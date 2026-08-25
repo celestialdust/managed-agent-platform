@@ -3,10 +3,6 @@
 An internal team ships an AI agent by registering a definition and calling a small REST
 API. They never see an agent loop. **This is the layer that makes handing them one safe.**
 
-| 67 | 3 | 0 | 1 turn |
-|:--|:--|:--|:--|
-| REST operations on the control plane | model wires — one passed through, two translated | credentials inside the agent's pod | the most a crash costs |
-
 ---
 
 ## Contents

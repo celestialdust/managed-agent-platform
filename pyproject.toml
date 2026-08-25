@@ -4,9 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115",
-  "uvicorn[standard]>=0.32",
+  "uvicorn[standard]>=0.52.4",
   "pydantic>=2.9",
-  "sqlalchemy[asyncio]>=2.0.36",
+  "sqlalchemy[asyncio]>=2.0.52",
   "asyncpg>=0.30",
   "alembic>=1.14",
   "httpx>=0.28",
@@ -65,7 +65,7 @@ dependencies = [
 dev = [
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
-  "testcontainers[postgres]>=4.8",
+  "testcontainers[postgres]>=4.15.0",
   "ruff>=0.8",
   "mypy>=1.13",
   # Stubs only; the parser itself is a runtime dependency above. `pyyaml` ships no

@@ -777,6 +777,20 @@ be true first.
 cluster, the nodegroup, RDS, the VPC and the buckets — an apply that replaces one of
 those destroys running state. Read `make infra-plan` first, every time.
 
+**`deploy/terraform/` adopts an environment; it does not create one from nothing.** Most
+resources in it carry an `import` block, because this configuration was written over
+infrastructure that already existed, and the names it uses (`map-dev`, `map-dev-eks-node`)
+are that environment's. Standing up a second environment means changing those names and
+dropping the `import` blocks for anything you are creating rather than adopting — a plan
+against an empty account fails on the first `import` with `Cannot import non-existent
+remote object`, which is loud and is the intended failure. Two values are already derived
+rather than written down, so nothing here names an account you do not own: the account id
+comes from `aws sts get-caller-identity` via `data.aws_caller_identity` (`account.tf`),
+and the state bucket is supplied by `terraform init -backend-config=backend.hcl` — copy
+`backend.hcl.example` and fill in your own. The cluster's OIDC issuer id in `iam.tf` is
+still a literal, deliberately: an import id that referenced the cluster resource would not
+be known at plan time, which is a rule `tests/deploy/` enforces on every import block.
+
 ### The deploy
 
 ```sh

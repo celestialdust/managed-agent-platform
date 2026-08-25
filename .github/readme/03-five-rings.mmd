@@ -1,0 +1,25 @@
+flowchart TD
+    R1["`**1 · user authorization**
+the team's own concern`"]
+    R2["`**2 · agent definition**
+ENFORCED · pinned`"]
+    R3["`**3 · skill revision**
+ENFORCED · pinned`"]
+    R4["`**4 · session grant + scope**
+SCOPE ENFORCED
+grant shapes the list only`"]
+    R5["`**5 · tool-side enforcement**
+TENANT-LEVEL
+not per-Session yet`"]
+    OUT["`**what this one task may do**
+narrower than any ring`"]
+
+    R1 --> OUT
+    R2 --> OUT
+    R3 --> OUT
+    R4 --> OUT
+    R5 --> OUT
+
+    style OUT fill:#e8f6f3,stroke:#16a085,stroke-width:2px
+    style R4 fill:#fdf3e0,stroke:#d68910
+    style R5 fill:#fdf3e0,stroke:#d68910

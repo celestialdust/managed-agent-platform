@@ -1,0 +1,75 @@
+# Puts the Session sandbox's seccomp profile on every node that may run a Session
+# pod, at the path kubelet resolves a `Localhost` profile against.
+#
+# The ConfigMap this mounts is NOT declared here, on purpose: its content is
+# `deploy/seccomp/session-sandbox.json` and a copy in this file would be a second
+# source for the same bytes. Create it from the file:
+#
+#   kubectl create configmap map-session-seccomp \
+#     --from-file=deploy/seccomp/session-sandbox.json
+#
+# To change the profile: update the file, recreate the ConfigMap, then
+# `kubectl rollout restart ds/map-session-seccomp-installer`. kubelet reads a
+# profile when it CREATES a container, so already-running Session pods keep the
+# filter they started with and have to be recreated too.
+#
+# A node that has not run this yet refuses Session pods rather than admitting
+# unconfined ones: kubelet cannot create the container and the pod stays Pending
+# with an event naming the missing path. Measured, not assumed.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: map-session-seccomp-installer
+  labels:
+    map.role: seccomp-installer
+spec:
+  selector:
+    matchLabels: { map.role: seccomp-installer }
+  template:
+    metadata:
+      labels: { map.role: seccomp-installer }
+    spec:
+      # The same selector session-pod.yaml uses. A node that cannot run a Session
+      # pod needs no Session profile.
+      nodeSelector:
+        map.role: session-pod
+      automountServiceAccountToken: false
+      containers:
+        - name: install
+          image: public.ecr.aws/amazonlinux/amazonlinux@sha256:5d271dd33b628252c31c15f5449e50d7c4e9f93badf9342f9b1e2a8d326fbe84
+          # uid 0 and no privilege: the seccomp root is created root-owned by
+          # kubelet, so the ordinary DAC check passes and CAP_DAC_OVERRIDE is not
+          # needed. This container writes one file and runs no tenant code.
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              install -o root -g root -m 0644 \
+                /src/session-sandbox.json \
+                /seccomp-root/map/session-sandbox.json
+              # A projection that silently produced nothing leaves a zero-byte
+              # file, which is not a missing file: it would load as invalid JSON
+              # and fail every Session pod on this node for the wrong reason.
+              test -s /seccomp-root/map/session-sandbox.json
+              echo "installed $(wc -c < /seccomp-root/map/session-sandbox.json) bytes"
+              exec sleep infinity
+          volumeMounts:
+            - { name: seccomp-root, mountPath: /seccomp-root/map }
+            - { name: profile, mountPath: /src, readOnly: true }
+      volumes:
+        # DirectoryOrCreate: /var/lib/kubelet/seccomp does not exist on a fresh
+        # AL2023 node and kubelet has no reason to create it.
+        - name: seccomp-root
+          hostPath:
+            path: /var/lib/kubelet/seccomp/map
+            type: DirectoryOrCreate
+        - name: profile
+          configMap:
+            name: map-session-seccomp

@@ -1,0 +1,22 @@
+flowchart LR
+    M["`**the model asks**
+name + arguments`"] --> TG["`**Tool Gateway**
+against the token's tenant
+not per-Session yet`"]
+    TG -->|"unknown OR forbidden"| NG["`**TOOL_NOT_GRANTED**
+one answer for both`"]
+    TG -->|"`a bound dimension
+the Scope lacks`"| OS2["`**TOOL_OUT_OF_SCOPE**`"]
+    TG -->|"narrowed to Scope"| RS["`**the real tool server**
+on the gateway's own
+credential`"]
+    RS --> EV["`**evidence captured**
+hashed, outside the pod
+inside the tool's deadline`"]
+    EV -->|"the result the model sees"| M
+    NG -->|"the Turn continues"| M
+
+    style TG fill:#e8f6f3,stroke:#16a085
+    style NG fill:#fdeaea,stroke:#c0392b
+    style OS2 fill:#fdeaea,stroke:#c0392b
+    style EV fill:#e8f6f3,stroke:#16a085

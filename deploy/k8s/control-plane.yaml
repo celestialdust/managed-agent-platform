@@ -1,0 +1,436 @@
+# The control plane: the tenant-facing REST surface, and the process that places a
+# Session's pod at that Session's first Turn.
+#
+# THREE DOCUMENTS, IN THIS ORDER: the Deployment, its ClusterIP Service, and a
+# PodDisruptionBudget. The Deployment stays FIRST because readers index document 0 of
+# this file as the Deployment rather than searching for it by kind -- grep
+# `_load(_DEPLOYMENT)[0]` and `_documents(_CONTROL_PLANE)[0]` under tests/deploy/ for the
+# two that do. Reordering these documents breaks them without touching them.
+#
+# THE SERVICE IS ClusterIP, AND THAT IS NOT A HARDENING PREFERENCE. This API
+# authenticates nothing: control/api/app.py declares no middleware and no Depends, and
+# every gated route takes its tenant from a request header whose own docstring
+# (control/api/request/tenancy.py:44) says the value "is asserted by whoever sent the request".
+# A LoadBalancer or a NodePort here would hand every tenant's Sessions, Turns and
+# uploaded files to anybody on the internet who can set a header, with nothing in
+# between -- because there is nothing in between to put in the way.
+#
+# ADR-022:95-98 recorded the state this replaces: "There is no control-plane Service and
+# no NetworkPolicy anywhere under deploy/, so nothing enforces that today; the boundary
+# was assumed, not built." Half of that is now false and half is still exactly true --
+# the Service exists, no NetworkPolicy does, so any pod in this cluster may dial this
+# address. A tenant-facing address is still a decision with money and internet exposure
+# in it, and it is not taken here.
+#
+# WHY THERE IS ONE AT ALL, having deliberately had none: replicas is no longer 1.
+# `kubectl port-forward deploy/control-plane` forwards to ONE arbitrary pod of the set,
+# so above one replica the platform's only address was neither stable nor balanced --
+# and every measurement on record was taken through one. A Service is what gives N pods
+# one name. An operator still needs no external address:
+#
+#     kubectl port-forward -n map-dev svc/control-plane 8080:80
+#
+# 80 there is the Service port and not the container's 8080, so this is not the pair the
+# Deployment-targeted form takes.
+#
+# The schema this process reads is upgraded by deploy/k8s/schema-migration.yaml, which
+# deploy/platform.py runs to completion before applying this. A pod started against an
+# unmigrated database answers /v1/healthz and 500s on the first query, because the probe
+# reads nothing -- see src/managed_agent/control/api/routes/health.py for why it does not.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: map-dev
+  labels: { map.component: control-plane }
+spec:
+  # Two, and the number is the cluster's AVAILABILITY ZONES rather than its nodes, its
+  # database ceiling, or a load figure. The distinction is not pedantry: the node count
+  # here is elastic and was measured at both 2 and 4 within one hour on 2026-08-23, as
+  # the autoscaler followed Session demand. Nodegroup `map-dev-nodes` is minSize 2 /
+  # maxSize 8, and cluster-autoscaler.yaml caps it at --max-nodes-total=4. A replica
+  # count justified against a transient node count would be wrong half the time.
+  #
+  # The zones do not move. That nodegroup spans exactly two subnets --
+  # subnet-0badee1628fa8f826 in us-east-1a and subnet-08539b97f50270799 in us-east-1b,
+  # read from `aws eks describe-nodegroup` and `aws ec2 describe-subnets` -- so two is
+  # the largest replica count where every replica holds a failure domain nothing else
+  # can take with it. A third would share a zone with one of these two.
+  #
+  # What a third would buy and cost, stated rather than dismissed: it would survive a
+  # SECOND simultaneous node loss, which the pair does not. It would cost 60 more
+  # database connections, which is most of the platform's remaining headroom (see below),
+  # on a process with no load profile at all. Raise it when a load profile exists, or
+  # when the nodegroup spans a third zone -- not because 3 is the next integer.
+  #
+  # WHERE THE DATABASE WALL IS, so the next person does not have to find it:
+  # composition.py's pool is pool_size 50 + max_overflow 10 per process, and the instance
+  # offers 397 -- `show max_connections` is 400 and three are reserved for superusers,
+  # which map_app is not. That is a MEASUREMENT, taken from inside a pod of this
+  # Deployment against the live instance; it replaces an earlier "roughly 225 at 2 GiB"
+  # that was arithmetic on the parameter group's formula and was 47 too high. Less about
+  # 15 for backends this platform does not open, the budget is 382. Today's peak is 2 of
+  # these + 2 tool-gateway + 1 migration Job = 5 pods = 300 connections. One more pod
+  # fits; two do not.
+  #
+  # So the earlier version of this comment -- "the number comes from the database" -- was
+  # true at 1 and is false at 2: the database would allow a peak of 3 here. What binds is
+  # the zone count above. Do not tune the pool constants from this file either. The whole
+  # sum lives in test_the_replica_count_and_surge_fit_the_databases_connection_ceiling,
+  # which reads every manifest that declares the database Secret and recomputes it, surge
+  # included. environment.md records what over the ceiling looked like on the smaller
+  # instance: "FATAL: too many connections, a total outage, as the designed response to
+  # load."
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    # maxSurge: 0 buys headroom now and no longer costs availability, and that flipped
+    # with the replica count above. At replicas 1 it meant every rollout had a window
+    # with no control plane at all -- which is what this comment used to say, and it is
+    # now false. At replicas 2 with maxUnavailable 1, a rollout takes one pod down and
+    # leaves one serving, so what the pin costs is capacity for the length of a rollout
+    # and what it buys is 60 fewer database connections during it. tool-gateway.yaml,
+    # the other Deployment that holds an engine, pins it for the same reason.
+    #
+    # maxUnavailable stays at 1 because it must be at least 1 when maxSurge is 0:
+    # Kubernetes rejects a RollingUpdate with both at zero, since such a rollout can
+    # never take a step.
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
+  selector:
+    matchLabels: { map.component: control-plane }
+  template:
+    metadata:
+      labels: { map.component: control-plane }
+    spec:
+      # TWO CONSTRAINTS, and the pair is the point rather than either one alone.
+      #
+      # Two replicas on one node is one node drain away from zero. Two replicas in one
+      # availability zone is one zone away from zero. Those are DIFFERENT states here,
+      # because this nodegroup runs several nodes per zone -- measured at four nodes
+      # across two zones on 2026-08-23, having been two an hour earlier. So a hostname
+      # constraint alone permits both replicas on two different nodes in us-east-1a, and
+      # a zone constraint alone permits both on one node inside a zone. Neither implies
+      # the other on this cluster, and the replica count above is argued on zones while
+      # the drain hazard is per-node, so both arguments need their own constraint.
+      #
+      # The scheduler already spreads pods of one Deployment, but its defaults are
+      # maxSkew 3 on hostname and 5 on zone -- kube-scheduler's PodTopologySpread
+      # defaultConstraints, read from the upstream default and NOT measured here, because
+      # EKS does not expose its scheduler configuration. Two pods together against zero
+      # everywhere else is a skew of 2, comfortably inside both. Without these, both
+      # replicas landing on one node is a permitted outcome rather than a bug.
+      #
+      # ScheduleAnyway on both, deliberately. DoNotSchedule would refuse to place the
+      # second replica whenever only one node or one zone can take it -- mid-drain, mid
+      # node-upgrade, or on a full node -- and so would trade away the availability it is
+      # here to buy, at exactly the moment availability is scarce. The pair that works is
+      # soft spreading plus the PodDisruptionBudget at the foot of this file: the
+      # constraints separate the pods when they can, and the budget stops both from being
+      # evicted at once when they could not.
+      #
+      # WHAT THIS DOES NOT GUARANTEE, said plainly because ScheduleAnyway is a
+      # preference: where one node or one zone is the only place with room, both replicas
+      # go there. No test in this tree can assert otherwise -- a spread constraint's
+      # effect is a scheduler's decision, and the only thing that disagrees with a
+      # well-formed constraint is a live cluster.
+      topologySpreadConstraints:
+        # Each labelSelector is the Deployment's own, and has to be: a constraint whose
+        # labelSelector matches no pod spreads an empty set and is silently inert.
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { map.component: control-plane }
+        - maxSkew: 1
+          # The label every node in this cluster carries -- measured with
+          # `kubectl get nodes -o custom-columns=...topology.kubernetes.io/zone`, which
+          # answered us-east-1a and us-east-1b. A topologyKey no node carries puts every
+          # pod in one nameless domain, where nothing can be skewed and the constraint is
+          # inert without being wrong-looking.
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { map.component: control-plane }
+      serviceAccountName: control-plane
+      securityContext:
+        runAsNonRoot: true
+        # Matches the uid the platform image bakes a passwd entry for, so HOME resolves.
+        runAsUser: 10002
+        fsGroup: 10002
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: api
+          # The un-substituted placeholder. Sixty-four zeros is the one digest-shaped
+          # value that is unmistakably a placeholder -- it parses, so nothing downstream
+          # special-cases it, and it resolves to no image anywhere, so an unsubstituted
+          # manifest fails at the pull instead of starting something. `:latest` was both
+          # the string core/registration/environment.py refuses and unpushable twice to an IMMUTABLE
+          # repository. deploy/platform.py replaces this with the digest ECR holds for
+          # this commit's tag, and refuses to apply if the placeholder is not here.
+          image: map/control-plane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args:
+            - "uvicorn"
+            - "managed_agent.asgi:build_app"
+            - "--factory"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8080"
+          ports:
+            - { name: http, containerPort: 8080 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          env:
+            # DATABASE_URL has no default and its absence raises, so an unconfigured
+            # process fails to start rather than reaching the wrong database. The value
+            # is a Kubernetes Secret this repository does not create and must not:
+            # deploy/platform.py refuses to apply this file while it is absent, and
+            # refuses further if its DSN connects as the RDS master user, whose password
+            # AWS rotates every seven days (measured) -- which would make this pod work
+            # and then stop, days after a deploy, for a reason nobody would connect to
+            # it. The role cannot read the rotated value either: its policy is
+            # map/dev/platform/* and the RDS-managed secret is rds!db-...
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: map-control-plane, key: database-url }
+            # Not a credential. composition.py's default is "default", which is wrong
+            # for every deployment that exists. It is read only on the placer's path,
+            # and that is why it is also what `pod_runner_from_environment` alarms on:
+            # a process naming a namespace to place into with no manifest to place from
+            # refuses to start rather than accepting Sessions it will never place. The
+            # manifest test reads the expected value out of deploy/bootstrap.py rather
+            # than repeating the string here.
+            - name: MAP_NAMESPACE
+              value: map-dev
+            # The two signing keys, and they are two on purpose. This one derives every
+            # Session's shim bearer, which is the shim route's only check; the one below
+            # signs the Session token the Tool Gateway reads. One key for two hops in
+            # opposite directions would make either side's compromise the other's.
+            #
+            # `shim-token-key` is not in this Secret yet and an operator must create it:
+            # the value is not in this repository and must not be. deploy/platform.py
+            # refuses to apply this file while it is absent, naming the Secret and key.
+            - name: MAP_SHIM_TOKEN_KEY
+              valueFrom:
+                secretKeyRef: { name: map-control-plane, key: shim-token-key }
+            # The SAME Secret and the SAME key tool-gateway.yaml names, deliberately.
+            # This process signs a Session token and that one verifies it, so two copies
+            # of "the same" key would be two things free to diverge -- and divergence
+            # shows up as every Session's tool calls answering 401 with nothing naming
+            # the cause. Crossing the Secret naming this way is the shape this repository
+            # already uses in the other direction: tool-gateway.yaml reads
+            # map-control-plane/database-url, because one store means one credential.
+            - name: MAP_SESSION_TOKEN_KEY
+              valueFrom:
+                secretKeyRef: { name: map-tool-gateway, key: session-token-key }
+            # Where the Session-pod manifest is mounted. A path and not a package
+            # resource: deploy/ is not in the wheel, so a manifest resolved by import
+            # would be present in a checkout and absent in the image.
+            - name: MAP_POD_MANIFEST
+              value: /etc/map/pod/session-pod.yaml
+            # Not credentials, and each is here rather than a constant because one
+            # cluster's Services are not another's. The literal-value allowlist in
+            # tests/deploy/test_control_plane_manifest.py names all three.
+            - name: MAP_TOOL_GATEWAY_URL
+              value: http://tool-gateway.map-dev.svc.cluster.local/mcp
+            - name: MAP_MODEL_GATEWAY_URL
+              value: http://model-gateway.map-dev.svc.cluster.local/v1
+            # A ceiling on how long a Session may use enterprise tools, not a refresh
+            # window: the compiled document is copied into the pod at start and read
+            # once. 24 h -- longer than any Session this platform has run, and short
+            # enough that a leaked document expires.
+            - name: MAP_SESSION_TOKEN_LIFETIME_S
+              value: "86400"
+            # How long the two in-process sweeps wait between passes: the webhook
+            # deliveries and the reclamation of Session pods nothing owns. Not a
+            # credential, and it has no default in composition.py on purpose -- a
+            # process that started on a guessed cadence would look configured from
+            # every angle while the number deciding how long a tenant waits for a
+            # callback was nobody's decision.
+            #
+            # 30 s, and the ceiling on it is not taste. One delivery pass advances its
+            # watermark by at most MAX_WINDOW_MS (five minutes), so an interval above
+            # that leaves the tail unable to catch up after an outage on any single
+            # tick. 30 s clears it by an order of magnitude, sits an order of magnitude
+            # above the sweep's own SAFETY_LAG_MS of 5 s -- so no pass is spent waiting
+            # for the frontier to move -- and costs two replicas four queries a minute
+            # against a database whose measured ceiling is 397 connections.
+            #
+            # It is NOT the pod-reclamation deadline: that is IDLE_GRACE_MS, fifteen
+            # minutes, compiled into session_reaper.py because reclaiming a Session's
+            # pod currently ends that Session's working life. This number only decides
+            # how soon after the grace expires the pod actually goes.
+            - name: MAP_SWEEP_INTERVAL_S
+              value: "30"
+            # Where an uploaded file's bytes go, and the value is safe to name because
+            # the grant now exists: the `UploadedFilesOnly` statement in
+            # deploy/iam/map-control-plane.json gives this role s3:GetObject and
+            # s3:PutObject on this bucket's objects. That is exactly the two calls the
+            # object half makes -- put_object when a file is stored, get_object when one
+            # is fetched -- and it makes no third. Until that statement existed this
+            # variable was deliberately unset, because a bucket named with no grant
+            # behind it turns every upload into AccessDenied instead of the named
+            # refusal an unset variable produces.
+            #
+            # The grant carries NO s3:DeleteObject, and that omission is deliberate: a
+            # Session's mount references an uploaded file long after the upload call
+            # returned, so this role must never be able to remove one. Nothing on the
+            # upload path deletes, so nothing here needs it.
+            #
+            # Setting this also wires the Evidence object store, which reads the same
+            # variable because Evidence and uploaded files share this bucket under
+            # different prefixes. Its capture and read paths are the same two calls; its
+            # prefix sweep is list_objects_v2 + DeleteObjects, which this role cannot
+            # do -- and nothing in this process calls the sweep. A slice that wires one
+            # here needs s3:ListBucket on the bucket and s3:DeleteObject on its objects,
+            # which is a policy change and not a manifest one.
+            #
+            # A literal rather than a secretKeyRef, because a bucket name is not a
+            # credential. The manifest test derives the expected value from that
+            # policy's own Resource rather than repeating the string, since a bucket
+            # named here that the grant does not cover fails at the first upload and
+            # nowhere earlier.
+            #
+            # Still no AWS_REGION beside it, though the old reason for that -- no
+            # aioboto3 client is constructed here at all -- has stopped being true. The
+            # region is injected by the IRSA webhook, which puts AWS_REGION=us-east-1
+            # into this pod next to AWS_ROLE_ARN; read off the running pod, not assumed.
+            - name: MAP_OBJECT_BUCKET
+              value: map-dev-000000000000-us-east-1-an
+            # The same bucket, under its own variable, and the two are not redundant.
+            #
+            # Unset until now, and the consequence was not "no Rollouts": composition.py
+            # reads this with `.get`, so an absent value wires `_RolloutNotYetShipped`
+            # and every completed Turn ships nothing. Nothing failed, no route answered
+            # an error, and every resume then refused for want of a Rollout that was
+            # never written -- which is why the reaper's grace is fifteen minutes rather
+            # than seconds. A variable whose absence degrades silently is one worth
+            # setting even where the value repeats.
+            #
+            # One bucket, three prefixes: uploads, evidence and now rollouts. Two
+            # variables naming it is deliberate -- the day resume state has to move to
+            # its own bucket, or its own lifecycle policy, that is one value here and no
+            # code change. Merging them would make the split a code change instead.
+            - name: MAP_ROLLOUT_BUCKET
+              value: map-dev-000000000000-us-east-1-an
+          volumeMounts:
+            # The Session-pod manifest, as a ConfigMap deploy/platform.py generates from
+            # deploy/k8s/session-pod.yaml itself rather than from a checked-in copy --
+            # one source of bytes, and the cluster gate compares the mounted document
+            # against the file. Read-only because this process only reads it and
+            # `_pod_for` deep-copies before substituting.
+            - { name: pod-manifest, mountPath: /etc/map/pod, readOnly: true }
+            # Not boilerplate, and not for the same reason tool-gateway.yaml has one.
+            # control/api/routes/files.py declares an UploadFile parameter, and Starlette's
+            # multipart parser writes the request body into a SpooledTemporaryFile that
+            # spills to disk above its in-memory threshold -- before the route function
+            # runs, so it happens whether or not the store then refuses. With a read-only
+            # root and no writable /tmp, a large upload fails with an OSError instead of
+            # the named refusal above.
+            #
+            # Node disk rather than medium: Memory, because the default upload cap is
+            # 100 MiB and a memory-backed emptyDir counts against this container's own
+            # memory limit.
+            - { name: scratch, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /v1/healthz, port: http }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /v1/healthz, port: http }
+            periodSeconds: 20
+          resources:
+            # A starting point, not a measurement, and said so rather than implied: no
+            # profile of this process under load exists. The request is what the scheduler
+            # reads, and without one this pod is BestEffort and is evicted first -- which
+            # is what deploy/k8s/session-pod.yaml is today and was recorded as
+            # deliberately unfixed for a per-Session pod. A long-lived platform Deployment
+            # is a different case.
+            #
+            # A memory limit and no CPU limit: a CPU limit throttles rather than fails, so
+            # it turns a busy process into a slow one for no diagnosable reason, while the
+            # request already carries the scheduling signal. The memory limit is twice the
+            # request so an OOMKill is a signal that the arithmetic was wrong.
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { memory: "1Gi" }
+      volumes:
+        - name: scratch
+          emptyDir: { sizeLimit: 256Mi }
+        - name: pod-manifest
+          configMap: { name: map-session-pod }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane
+  namespace: map-dev
+  labels: { map.component: control-plane }
+spec:
+  # Written out, where tool-gateway.yaml and model-gateway.yaml both leave it to the
+  # default of the same value. `type` is the one field that turns this from an in-cluster
+  # address into an internet-facing one, and a check that it EQUALS ClusterIP cannot be
+  # satisfied by the field being missing -- which is what a check for the absence of the
+  # string "LoadBalancer" can be. The header says what publishing this would publish.
+  type: ClusterIP
+  # The Deployment's own selector labels. A Service whose selector matches no pod is
+  # valid YAML, is accepted by the API server, and routes to nothing.
+  #
+  # The near defect this project has already paid for was a DIFFERENT mechanism with the
+  # same symptom, and the difference is worth keeping straight: session-shim-service.yaml
+  # was committed and applied by nothing, so the name did not resolve at all. A
+  # mis-selecting Service resolves and then carries no traffic. Neither has ever been
+  # visible to a probe -- on 2026-08-23 a Session pod sat at 2/2 Running with its shim
+  # answering the kubelet while every Turn failed as unreachable. Nothing in this
+  # repository has hit the mis-selecting variant yet, which is exactly why it is worth a
+  # check rather than a note.
+  selector: { map.component: control-plane }
+  ports:
+    # Port 80, and unlike model-gateway.yaml's the number is NOT forced by a compiled
+    # URL: no caller in this tree dials the control plane by name, which is checked
+    # rather than assumed -- grepping src/, tests/, deploy/ and tools/ for
+    # `control-plane.` as a hostname prefix finds only this comment and its test's
+    # docstring, and the one address that exists is the port-forward in
+    # tests/pod/test_the_control_plane_places_a_session_pod.py. What forces the number is
+    # this platform's one address convention: both in-cluster URLs THIS Deployment hands
+    # out, MAP_TOOL_GATEWAY_URL and MAP_MODEL_GATEWAY_URL above, carry no port, and a URL
+    # with no port is port 80. Both Services behind them are port 80 (read out of
+    # tool-gateway.yaml and model-gateway.yaml, and asserted by the manifest test). A
+    # third platform Service on any other number would mean the one natural spelling of
+    # its own address, http://control-plane.map-dev.svc.cluster.local/v1/..., reaches
+    # nothing.
+    #
+    # targetPort names the container's port instead of repeating 8080. The name is
+    # resolved against that pod's own containerPort list, so a rename that misses one
+    # side yields an endpoint with no port rather than an endpoint to the wrong one.
+    - { name: http, port: 80, targetPort: http }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: control-plane
+  namespace: map-dev
+  labels: { map.component: control-plane }
+spec:
+  # One pod survives every VOLUNTARY disruption, and only voluntary ones -- which is the
+  # whole of what a budget can do, so it is worth being exact. It governs the eviction
+  # API: `kubectl drain` for a node upgrade, and the cluster-autoscaler that
+  # cluster-autoscaler.yaml deploys, which is a real evictor on this cluster. It governs
+  # nothing about an OOMKill, a kernel panic, or a node that stops answering; those take
+  # whatever was on the node, and the spread constraint above is what limits how much
+  # that is.
+  #
+  # minAvailable and not maxUnavailable, because what is forbidden here is zero rather
+  # than a rate. At replicas 2 the two spell the same permission -- evict one, keep one
+  # -- and they diverge the moment somebody scales this Deployment to 1: maxUnavailable 1
+  # would let the last pod go, and minAvailable 1 blocks the drain instead. Blocking is
+  # the better of those two failures, and it is a loud one: `kubectl drain` prints
+  # "Cannot evict pod as it would violate the pod's disruption budget" and keeps
+  # retrying, rather than the API quietly disappearing. Whoever meets it scales up first
+  # or deletes this object on purpose.
+  minAvailable: 1
+  selector:
+    # The Deployment's own selector labels. A budget matching no pod reports
+    # `expectedPods: 0`, permits every eviction, and protects nothing -- the same
+    # silently-inert shape as a Service selector that matches nothing.
+    matchLabels: { map.component: control-plane }

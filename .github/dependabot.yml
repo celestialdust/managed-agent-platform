@@ -1,0 +1,42 @@
+# Dependency updates as pull requests, so a security advisory arrives as a diff the
+# gates run against rather than as a dashboard nobody opens.
+#
+# **A PR opened here cannot be merged, and that is a property of how this repository is
+# published rather than a mistake.** What GitHub holds is a squashed snapshot written by
+# `tools/publish.py` from a source repository it shares no ancestry with; the next
+# publish overwrites the branch outright, so a merge commit on it is lost, and merging
+# one back into the source would put the withheld design record into the tree the
+# snapshot writes. Read a Dependabot PR as a notification: make the same change in the
+# source, run the gates, publish, and Dependabot closes its own PR as superseded.
+#
+# There is no `npm audit` equivalent step in the CI workflow on purpose. GitHub already
+# raises an advisory against `uv.lock` and opens the fix as a PR here; a second scanner
+# in CI would be a second answer to the same question, free to disagree with the first
+# and adding a dependency to check dependencies.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # The lockfile only. Without this, Dependabot raises the *floor* in
+    # `pyproject.toml` to whatever is newest -- `uvicorn>=0.32` became `>=0.52.4` -- and
+    # that is churn on an application: the resolved versions already come from
+    # `uv.lock`, so the higher floor buys nothing and narrows what a contributor may
+    # have installed. A library, whose floors are a promise to its callers, would want
+    # the opposite.
+    versioning-strategy: lockfile-only
+    # Grouped, because the lockfile is resolved as a whole: five separate PRs each
+    # bumping one entry conflict with each other on `uv.lock` and only the first
+    # merges cleanly.
+    groups:
+      python:
+        patterns: ["*"]
+
+  # The workflow's own actions pin to major tags, which move. This is what notices when
+  # one of them has been abandoned.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

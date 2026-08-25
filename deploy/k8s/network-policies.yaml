@@ -1,0 +1,485 @@
+# What may reach what inside `map-dev`. Deny by default; every arrow below is an
+# exception somebody had to write down.
+#
+#     kubectl apply -f deploy/k8s/network-policies.yaml
+#
+# Every document carries its own namespace, so no `-n` is needed and applying this from
+# the wrong context cannot put the set somewhere else.
+#
+# THESE FILTER NOTHING UNTIL THE CNI IS ENFORCING, and that is the first thing to know
+# about this file rather than a footnote. This cluster runs the Amazon VPC CNI, whose
+# network-policy agent is deployed and switched off: the `aws-eks-nodeagent` container of
+# `kube-system/aws-node` runs with `--enable-network-policy=false` (measured). While that
+# is false the API server still accepts every object here, `kubectl get netpol` still
+# lists them, and not one packet is examined. `NETWORK_POLICY_ENFORCING_MODE=standard`
+# sits on the same DaemonSet and reads like enforcement being configured; it is the
+# setting that says what happens to a pod's traffic *while* its policies are being
+# programmed, and it is inert for the same reason everything else here is. The switch is
+# `enableNetworkPolicy` on the `vpc-cni` add-on -- `deploy/terraform/vpc_cni.tf` -- and
+# the check that this file is not decoration is
+# `tests/deploy/test_network_policies.py::test_the_cni_is_enforcing_network_policy`,
+# which fails while the flag is false.
+#
+# WHAT ORDER TO PUT THESE IN, if the platform is serving. A pod that no policy selects is
+# unrestricted, and a pod that any policy selects is denied everything that policy does
+# not allow -- so the risky step is not the blanket deny at the foot of this file, it is
+# each per-workload document above it. Turning enforcement on with no policy present
+# changes nothing; applying this file is what starts filtering. The blanket deny is last
+# in the file so that a single `kubectl apply` lands the exceptions first, and its only
+# marginal effect is on pods nothing else here names -- which today is none, and tomorrow
+# is whatever somebody adds without a policy.
+#
+# THE KUBELET IS NOT A POD AND NO SELECTOR HERE MATCHES IT. Every Deployment in this
+# namespace and both containers of a Session pod are probed by the kubelet, which dials
+# the pod's address from the node's own network namespace -- so an `ingress` rule written
+# over `podSelector` cannot match it, and a default-deny that had to name it would take
+# the whole platform unready with every manifest still reading correctly. It does not
+# have to. The agent that enforces these policies puts the node's own IP into every pod's
+# allow map with an allow-all value before it writes any rule from any policy, and skips
+# any policy rule that names that address. Read off the agent's source at the version
+# this cluster runs -- image `amazon/aws-network-policy-agent:v1.4.0-eksbuild.1`,
+# measured, and at tag `v1.4.0` `pkg/fwruleprocessor/fw_rule_processor.go` carries
+# "Traffic from the local node should always be allowed. Add NodeIP by default to map
+# entries." beside the entry, and `shouldSkipRule` returns true for the node IP. So
+# liveness, readiness and startup probes are permitted by the enforcement mechanism
+# rather than by anything in this file, and so are `kubectl port-forward`, `exec` and
+# `logs`, which all arrive from the node for the same reason. NOT a claim about
+# Kubernetes in general: another CNI would need these arrows written out.
+#
+# A POD'S EGRESS IS FILTERED BEFORE kube-proxy REWRITES THE DESTINATION, which is why
+# some rules below name a container port and some name a CIDR that looks too wide. The
+# agent's egress program runs on the host side of the pod's veth, ahead of the NAT that
+# turns a ClusterIP into a backing pod's address, so a call to
+# `tool-gateway.map-dev.svc.cluster.local` reaches the filter carrying the *Service's*
+# address and the *Service's* port -- neither of which is a pod. What makes a
+# `podSelector` rule work for such a call at all is the network-policy controller, which
+# resolves the Service fronting the selected pods and adds its ClusterIP to the allowed
+# set, mapping the container port named in the rule onto that Service's own port. Every
+# in-namespace arrow below therefore names the CONTAINER port, never the Service port,
+# and each one says so. A headless Service has no ClusterIP and needs none of this: the
+# control plane's call to a Session's shim resolves straight to the pod's address.
+#
+# WHERE THIS IS WEAKEST, said here rather than left to be discovered. A Session's pod is
+# a bare Pod -- the control plane creates it directly and nothing owns it, measured:
+# `kubectl get pod map-session-... -o jsonpath={.metadata.ownerReferences}` prints
+# nothing. Amazon's own considerations for this feature say network policy enforcement
+# "might not work reliably" for a pod with no `metadata.ownerReferences`, and the two
+# documents in this file that select `map.role: session-pod` are exactly that pod. So the
+# isolation that matters most here is ALSO written at the other end: the control plane and
+# both gateways deny ingress by default, and those are Deployment-managed pods the
+# feature makes no such reservation about. Session-to-Session and Session-to-internet
+# have no other end to be enforced at, and for those two this file is the only thing
+# standing there.
+#
+# The seccomp installer runs in `default` rather than here, so nothing in this file
+# reaches it. It opens no socket.
+
+# The control plane. It talks to the database, to the Kubernetes API, to AWS, and into a
+# Session's pod -- and nothing in this cluster talks to it.
+#
+# NO `ingress` KEY AT ALL, which with `policyTypes: [Ingress]` denies every pod in this
+# cluster. That is the point rather than an omission. This API authenticates nothing: it
+# takes its tenant from a request header whose value is asserted by whoever sent the
+# request, so any pod that can reach port 8080 here can read and write every tenant's
+# Sessions. ADR-022 rests on the Session pod being unable to name this address; until now
+# nothing stopped it dialling one it guessed. An operator still reaches it, because
+# `kubectl port-forward` arrives from the node -- see the header.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: control-plane
+  namespace: map-dev
+spec:
+  podSelector:
+    matchLabels: { map.component: control-plane }
+  policyTypes: [Ingress, Egress]
+  egress:
+    # DNS, first because everything else here is a name. The database DSN, the AWS
+    # endpoints and a Session pod's per-pod record are all resolved through CoreDNS, so a
+    # policy that forgets this breaks every other rule in the document and reports it as
+    # a connection failure to whatever was being resolved. Both protocols: a response
+    # over 512 bytes is retried over TCP, and this namespace's own names already answer
+    # with several records.
+    #
+    # The kube-dns Service publishes port 53 and targets port 53, so the container port
+    # named here is also the Service port and the rewrite the header describes cannot
+    # disagree with it.
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # A Session's shim, which is how a Turn is delivered and how a completed Turn's
+    # Rollout is read back out. `map-session` is headless, so the name resolves to the
+    # pod's own address and 8081 is both the container port and the Service port.
+    #
+    # THIS IS THE RULE MOST LIKELY TO BREAK THE PLATFORM, and for the same reason as the
+    # header's note on `ownerReferences` -- but at the other end of it. Here the bare Pod
+    # is the PEER: the controller has to resolve `map.role: session-pod` into the pod
+    # addresses this allow covers, and it is that resolution AWS's considerations decline
+    # to promise for a pod nothing owns. If it does not happen, this rule permits nothing
+    # and every Turn fails as `the shim for session ... could not be reached` -- the exact
+    # message the platform produced on 2026-08-23 for a different cause.
+    #
+    # It is written this way anyway, because the alternative is worse rather than safer.
+    # An `ipBlock` over the pod subnets on 8081 would reach the shims and also every
+    # future pod on that port, which is the widening
+    # `test_no_container_port_in_the_tree_falls_inside_an_address_range_allow` exists to
+    # refuse. And the failure here is loud and instantly reversible: a Turn fails with
+    # that message, and `kubectl delete -f` on this file restores every connection with
+    # no rollout. So the measurement to take right after enforcement goes on is one Turn
+    # against one Session, before anything else is trusted.
+    - to:
+        - podSelector:
+            matchLabels: { map.role: session-pod }
+      ports:
+        - { protocol: TCP, port: 8081 }
+    # PostgreSQL. The instance's network interface sits in the two private subnets -- read
+    # from its subnet group, `subnet-0badee1628fa8f826` and `subnet-08539b97f50270799` --
+    # and its address is AWS's to move, so the allow is those subnets rather than a /32
+    # that would silently stop matching after a failover or a storage change.
+    #
+    # Those are also the subnets every pod in this cluster gets its address from, so this
+    # rule permits reaching a pod on 5432 as well as the database. Nothing in this
+    # platform listens on 5432 -- the container ports declared under deploy/k8s/ are 8080,
+    # 8081 and 8085 -- and
+    # `test_no_container_port_in_the_tree_falls_inside_a_cidr_shaped_allow` is what keeps
+    # that true rather than merely true today.
+    - to:
+        - ipBlock: { cidr: 172.31.96.0/20 }
+        - ipBlock: { cidr: 172.31.112.0/20 }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    # The Kubernetes API, which is how a Session's pod and its three Secrets are created
+    # and deleted. TWO ADDRESSES FOR ONE DESTINATION, and both are needed.
+    #
+    # The pod dials `10.100.0.1:443` -- `KUBERNETES_SERVICE_HOST` on a running
+    # control-plane pod, measured -- which is the `kubernetes` Service's ClusterIP, and
+    # that is what the filter sees, per the header. The endpoints behind it are the EKS
+    # control plane's own network interfaces inside this VPC (measured today:
+    # `172.31.8.207` and `172.31.92.149`), and they are AWS's: they move on a cluster
+    # upgrade and they may be placed in any of the four subnets this cluster declares.
+    # Pinning today's two would be an outage on the day one changes, with the control
+    # plane unable to place any pod and nothing here to say why -- so the second entry is
+    # the VPC.
+    #
+    # What that costs: this pod may open TCP 443 to any address in the VPC. Nothing in
+    # this platform listens on 443, and the test named on the database rule above is what
+    # keeps that from quietly changing.
+    - to:
+        - ipBlock: { cidr: 10.100.0.1/32 }
+        - ipBlock: { cidr: 172.31.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 443 }
+    # AWS, over the public internet, because this VPC has no endpoint for any service:
+    # `aws ec2 describe-vpc-endpoints` returns an empty list (measured), so an S3 or STS
+    # call from this pod leaves through the NAT gateway to a public address. This pod
+    # makes two kinds: STS, to exchange its projected token for the role it runs as, and
+    # S3, for an uploaded file's bytes and for captured Evidence.
+    #
+    # The three exclusions are what keep "reach AWS" from meaning "reach everything". The
+    # VPC and the Service range are carved out because the two rules above are where
+    # in-cluster and in-VPC destinations are decided, and a blanket 443 here would quietly
+    # overrule both. Link-local is carved out because it is where the instance's own
+    # credentials answer: this pod takes AWS credentials from the projected web-identity
+    # token the IRSA webhook mounts (`AWS_WEB_IDENTITY_TOKEN_FILE`, read off the running
+    # pod), so it has no reason to reach the node's instance role and no way to fall back
+    # to it.
+    #
+    # Nothing here dials the public internet on any other port, and that is a property of
+    # what this process does rather than a preference: it holds no webhook client -- the
+    # dispatcher that would make one is constructed by tests and by nothing that runs --
+    # so the day one is wired, its first call fails against this rule rather than
+    # succeeding unnoticed.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 172.31.0.0/16
+              - 10.100.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# The Tool Gateway. A Session's agent reaches it; it reaches registered MCP servers on the
+# public internet, and it never reaches into a pod -- which is what this document turns
+# from a sentence in that manifest's header into a filter.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tool-gateway
+  namespace: map-dev
+spec:
+  podSelector:
+    matchLabels: { map.component: tool-gateway }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Session pods and nothing else. 8080 is the CONTAINER port; the Service in front of
+    # it publishes 80. An ingress rule is evaluated on this pod's own interface, after any
+    # rewrite, so the port here is the one this container is listening on either way.
+    - from:
+        - podSelector:
+            matchLabels: { map.role: session-pod }
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The same database as the control plane's, through the same subnets and for the same
+    # reason the address is not a /32.
+    - to:
+        - ipBlock: { cidr: 172.31.96.0/20 }
+        - ipBlock: { cidr: 172.31.112.0/20 }
+      ports:
+        - { protocol: TCP, port: 5432 }
+    # Everything outside the VPC, on 443 only, and this is the widest rule in the file. It
+    # has to be: a registered MCP server is a tenant's address, not the platform's, so
+    # there is no narrower set to name. 443 rather than any port is what keeps it from
+    # being "the internet": a registered HTTP endpoint's URL must match `^https://`
+    # (`core/registration/scope_binding.py`), so a plaintext server cannot be registered, and this pod
+    # fetches its credentials from Secrets Manager over the same port.
+    #
+    # THE GAP THIS LEAVES, named rather than papered over: that pattern pins the scheme
+    # and not the port, so `https://example.com:8443/mcp` is a registration the platform
+    # accepts and this rule refuses. It fails at the first tool call of the first Session
+    # bound to it. Widening to all ports would make this rule "any pod here may reach any
+    # address on any port", which is the whole of what a default-deny egress is for.
+    #
+    # A stdio registration names a command this container runs, and a child that fetches
+    # a package reaches a registry over 443 like everything else here. One that wants
+    # another port fails the same way, loudly, at its first call.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 172.31.0.0/16
+              - 10.100.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# The Model Gateway. It holds the provider credential no pod holds, and this is what says
+# the only thing that may ask it for a completion is a Session pod.
+#
+# No database rule: this process calls `create_model_gateway_app` directly, opens no
+# engine, and reads nothing relational.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: model-gateway
+  namespace: map-dev
+spec:
+  podSelector:
+    matchLabels: { map.component: model-gateway }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # 8080 is the container port; the Service publishes 80. See the Tool Gateway's.
+    - from:
+        - podSelector:
+            matchLabels: { map.role: session-pod }
+      ports:
+        - { protocol: TCP, port: 8080 }
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The upstream providers and the vault, both outside the VPC and both on 443: the
+    # routing table's two `base_url`s are `https://` and Secrets Manager has no endpoint
+    # in this VPC. Not narrowed to those hosts, because an ipBlock takes addresses and a
+    # provider's are a CDN's -- a fixed set here would fail on the first rotation, and
+    # what decides which upstream this service may call is the routing table it mounts
+    # rather than a CIDR.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 172.31.0.0/16
+              - 10.100.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# The Cluster Autoscaler. Not a platform service, and it is here because a namespace-wide
+# deny would otherwise stop it: it lives in `map-dev` rather than `kube-system` because
+# the IAM role it assumes trusts exactly one subject in this namespace.
+#
+# What breaks if this document is wrong is not the autoscaler, it is capacity: it stops
+# adding nodes, and the symptom is Session pods Pending for ever with nothing on the pod
+# naming a network filter.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cluster-autoscaler
+  namespace: map-dev
+spec:
+  podSelector:
+    matchLabels: { map.component: cluster-autoscaler }
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The Kubernetes API: it watches unschedulable pods, and it writes a status ConfigMap
+    # and holds a leader-election Lease. Both entries for the reason the control plane's
+    # pair gives.
+    - to:
+        - ipBlock: { cidr: 10.100.0.1/32 }
+        - ipBlock: { cidr: 172.31.0.0/16 }
+      ports:
+        - { protocol: TCP, port: 443 }
+    # EC2 Auto Scaling and STS, over the public internet for the same reason as every
+    # other AWS call from this namespace: this VPC has no endpoints.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 172.31.0.0/16
+              - 10.100.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
+---
+# The schema migration. It exists for the length of one deploy and it needs two things,
+# and it is in this file because the applier waits for it: a Job that cannot reach the
+# database never completes, `kubectl wait --for=condition=complete` times out, and the
+# deploy fails before the workload it was preparing for is applied.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: schema-migration
+  namespace: map-dev
+spec:
+  podSelector:
+    matchLabels: { map.component: schema-migration }
+  policyTypes: [Ingress, Egress]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    - to:
+        - ipBlock: { cidr: 172.31.96.0/20 }
+        - ipBlock: { cidr: 172.31.112.0/20 }
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+# A Session's pod: the one process in this cluster that runs a tenant's agent, and
+# therefore the one that runs model-authored code. Most of the value in this file is here.
+#
+# It may resolve names and call the two gateways. It may NOT reach the control plane, the
+# Kubernetes API, the database, another tenant's Session, the node's instance credentials,
+# or any address outside this cluster. Nothing it holds is a credential for any of those
+# -- it is given a Session-scoped bearer and nothing else -- and this is what stops it
+# from trying.
+#
+# Read the header's note on `ownerReferences` before trusting this document. It selects a
+# bare Pod, which is the shape Amazon's considerations for this feature decline to
+# guarantee enforcement for, so the arrows it forbids to the control plane and the two
+# gateways are also forbidden by those pods' own ingress rules. The two it forbids with
+# nobody backing it up are Session-to-Session and Session-to-internet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: session-pod
+  namespace: map-dev
+spec:
+  podSelector:
+    matchLabels: { map.role: session-pod }
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # The control plane, on the shim's port, and nothing else -- no other Session pod, in
+    # particular, since one Session reaching another's shim would let it submit Turns
+    # against a Session it does not own. The direction is the whole of ADR-022's
+    # mechanism: the control plane pulls, and this is the pull's one permitted source.
+    - from:
+        - podSelector:
+            matchLabels: { map.component: control-plane }
+      ports:
+        - { protocol: TCP, port: 8081 }
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+          podSelector:
+            matchLabels: { k8s-app: kube-dns }
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    # The two gateways, in one rule because they are one permission: the runtime inside
+    # this pod is compiled to reach a model through one and a tool through the other, and
+    # neither is useful without the other.
+    #
+    # 8080 IS THE CONTAINER PORT AND BOTH SERVICES PUBLISH 80. That mismatch is the one
+    # thing in this file most likely to be wrong, so it is worth being exact about. The
+    # runtime dials `http://tool-gateway.map-dev.svc.cluster.local/mcp` -- no port, so 80
+    # -- and the filter sees the Service's address and port 80, not this pod's rule. The
+    # entry that matches it is written by the network-policy controller, which resolves
+    # the Service fronting these pods and maps the 8080 named here onto that Service's own
+    # 80. Amazon's considerations for this feature also say flatly that a Service's port
+    # must equal its container port, which these two do not: the platform's compiled
+    # base_url carries no port, so the Service must publish 80, while the container listens
+    # on 8080.
+    #
+    # So this rule either holds or a Session cannot call a model at all, and NOTHING IN
+    # THIS TREE CAN TELL YOU WHICH. It is a live measurement, and it is the first thing to
+    # take after enforcement is turned on:
+    #
+    #   kubectl exec -n map-dev <a session pod> -c session-shim -- \
+    #     python -c "import socket;socket.create_connection(('tool-gateway.map-dev.svc.cluster.local',80),5)"
+    #
+    # If that hangs where it used to connect, the translation did not happen, and the fix
+    # is a Service whose port equals its container port -- which moves the compiled
+    # base_url and belongs to `control/pod_config/compiler.py` and the two gateway manifests
+    # rather than to this file.
+    - to:
+        - podSelector:
+            matchLabels: { map.component: tool-gateway }
+        - podSelector:
+            matchLabels: { map.component: model-gateway }
+      ports:
+        - { protocol: TCP, port: 8080 }
+---
+# The floor. Applied last, and it is the only document here that says anything about a pod
+# nobody has written yet.
+#
+# An empty `podSelector` selects every pod in this namespace, and naming both policy types
+# with no rule of either denies both directions. For the six workloads above it changes
+# nothing -- a pod selected by two policies gets the union of their allowances -- so what
+# this is for is the seventh: a workload added to `map-dev` with no document in this file
+# has no network at all, and finds out immediately rather than inheriting the run of the
+# cluster.
+#
+# That is a real cost and it is the intended one. The failure it produces is a new pod
+# whose every connection times out, which is legible; the failure it prevents is a new pod
+# that can dial the unauthenticated control plane, which is not.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: map-dev
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]

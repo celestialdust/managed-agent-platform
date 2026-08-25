@@ -1,0 +1,101 @@
+# Every gate this project is checked with, run on every pull request and every push to
+# main. It defines no command of its own: each step calls a target in the Makefile, so
+# what CI runs and what a developer types are the same words and cannot drift apart.
+#
+# There is no deploy job, and that is deliberate rather than unfinished. Deploying this
+# platform means holding AWS credentials that can place pods, read the vault and roll
+# three Deployments; putting them in a GitHub secret would widen who holds them from
+# "an operator at a terminal" to "anything that can trigger a workflow". `make deploy`
+# is the deploy, and a person runs it.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A second push to the same branch supersedes the first; nothing is learned by finishing
+# a run against a commit that is already history.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast, no services, no containers: this is the half that can fail in seconds, so it
+  # runs beside the suite rather than ahead of it -- a type error and a broken test are
+  # both worth knowing about on the same run.
+  static:
+    name: lint · format · types · residue
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install the locked toolchain
+        run: make setup
+
+      - name: Lint
+        run: make lint
+
+      - name: Format
+        run: make format-check
+
+      - name: Types
+        run: make types
+
+      - name: Merge residue
+        run: make residue
+
+  suite:
+    name: tests
+    runs-on: ubuntu-latest
+    # The offline suite takes a little over two minutes locally and starts a PostgreSQL
+    # container per session. The ceiling is generous against a cold image pull, not
+    # against a hang: a run that reaches it has stopped making progress.
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install the locked toolchain
+        run: make setup
+
+      # Pulled before the suite so a slow registry shows up as a slow pull rather than
+      # as a slow first test, and so the pull's failure names the image.
+      - name: Pull the database image the fixtures start
+        run: docker pull postgres:17-alpine
+
+      # No overrides. `make test` already prints skip reasons and already strips
+      # AWS_PROFILE from the suite's environment; a flag or a variable passed only here
+      # is a difference between what CI runs and what a person runs, which is the one
+      # thing this workflow exists not to have.
+      - name: Suite
+        run: make test
+
+  # The list of skip gates, printed on every run. It costs a second and it is the only
+  # thing standing between "3974 passed" and a reader believing that means everything
+  # ran.
+  gates:
+    name: skip gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - run: make gates

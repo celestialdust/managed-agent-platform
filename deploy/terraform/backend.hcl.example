@@ -1,0 +1,13 @@
+# Copy to `backend.hcl` and fill in the bucket, then:
+#
+#     terraform init -backend-config=backend.hcl
+#
+# Only `bucket` lives here. Everything else about the backend -- the key, the region,
+# encryption, and S3-native locking -- is committed in `versions.tf`, because none of it
+# names an account. This one argument is separated for the single reason given there: a
+# backend block accepts no expressions, so a bucket name that embeds the account id
+# cannot be derived the way every other ARN in this configuration is.
+#
+# The name this environment uses is `map-dev-tfstate-<account-id>-<region>`. It is NOT
+# the platform bucket -- see `versions.tf` for why state must not live there.
+bucket = "map-dev-tfstate-000000000000-us-east-1"

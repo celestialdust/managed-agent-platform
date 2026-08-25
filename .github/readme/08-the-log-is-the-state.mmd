@@ -1,0 +1,8 @@
+flowchart LR
+    E41["41 · start"] --> E42["42 · tool"] --> E43["43 · text"] --> E44["`44 · discarded
+marked, not removed`"] --> E45["45 · tool"] --> E46["46 · done"]
+    E46 -->|fold| CUR["`**current state**
+computed on every read`"]
+
+    style E44 fill:#fdeaea,stroke:#c0392b
+    style CUR fill:#e8f6f3,stroke:#16a085,stroke-width:2px

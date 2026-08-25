@@ -1,0 +1,471 @@
+"""Getting a file the agent WROTE out of the pod before the pod is allowed to die.
+
+A Session's workspace is an `emptyDir` (`deploy/k8s/session-pod.yaml`). Nothing about it
+outlives the pod, so until this existed a tenant who asked an agent to produce a
+document got a completed Turn and no document: the bytes were written, the Turn was
+recorded, and the reaper took the volume with the pod.
+
+This is the outbound mirror of `session_files.py`. That module reads the object store
+and pushes a tenant's upload down the authenticated hop into the pod; this one pulls
+what the agent left back up the same hop and puts it in the store. The direction is
+the same in both and it is not a style choice: the pod is given no cloud identity
+(ADR-004), so nothing in it can read or write a bucket, and every byte crossing that
+boundary crosses because the control plane came and moved it.
+
+It is the same journey the Rollout already makes -- fetch off the pod's disk at a
+completed Turn, put in the object store -- and it deliberately makes the same choices
+where the reasons carry over. Where it differs, the difference is stated at the point it
+is made.
+
+Nothing here imports a web framework, an object-store client or the pod wire. The three
+collaborators are Protocols declared below and satisfied elsewhere, which is what keeps
+this module -- where every bound and every refusal lives -- exercisable without an HTTP
+request or a bucket.
+"""
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Protocol
+
+from managed_agent.control.files.store import content_digest
+from managed_agent.core.ids import SessionId, TenantId, TurnId
+from managed_agent.core.pod.workspace_contract import is_a_produced_path
+from managed_agent.core.ports import EventLogAppend
+from managed_agent.core.session.event_append import append_in_order
+from managed_agent.core.session.session import SessionRecord
+from managed_agent.core.vfs.session_vfs import (
+    ARTIFACTS,
+    ObjectAlreadyPresent,
+    SealedFile,
+    SourceRef,
+    StoredObject,
+    VfsFile,
+)
+from managed_agent.core.vocabulary import output
+
+OUTPUT_COUNT_LIMIT = 32
+"""How many produced files one completed Turn may ship, and the most one is listed.
+
+Declared here rather than beside the route that reports them, because it is a bound on
+what a control-plane worker will take rather than a fact about the pod -- and read by
+`shim/serve.py`, so the listing and the refusal cannot come to disagree about what "too
+many" is. The listing stops once it has this many *plus one*, and that extra entry is
+what lets this module tell "exactly the limit" from "more than the limit" without the
+pod having read a directory of unknown size to count.
+
+Thirty-two is generous for what this ships and small enough to keep the transfer
+bounded. An agent asked to produce a document produces one to a handful of files at
+its working root; a tree with more than thirty-two files directly in it is a build
+directory, and shipping one of those is an unbounded transfer of things nobody asked
+to keep.
+
+The cost is stated where it bites: a Session whose agent leaves more than this at its
+root has every Turn refused, and cannot be unwedged from the tenant surface -- there is
+no route that deletes a file out of a pod. That is the deliberate trade. A tenant handed
+thirty-two of a hundred files cannot tell which the platform dropped, or that it dropped
+any, and a silent wrong answer is worse than a loud refusal.
+"""
+
+OUTPUT_BUDGET_BYTES = 64 * 1024 * 1024
+"""How many bytes of produced files one completed Turn may ship, in total.
+
+A quarter of `session_files.WORKSPACE_FILE_BUDGET_BYTES`, and the ratio is the reason
+rather than the number. That budget is spent once per Session, when its attachments are
+placed; this one is spent **once per Turn**, and a Session runs many Turns, so the
+per-Turn figure has to be the smaller of the two or a long Session's ship-outs dominate
+what a control-plane worker holds.
+
+What it bounds is exactly that: this worker's memory. Each file is pulled off the pod
+into memory and handed to the file store, which buffers it again to hash it, so the peak
+is one file rather than the whole set -- but the set is what a Turn is allowed to cost,
+and an unbounded one is a control-plane replica killed by the OOM reaper while serving
+one tenant's Session.
+
+Checked against the lengths the listing reported, before any transfer starts, for the
+reason `session_files.py` checks its budget before its first push: a Turn that is going
+to be refused on its fourth file should not have shipped three.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class ProducedFile:
+    """One file the agent produced: where it sits in the tree, and how big it is.
+
+    `name` is a path relative to the directory ship-out is reading from, so it may carry
+    separators -- `report/fig1.png` is one file, at that path, one directory down. The
+    field kept its name through that widening because it is the wire's field name too,
+    and renaming it here alone would leave the two spellings to be reconciled by whoever
+    next read `pod_channel.py`.
+
+    The length is carried because it is what the transfer is checked against. A produced
+    file is not append-only the way a Rollout is, so a body that arrives short has no
+    torn-tail reading available: it is a partial document, and storing one under the
+    whole document's name is a lie the tenant has no way to detect.
+
+    Declared here rather than in the shim's wire models so this module names nothing on
+    the pod wire. `shim/pod_channel.py` parses the wire shape and hands back these.
+    """
+
+    name: str
+    byte_length: int
+    content_sha256: str | None = None
+    """What the pod said the bytes hash to, or None if it does not report digests.
+
+    None is not "no opinion, proceed": it is "this pod predates the field". A Session's
+    pod runs the shim image it started with, so a control plane that required this would
+    fail every Turn already in flight the moment it rolled. Verified when present,
+    skipped when absent, and the absence is what a rolling deploy looks like rather than
+    a hole a caller chose.
+    """
+
+
+class OutputsNotShippable(Exception):
+    """What the agent produced cannot be made durable, so the Turn did not achieve it.
+
+    One type for every reason, because the caller does the same thing with all of them:
+    `HttpPodDispatch` turns whatever the completion seam raises into `TurnUndeliverable`
+    and `control/api/routes/turns.py` records the Turn as failed. The reasons are not
+    interchangeable to a reader, though -- too many files, too many bytes, a body that
+    did not match its listed length, and a name the pod promised not to send are four
+    different problems -- so each carries its own message.
+    """
+
+
+class WorkspaceOutputs(Protocol):
+    """Getting at what one Session's agent has written, without naming a transport.
+
+    The concrete implementation is `shim/pod_channel.py`'s `PodOutputFetch`, which
+    computes the pod's address and the Session's bearer token from what the cluster
+    answers. A Protocol rather than that class for the reason `RolloutFetch` is one:
+    `placement` sits on the far side of this seam and importing it here would close a
+    cycle back through `control/session/placement.py`.
+
+    The direction is the point of the shape, exactly as it is for a Rollout. State
+    leaves a pod because the control plane came and read it, never because the pod
+    pushed: a Protocol shaped the other way would need a durable write credential inside
+    the least-trusted process in the platform, and the per-Session token that would
+    authorize it is a constant for the Session's life with no nonce and no expiry
+    (ADR-022).
+    """
+
+    async def list_outputs(self, session_id: SessionId, /) -> tuple[ProducedFile, ...]:
+        """What that Session's agent has produced. Empty when its pod holds nothing.
+
+        May answer with more entries than `OUTPUT_COUNT_LIMIT`; that is how "the
+        workspace holds more than we will take" is reported, and the caller decides
+        what it costs.
+        """
+
+    async def fetch_output(
+        self, session_id: SessionId, name: str, limit_bytes: int, /
+    ) -> bytes | None:
+        """That file's bytes, or None when the name no longer names a plain file.
+
+        Refuses rather than truncating past `limit_bytes`, so a pod that under-reported
+        a length in its listing cannot spend more of this worker's memory than the
+        budget the listing was checked against.
+        """
+
+
+class ArtifactLane(Protocol):
+    """The two lane operations shipping a produced file needs, and no third.
+
+    `place` and not `replace`, because the destination is sealed: a Turn's artifact is
+    written once and the store refuses a second write to the same key. `read` is here
+    only for what that refusal costs -- see `_ship_one` -- and is deliberately not a
+    listing: what this module ships is decided by what the pod offers, never by what the
+    lane already holds.
+
+    A narrow Protocol rather than the concrete `SessionVfsStore`, matching how
+    `session_files.py` asks the file store for a read: this module is the high-level
+    half and has no business knowing the store also lists lanes, or that the event
+    recording each write is appended by the same call. `SessionVfsStore` satisfies it
+    structurally, so the composition root passes the real one and nothing adapts
+    anything.
+    """
+
+    async def place(
+        self, file: VfsFile, body: bytes, sources: Sequence[SourceRef] = ()
+    ) -> StoredObject:
+        """Write a new object. Raises `ObjectAlreadyPresent` if the key is occupied."""
+
+    async def read(self, file: VfsFile) -> bytes | None:
+        """The object's bytes, or None when the lane holds nothing at that path."""
+
+
+class SessionCreationFacts(Protocol):
+    """A Session's record by id alone, for the one field this needs: its tenant.
+
+    Keyed by the Session and taking no tenant, which is worth being exact about because
+    every tenant-scoped read of that store takes one. The tenant argument is what a
+    *caller-supplied* id is filtered by, so another tenant's Session is absent from an
+    answer rather than fetched and then dropped. Nothing is caller-supplied here: this
+    runs on the completion of a Turn the platform itself admitted, for a Session it
+    already resolved, and the record is never handed back out -- its `tenant_id` is only
+    used to scope the write that follows. A tenant argument here would have to be
+    invented, and an invented tenant is a filter that always agrees with itself.
+    """
+
+    async def read(self, session_id: SessionId) -> SessionRecord: ...
+
+
+class TurnCompletionSeam(Protocol):
+    """Whatever a completed Turn owes. Satisfied by this module's class and by
+    `rollout_sync.ShipOutAtTurnCompletion`, neither of which imports the other."""
+
+    async def turn_completed(self, session_id: SessionId, turn_id: TurnId) -> None: ...
+
+
+class EachAtTurnCompletion:
+    """Every seam a completed Turn owes, awaited in the order they were given.
+
+    Ordered, and the order is a decision rather than an artefact of a loop. The
+    Rollout's ship-out goes first: it is the Session's resume state, so losing it makes
+    every later Turn impossible, while losing a produced document costs that document. A
+    seam that raises stops the ones behind it, so putting the recoverable loss second is
+    what keeps a failure to ship one file from also costing the Session its ability to
+    run again.
+
+    A variadic composite rather than a field on either seam, because neither owns the
+    other and a seam that reached for a sibling would decide the order somewhere no
+    reader of the composition root can see it.
+    """
+
+    def __init__(self, *seams: TurnCompletionSeam) -> None:
+        self._seams = seams
+
+    async def turn_completed(self, session_id: SessionId, turn_id: TurnId) -> None:
+        for seam in self._seams:
+            await seam.turn_completed(session_id, turn_id)
+
+
+class ShipOutOutputsAtTurnCompletion:
+    """Puts every file the agent produced this Turn into the object store.
+
+    **A failed ship-out raises, and the Turn's tenant-visible events have already been
+    appended.** That is the Rollout path's choice and the reason carries over intact: a
+    Turn that reads as complete while what it produced is still only inside a pod about
+    to be allowed to die is the exact lie this whole module exists to remove. ADR-004
+    already puts the Event-Log-ahead-of-the-durable-state divergence in writing, so the
+    honest outcome is a dispatch that fails loudly over one that swallows the error.
+
+    The cost of that choice is real and is bounded deliberately. A transient
+    object-store failure turns a Turn that did run into a Turn recorded as failed, which
+    a tenant may retry and pay for twice -- so `EachAtTurnCompletion` runs the Rollout's
+    ship-out first, and a failure here therefore never costs the Session its resume
+    state. What it costs is one Turn's record, not the Session.
+
+    **A pod holding nothing does nothing**, and unlike a Rollout that is the common case
+    rather than a guard: most Turns answer in text and write no file, and there is no
+    stored object here for an empty answer to overwrite. Nothing is asked of the file
+    store, the Session registry or the Event Log for such a Turn.
+
+    **Each file shipped appends `output.produced`, and without it the bytes are
+    unreachable.** Nothing else in the platform tells the tenant which path a Turn wrote
+    to: `GET /v1/sessions/{id}/resources` lists what the Session was created with, and
+    there is deliberately no route that lists a lane. So the append is part of shipping
+    rather than a notification beside it -- a stored file nobody was told about is the
+    same outcome as one that never left the pod, an AWS bill worse.
+
+    That is the second event each shipped file produces. The first is
+    `vfs.object_placed`, appended by the lane store inside `place`, recording that the
+    object exists and what it hashes to; this one says the object is a deliverable.
+    Neither is derivable from the other, because the same lane write happens for things
+    nobody asked for.
+
+    The append is per file and follows that file's write, so a run that raises partway
+    has appended exactly the files that are durable. The alternative -- one event after
+    the loop -- would name files that shipped and files that did not with no way to tell
+    which, and the loop above already refuses every bound before the first transfer
+    precisely so that a partial ship-out is rare rather than routine.
+    """
+
+    def __init__(
+        self,
+        outputs: WorkspaceOutputs,
+        artifacts: ArtifactLane,
+        sessions: SessionCreationFacts,
+        events: EventLogAppend,
+    ) -> None:
+        self._outputs = outputs
+        self._artifacts = artifacts
+        self._sessions = sessions
+        self._events = events
+
+    async def turn_completed(self, session_id: SessionId, turn_id: TurnId) -> None:
+        """Ship what this Session's agent produced, or refuse having shipped none.
+
+        Every refusal is decided before the first transfer, which is the shape
+        `session_files.place_for` takes and for the same reason: a partial ship-out is
+        the worst outcome available, because a tenant holding three of five documents
+        cannot tell which two the platform dropped or that it dropped any.
+
+        The names are re-parsed here even though the pod filtered them, because the pod
+        is the untrusted end: `parse_upload_filename` is what the platform records a
+        file under, and a name that fails it is a pod sending something its own listing
+        promised not to. That is a lying pod rather than a badly named document, which
+        is why it raises rather than being skipped -- a real pod never produces it.
+        """
+        produced = await self._outputs.list_outputs(session_id)
+        if not produced:
+            return
+        if len(produced) > OUTPUT_COUNT_LIMIT:
+            raise OutputsNotShippable(
+                f"the workspace of session {session_id} holds more than "
+                f"{OUTPUT_COUNT_LIMIT} files at its root after turn {turn_id}, so "
+                "shipping them would be an unbounded transfer and shipping some of "
+                "them would not say which"
+            )
+        total = sum(file.byte_length for file in produced)
+        if total > OUTPUT_BUDGET_BYTES:
+            raise OutputsNotShippable(
+                f"the files session {session_id} produced in turn {turn_id} total "
+                f"{total} bytes, over the {OUTPUT_BUDGET_BYTES} one Turn may ship"
+            )
+        for file in produced:
+            _refuse_a_path_the_pod_promised_not_to_send(session_id, file.name)
+        tenant_id = (await self._sessions.read(session_id)).tenant_id
+        for file in produced:
+            await self._ship_one(session_id, tenant_id, file)
+
+    async def _ship_one(
+        self,
+        session_id: SessionId,
+        tenant_id: TenantId,
+        file: ProducedFile,
+    ) -> None:
+        """One produced file, checked against the length its listing reported.
+
+        **The fetch is capped at that same length rather than at the whole budget.** It
+        is the tightest cap available and it is free, because the listing already said
+        how big the file is -- so a pod that under-reports a length to slip a large
+        transfer past the budget check above is refused at the wire instead.
+
+        A body *shorter* than the listing is refused too, and that is the half a cap
+        cannot do. A produced file is not append-only, so short bytes are a document
+        that was being rewritten while it was read, and storing that under the whole
+        document's name is undetectable afterwards: the store hashes what it is given,
+        so the digest would certify the truncation.
+
+        **The length is checked and then the digest, and the second catches what the
+        first cannot.** A file rewritten to the same length between the listing and the
+        fetch passes every length check there is; only the content settles it. The pod
+        reports the digest it computed while listing, so this compares two moments on
+        the pod's own filesystem rather than trusting one of them -- and a mismatch is a
+        refusal rather than a repair, because nothing here knows which of the two bodies
+        the tenant meant. A pod that reports no digest is not refused, for the reason
+        `ProducedFile.content_sha256` gives.
+
+        **A file that has vanished is skipped, not refused.** The pod answers "no plain
+        file there" for a name it listed a moment earlier when the agent unlinked it
+        after its Turn ended, and there is no document in that to lose.
+
+        **The destination is a sealed lane, so the second Turn of every Session lands
+        on an occupied key.** Nothing clears the agent's output directory between Turns
+        -- and nothing should, because a route that reached into a pod to delete a
+        tenant's files to fix a control-plane problem would also destroy the tenant's
+        expectation that `out/` accumulates across a Session. So a Turn that produced
+        nothing new re-offers the previous Turn's files, and `place` refuses every one
+        of them. Left unhandled that fails a Turn that did nothing wrong, on the second
+        Turn, for every Session that ever produced a file.
+
+        `_is_already_delivered` settles it by reading what is stored. Identical bytes
+        mean this exact artifact is already durable and already announced, so the ship
+        succeeded before and succeeds now, and nothing is appended -- an event per Turn
+        naming an unchanged file would tell a tenant polling the log that their document
+        was produced again on a Turn that never touched it. Different bytes at the same
+        path are a real collision: the agent rewrote a delivered artifact, the seal says
+        that cannot be recorded, and the Turn is refused saying so.
+        """
+        body = await self._outputs.fetch_output(session_id, file.name, file.byte_length)
+        if body is None:
+            return
+        if len(body) != file.byte_length:
+            raise OutputsNotShippable(
+                f"session {session_id} listed {file.name!r} as {file.byte_length} "
+                f"bytes and served {len(body)}, so what arrived is not the document"
+            )
+        if (
+            file.content_sha256 is not None
+            and content_digest(body) != file.content_sha256
+        ):
+            raise OutputsNotShippable(
+                f"session {session_id} served {file.name!r} at the length it listed "
+                "but not the content it listed, so the bytes changed between the two "
+                "and what arrived is not the document that was offered"
+            )
+        target = SealedFile(
+            tenant_id=tenant_id,
+            session_id=session_id,
+            lane=ARTIFACTS,
+            relative=file.name,
+        )
+        try:
+            await self._artifacts.place(target, body)
+        except ObjectAlreadyPresent as occupied:
+            if await self._is_already_delivered(target, body):
+                return
+            raise OutputsNotShippable(
+                f"session {session_id} produced {file.name!r} again with different "
+                "bytes, and an artifact already delivered under that path cannot be "
+                "revised -- write the new version under a different path"
+            ) from occupied
+        await append_in_order(
+            self._events,
+            session_id,
+            output.OUTPUT_PRODUCED,
+            {"path": file.name, "byte_length": len(body)},
+        )
+
+    async def _is_already_delivered(self, target: SealedFile, body: bytes) -> bool:
+        """Whether the lane already holds exactly these bytes at exactly this path.
+
+        Compares the bytes rather than a digest of them, which is what the port makes
+        available and is also strictly the stronger check: two digests agreeing is
+        evidence the bodies agree, and the bodies agreeing is the fact itself. There is
+        no `head` on `LaneBlobs` that could answer this without the download, and adding
+        one to save a fetch on a path that only runs when a Turn produced nothing new
+        would be buying speed with a fifth operation on a port whose whole claim is that
+        it has four.
+
+        The cost is stated where it bites: this holds the stored object and the fetched
+        one at once, so a re-offered 64 MiB artifact peaks at twice that in this worker.
+        The per-Turn budget already bounds the set, and the peak is one file rather than
+        the set, so the ceiling is `OUTPUT_BUDGET_BYTES` doubled and not multiplied by
+        the file count.
+
+        A read that answers None while `place` said the key was occupied is a delete
+        between the two calls -- which nothing in this platform holds the grant to do --
+        so it is reported as a real collision rather than as a match. Answering "already
+        delivered" for an object that is not there would drop the file silently.
+        """
+        stored = await self._artifacts.read(target)
+        return stored is not None and stored == body
+
+
+def _refuse_a_path_the_pod_promised_not_to_send(
+    session_id: SessionId, relative: str
+) -> None:
+    """Raise unless this path is one the pod's own listing rule would have offered.
+
+    Re-parsed rather than trusted. The shim filters its listing by `is_a_produced_path`
+    and this checks the same predicate, so a path arriving here that fails it is not a
+    document with an awkward name -- it is a pod sending something its own listing said
+    it would not, and the honest reading of that is a compromised pod rather than a file
+    to quietly drop.
+
+    Checked for every file before the first transfer, for the reason the count and byte
+    bounds are: a Turn that is going to be refused on its fourth file should not have
+    shipped three, because a tenant holding three of five documents cannot tell which
+    two the platform dropped or that it dropped any.
+
+    Refuses rather than returning a parsed value, because there is nothing to return:
+    the path is a `str` already and `SealedFile` parses it again at construction. What
+    this adds over that parse is the dotted-segment rule and a message naming the pod.
+    """
+    if not is_a_produced_path(relative):
+        raise OutputsNotShippable(
+            f"the pod for session {session_id} offered {relative!r} as a produced "
+            "file, which is not a path this platform's own listing rule would have "
+            "offered: it must be relative, carry no dotted segment and no `..`"
+        )

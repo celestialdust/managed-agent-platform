@@ -1,0 +1,51 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "TheDatabasePasswordOnly",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-east-1:000000000000:secret:map/dev/platform/*"
+    },
+    {
+      "Sid": "WebhookSigningSecretsOnly",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-east-1:000000000000:secret:map/webhook-secret/*"
+    },
+    {
+      "Sid": "WriteToolCredentialsNeverReadThem",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:TagResource"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-east-1:000000000000:secret:map/tool-credential/*"
+    },
+    {
+      "Sid": "UploadedFilesOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::map-dev-000000000000-us-east-1-an/*"
+    },
+    {
+      "Sid": "ListTheObjectBucketOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::map-dev-000000000000-us-east-1-an"
+    }
+  ]
+}

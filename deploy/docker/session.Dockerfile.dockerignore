@@ -1,0 +1,25 @@
+# The build context for session.Dockerfile, and nothing else.
+#
+# BuildKit reads "<dockerfile-path>.dockerignore" in preference to a root .dockerignore,
+# so this scopes the filter to this one image instead of claiming a repository-root file
+# every future image build would share.
+#
+# An allowlist, and that is the whole design. The repository root is 5.5 GB -- .claude is
+# 4.8 GB of worktrees and tool output, .venv is 470 MB, .reference is 109 MB, .mypy_cache
+# is 107 MB -- and a build sends the context to the daemon before it runs one instruction.
+# A denylist would have to name each of those, and would silently ship the next large
+# directory somebody adds. This names the three paths the image needs and excludes
+# everything else by default.
+#
+# src/** rather than src: the pattern must match the files inside the directory, not only
+# the directory entry.
+#
+# The last two are the model-catalogue bake step, and they are named as single files
+# rather than as `!tools/**` and `!deploy/**` on purpose: this is an allowlist, and a
+# directory glob would silently ship whatever anybody adds beside them next.
+*
+!pyproject.toml
+!uv.lock
+!src/**
+!tools/bake_model_catalog.py
+!deploy/k8s/model-gateway.yaml

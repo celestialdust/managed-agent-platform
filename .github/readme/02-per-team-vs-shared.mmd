@@ -1,0 +1,27 @@
+flowchart LR
+    subgraph one ["one agent per use case"]
+        direction TB
+        TA1["Team A"] -->|its own key| M1[("`models · tools
+n keys`")]
+        TB1["Team B"] -->|its own key| M1
+        TC1["Team C"] -->|its own key| M1
+        N1["`each rebuilds the basics
+no company-wide record`"]
+    end
+    subgraph shared ["one shared layer"]
+        direction TB
+        TA2["Team A"] --> P["`**the platform**
+sessions · permissions
+tools · evidence
+recovery · the record
+**built once**`"]
+        TB2["Team B"] --> P
+        TC2["Team C"] --> P
+        P --> M2["`models · tools
+keys live only here`"]
+        P --> R["`**one record**
+every session, one shape`"]
+    end
+
+    style P fill:#fdeaea,stroke:#c0392b,stroke-width:2px
+    style R fill:#e8f6f3,stroke:#16a085

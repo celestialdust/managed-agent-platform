@@ -1,0 +1,14 @@
+flowchart LR
+    T1["`**Turn 1**
+finished`"] --> T2["`**Turn 2**
+finished`"]
+    T2 --> T3["`**Turn 3**
+in flight — lost`"]
+    T3 -.->|"the pod dies"| NEW["`**A new pod picks up**
+restored from Turn 2
+tail cut off`"]
+    T2 -->|"read out every Turn"| RS["`**rollout**`"]
+    RS -.-> NEW
+
+    style T3 fill:#fdeaea,stroke:#c0392b,stroke-dasharray: 5 5
+    style RS fill:#e8f6f3,stroke:#16a085

@@ -1,0 +1,23 @@
+flowchart TB
+    CP["`**Control plane**
+sessions · files`"] --> CORE
+    GW["`**Gateways**
+model · tool`"] --> CORE
+    SH["`**Session shim**
+in the pod`"] --> CORE
+    CORE["`**core**
+ids · vocabulary · ports
+Protocols only
+no driver, no HTTP, no cloud`"]
+    AD["`**adapters**
+postgres · s3
+kubernetes · secrets`"] -->|implements| CORE
+    COMP["`**composition.py**
+where a port meets
+an implementation
+**ruff banned-api**`"]
+    COMP -.-> CORE
+    COMP -.-> AD
+
+    style CORE fill:#e8f6f3,stroke:#16a085,stroke-width:2px
+    style COMP fill:#fdeaea,stroke:#c0392b,stroke-width:2px

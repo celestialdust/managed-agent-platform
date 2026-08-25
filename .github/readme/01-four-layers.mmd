@@ -1,0 +1,23 @@
+flowchart TD
+    A["`**The team's own product**
+their users · their screens
+their authorization`"]
+    B["`**This platform**
+the enterprise layer
+who may reach what
+what happened · what it cost
+how a person takes it back
+**the only layer we build**`"]
+    C["`**The agent loop**
+adopted, never patched
+decide → call a tool → read
+compaction · checkpoints
+streaming · retry · approvals`"]
+    D["`**Models**`"]
+
+    A -->|"one REST surface"| B
+    B -->|"a compiled config"| C
+    C -->|"three different wires"| D
+
+    style B fill:#fdeaea,stroke:#c0392b,stroke-width:2px
+    style C fill:#f0f0f0,stroke:#999,stroke-dasharray: 5 5

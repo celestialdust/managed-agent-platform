@@ -1,0 +1,45 @@
+flowchart TB
+    T["`**Tenant service**
+a team's own product`"] -->|REST| CP["`**Control plane**
+sessions · definitions
+registries · files`"]
+    CP -->|"places the pod"| POD
+
+    subgraph POD ["SESSION POD · untrusted · no key · no cloud identity"]
+        direction TB
+        SH["`**session shim**
+four event types`"]
+        AL["`**agent loop**
+adopted, never patched`"]
+        SB["`**sandbox**
+path-prefix deny rules
+no TCP listener`"]
+        SH ---|unix socket| AL --- SB
+    end
+
+    POD --> MG["`**Model Gateway**
+the only model provider
+holds the upstream tokens`"]
+    POD --> TG["`**Tool Gateway**
+the only MCP server
+holds the tool credentials`"]
+    MG --> UP["upstreams"]
+    TG --> TS["your tool servers"]
+
+    POD -->|"`events leave as
+mapped types`"| EL["`**Event log**
+append-only, contiguous
+state is a fold of this`"]
+    CP -->|"rollout, every Turn"| OS["`**Object store**
+rollout · evidence · files
+the durable filesystem`"]
+    TG -->|"`evidence, hashed
+outside the pod`"| OS
+    OS -.->|"mounted back in"| POD
+
+    style POD fill:#fafafa,stroke:#999,stroke-dasharray: 5 5
+    style CP fill:#fdeaea,stroke:#c0392b
+    style MG fill:#e8f6f3,stroke:#16a085
+    style TG fill:#e8f6f3,stroke:#16a085
+    style OS fill:#e8f6f3,stroke:#16a085
+    style EL fill:#e8f6f3,stroke:#16a085

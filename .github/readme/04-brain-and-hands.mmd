@@ -1,0 +1,19 @@
+flowchart TB
+    subgraph theirs ["ANTHROPIC · decoupled"]
+        direction LR
+        BR1["`**the brain**
+the loop, hosted`"] -->|on demand| HA1["`**the hands**
+sandbox, started later
+may run in your VPC`"]
+    end
+    subgraph ours ["OURS · co-located, on purpose"]
+        direction LR
+        BR2["`**the brain**
+the agent loop`"] --- HA2["`**the hands**
+sandbox + files`"]
+    end
+    ours -.- E["`**the pod edge is the**
+**credential boundary**`"]
+
+    style ours fill:#fdeaea,stroke:#c0392b,stroke-width:2px,stroke-dasharray: 5 5
+    style E fill:#fff,stroke:#c0392b

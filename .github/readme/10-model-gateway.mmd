@@ -1,0 +1,20 @@
+flowchart LR
+    REQ["`**a Turn's request**
+from the agent loop`"] --> RE["`**Routing Entry**
+by model name
+no default`"]
+    RE --> RSP["`**RESPONSES**
+passed through`"]
+    RE --> AM["`**ANTHROPIC_MESSAGES**
+translated both ways`"]
+    RE --> CC["`**CHAT_COMPLETIONS**
+translated both ways`"]
+    RSP --> NOTHING["the bytes pass through"]
+    AM --> CL["`**CLASSIFIED AHEAD**
+translated, dropped,
+or fails the Turn
+**unclassified → fails**`"]
+    CC --> CL
+
+    style RE fill:#e8f6f3,stroke:#16a085
+    style CL fill:#fdeaea,stroke:#c0392b,stroke-width:2px

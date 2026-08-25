@@ -43,20 +43,7 @@ source. So we take one as-is and never patch it. What is left over is the layer 
 hands you — who is allowed to reach what, what actually happened, what it cost, and how a
 person takes the work back.
 
-```mermaid
-flowchart TD
-    A["<b>The team's own product</b><br/><small>their users · their screens · their authorization</small>"]
-    B["<b>This platform — the enterprise layer</b><br/><small>who may reach what · what happened · what it cost</small><br/><small>where the output came from · how a person takes it back</small><br/><b><small>the only layer we build</small></b>"]
-    C["<b>The agent loop — adopted, never patched</b><br/><small>decide → call a tool → read → decide again</small><br/><small>compaction · checkpoints · streaming · retry · approvals</small>"]
-    D["<b>Models</b>"]
-
-    A -->|"one REST surface · one agent definition"| B
-    B -->|"a compiled config, over a unix socket"| C
-    C -->|"three different wires"| D
-
-    style B fill:#fdeaea,stroke:#c0392b,stroke-width:2px
-    style C fill:#f0f0f0,stroke:#999,stroke-dasharray: 5 5
-```
+![Four layers: the team's product on top, this platform beneath it, the adopted agent loop under that, models at the bottom](.github/readme/01-four-layers.svg)
 
 The governing rule that comes with that position: **solve the general agent problem once,
 keep the enterprise-specific problems in this layer, and leave domain knowledge to the
@@ -102,27 +89,7 @@ the gap this fills.
 | Sales prep, finance analysis, incident triage — each copies a prompt and wires its own tools. Fast at first, then the shared basics diverge: different retries, different permissions, different audit, different output rules. | Coding agents have powerful file, terminal and execution abilities — aimed at an engineering workspace. Knowledge workers need business objects, controlled data and a shareable report, not an arbitrary shell. |
 | Nobody can tell whether a bug is the prompt, the tool, or the model. | Handing that power over unchanged hands the security risk to the user too. |
 
-```mermaid
-flowchart LR
-    subgraph one ["one agent per use case"]
-        direction TB
-        TA1[Team A] -->|its own key| M1[("models · tools<br/><small>n keys</small>")]
-        TB1[Team B] -->|its own key| M1
-        TC1[Team C] -->|its own key| M1
-        N1["<small>each rebuilds: loop · permissions · tools · record · spend</small><br/><small><b>no company-wide record anywhere</b></small>"]
-    end
-    subgraph shared ["one shared layer"]
-        direction TB
-        TA2[Team A] --> P["<b>the platform</b><br/><small>sessions · permissions · tools</small><br/><small>evidence · recovery · the record</small><br/><b><small>built once</small></b>"]
-        TB2[Team B] --> P
-        TC2[Team C] --> P
-        P --> M2["models · tools<br/><small>keys live only here</small>"]
-        P --> R["<b>one record, every session, one shape</b>"]
-    end
-
-    style P fill:#fdeaea,stroke:#c0392b,stroke-width:2px
-    style R fill:#e8f6f3,stroke:#16a085
-```
+![One agent per use case, where every team rebuilds the basics and holds its own key, against one shared layer where the paths converge](.github/readme/02-per-team-vs-shared.svg)
 
 **What changes is where the lines go.** On the left, five concerns are rebuilt per team
 and every path out carries its own key. On the right the paths converge — which is what
@@ -154,25 +121,7 @@ This is the idea the whole enforcement design hangs on. A traditional app author
 task*. What that task may reach should be far narrower than what the person may reach —
 and it is not one permission but the **intersection of five separate narrowings**.
 
-```mermaid
-flowchart TD
-    R1["<b>1 · user authorization</b><br/><small>the team's own concern, by design</small>"]
-    R2["<b>2 · agent definition</b><br/><small>ENFORCED — pinned at creation</small>"]
-    R3["<b>3 · skill revision</b><br/><small>ENFORCED — a pinned revision</small>"]
-    R4["<b>4 · session grant + scope</b><br/><small>SCOPE ENFORCED · grant shapes the list only</small>"]
-    R5["<b>5 · tool-side enforcement</b><br/><small>TENANT-LEVEL, not per-Session yet</small>"]
-    OUT["<b>what this one task may actually do</b><br/><small>narrower than any ring above</small>"]
-
-    R1 --> OUT
-    R2 --> OUT
-    R3 --> OUT
-    R4 --> OUT
-    R5 --> OUT
-
-    style OUT fill:#e8f6f3,stroke:#16a085,stroke-width:2px
-    style R4 fill:#fdf3e0,stroke:#d68910
-    style R5 fill:#fdf3e0,stroke:#d68910
-```
+![Five narrowings intersecting: user authorization, agent definition, skill revision, session grant and scope, tool-side enforcement](.github/readme/03-five-rings.svg)
 
 **Capability is an intersection, not a permission.** Two rings are real, one is the
 tenant's own, and two are narrower on paper than in the running system. Measured from the
@@ -209,21 +158,7 @@ agent loop from the place tools run**. They started with both in one container a
 away from it. We deliberately went the other way, and this is the one place our design
 disagrees with a source we otherwise follow.
 
-```mermaid
-flowchart TB
-    subgraph theirs ["ANTHROPIC — decoupled"]
-        direction LR
-        BR1["<b>the brain</b><br/><small>the agent loop, hosted</small>"] -->|on demand| HA1["<b>the hands</b><br/><small>sandbox, started later</small><br/><small>may run in the customer's VPC</small>"]
-    end
-    subgraph ours ["OURS — co-located, on purpose"]
-        direction LR
-        BR2["<b>the brain</b><br/><small>the agent loop</small>"] --- HA2["<b>the hands</b><br/><small>sandbox + files</small>"]
-    end
-    ours -.- E["<b>the pod edge is the credential boundary</b>"]
-
-    style ours fill:#fdeaea,stroke:#c0392b,stroke-width:2px,stroke-dasharray: 5 5
-    style E fill:#fff,stroke:#c0392b
-```
+![Anthropic's decoupled brain and hands against ours co-located in one pod, whose edge is the credential boundary](.github/readme/04-brain-and-hands.svg)
 
 | | decoupled (theirs) | co-located (ours) |
 |---|---|---|
@@ -279,36 +214,7 @@ The pod runs the agent loop in a sandbox. It holds **no keys and no cloud identi
 cannot even write to the object store; the control plane reads the resume state out over
 the channel it already opened. The two gateways on the far side hold the credentials.
 
-```mermaid
-flowchart TB
-    T["<b>Tenant service</b><br/><small>a team's own product</small>"] -->|REST| CP["<b>Control plane</b><br/><small>sessions · definitions · registries · files</small>"]
-    CP -->|"places the pod<br/><small>config mounted, not editable</small>"| POD
-
-    subgraph POD ["SESSION POD — untrusted zone · no key · no cloud identity · nothing durable"]
-        direction TB
-        SH["<b>session shim</b><br/><small>a closed set of four event types</small>"]
-        AL["<b>agent loop</b><br/><small>adopted, never patched</small>"]
-        SB["<b>sandbox</b><br/><small>path-prefix deny rules · no TCP listener</small>"]
-        SH ---|unix socket| AL --- SB
-    end
-
-    POD --> MG["<b>Model Gateway</b><br/><small>the pod's only model provider</small><br/><small>holds every upstream token</small>"]
-    POD --> TG["<b>Tool Gateway</b><br/><small>the pod's only MCP server</small><br/><small>holds every tool credential</small>"]
-    MG --> UP["upstreams"]
-    TG --> TS["your tool servers"]
-
-    POD -->|"events leave as mapped types<br/><small>the control plane appends</small>"| EL["<b>Event log</b><br/><small>append-only, contiguous, no gaps</small><br/><small>state is a fold of this — never stored</small>"]
-    CP -->|"rollout, at every finished Turn"| OS["<b>Object store</b><br/><small>rollout · evidence · produced files</small><br/><small>the only durable filesystem</small>"]
-    TG -->|"evidence, hashed outside the pod"| OS
-    OS -.->|"the next pod starts with these lanes mounted back in"| POD
-
-    style POD fill:#fafafa,stroke:#999,stroke-dasharray: 5 5
-    style CP fill:#fdeaea,stroke:#c0392b
-    style MG fill:#e8f6f3,stroke:#16a085
-    style TG fill:#e8f6f3,stroke:#16a085
-    style OS fill:#e8f6f3,stroke:#16a085
-    style EL fill:#e8f6f3,stroke:#16a085
-```
+![The topology: a tenant service calls the control plane, which places a Session pod holding no credential; the two gateways, the event log and the object store sit outside it](.github/readme/05-topology.svg)
 
 **The credential boundary is the whole topology.** Because the pod holds no key and no
 cloud identity, an agent that goes wrong cannot use one. It can only ask a gateway — and
@@ -328,21 +234,7 @@ Second, **large output is captured and hashed before it is handed back**, at the
 an enterprise result passes that the pod cannot reach, inside the tool's own deadline. So a
 call that cannot be recorded fails rather than succeeding unrecorded.
 
-```mermaid
-flowchart LR
-    M["<b>the model asks</b><br/><small>name + arguments</small>"] --> TG["<b>Tool Gateway</b><br/><small>against the token's tenant</small><br/><small>not per-Session yet</small>"]
-    TG -->|"unknown OR forbidden"| NG["<b>TOOL_NOT_GRANTED</b><br/><small>one answer for both</small>"]
-    TG -->|"a bound dimension<br/>the Scope lacks"| OS2["<b>TOOL_OUT_OF_SCOPE</b>"]
-    TG -->|"arguments narrowed to Scope"| RS["<b>the real tool server</b><br/><small>on the gateway's credential</small>"]
-    RS --> EV["<b>evidence captured</b><br/><small>hashed, outside the pod</small><br/><small>inside the tool's deadline</small>"]
-    EV -->|"the result the model sees<br/><small>a large payload never enters the context at all</small>"| M
-    NG -->|"the Turn continues"| M
-
-    style TG fill:#e8f6f3,stroke:#16a085
-    style NG fill:#fdeaea,stroke:#c0392b
-    style OS2 fill:#fdeaea,stroke:#c0392b
-    style EV fill:#e8f6f3,stroke:#16a085
-```
+![One tool call: the gateway resolves the name, refuses unknown and forbidden alike, clamps arguments to the Scope, then captures evidence before the model reads the result](.github/readme/06-one-tool-call.svg)
 
 ### What a crash costs
 
@@ -355,17 +247,7 @@ tail, so the incomplete part is cut off *before the bytes ever reach a new pod* 
 makes the boundary a property of the platform rather than a hope about how the old pod
 happened to fail.
 
-```mermaid
-flowchart LR
-    T1["<b>Turn 1</b><br/><small>finished</small>"] --> T2["<b>Turn 2</b><br/><small>finished</small>"]
-    T2 --> T3["<b>Turn 3</b><br/><small>in flight — lost</small>"]
-    T3 -.->|"the pod dies<br/><small>crash · node loss · eviction</small>"| NEW["<b>A new pod picks up</b><br/><small>restored from Turn 2, tail cut off</small>"]
-    T2 -->|"resume state read out<br/>at every finished Turn"| RS["<b>rollout</b>"]
-    RS -.-> NEW
-
-    style T3 fill:#fdeaea,stroke:#c0392b,stroke-dasharray: 5 5
-    style RS fill:#e8f6f3,stroke:#16a085
-```
+![Turns 1 and 2 finished and Turn 3 in flight when the pod dies; a new pod resumes from Turn 2 with the tail cut off](.github/readme/07-what-a-crash-costs.svg)
 
 **Losing a pod is normal operation, not an incident.** The cost of that guarantee: a full
 write of the resume state at every single turn, growing with how long the conversation has
@@ -379,14 +261,7 @@ outright that they are **never persisted**. Current state is computed by reading
 forward. Work that got thrown away is **marked, never deleted**, because a reader who has
 already seen event 40 must never find that event 40 changed underneath them.
 
-```mermaid
-flowchart LR
-    E41["41 · start"] --> E42["42 · tool"] --> E43["43 · text"] --> E44["44 · discarded<br/><small>marked, not removed</small>"] --> E45["45 · tool"] --> E46["46 · done"]
-    E46 -->|fold| CUR["<b>current state</b><br/><small>computed on every read</small>"]
-
-    style E44 fill:#fdeaea,stroke:#c0392b
-    style CUR fill:#e8f6f3,stroke:#16a085,stroke-width:2px
-```
+![A run of events, one of them marked discarded rather than removed, folded into the current state on every read](.github/readme/08-the-log-is-the-state.svg)
 
 **State is derived, never stored twice.** Two copies of a fact can disagree, and when they
 do nothing can say which is lying. What it costs: the log carries work that was thrown
@@ -410,20 +285,7 @@ ports — **17 Protocols and no drivers**: no database client, no HTTP client, n
 The control plane, the two gateways and the pod shim all depend on those ports. `adapters`
 implements them against Postgres, S3, Kubernetes and the secret store.
 
-```mermaid
-flowchart TB
-    CP["<b>Control plane</b><br/><small>sessions · files</small>"] --> CORE
-    GW["<b>Gateways</b><br/><small>model · tool</small>"] --> CORE
-    SH["<b>Session shim</b><br/><small>in the pod</small>"] --> CORE
-    CORE["<b>core</b> — ids, vocabulary, ports<br/><small>Protocols only. Knows no driver, no HTTP client, no cloud.</small>"]
-    AD["<b>adapters</b><br/><small>postgres · s3 · kubernetes · secrets</small>"] -->|implements| CORE
-    COMP["<b>composition.py</b><br/><small>the only place a port meets an implementation</small><br/><b><small>ruff banned-api</small></b><br/><small>any other file importing adapters, sqlalchemy or aioboto3 fails lint</small>"]
-    COMP -.-> CORE
-    COMP -.-> AD
-
-    style CORE fill:#e8f6f3,stroke:#16a085,stroke-width:2px
-    style COMP fill:#fdeaea,stroke:#c0392b,stroke-width:2px
-```
+![Control plane, gateways and session shim all depending on core's ports; adapters implementing them; composition.py the only file that knows which is which](.github/readme/09-code-layout.svg)
 
 **Dependency arrows all point inward, and one file is exempt.** The adapters point up into
 `core` because `core` defines the interface and the adapter implements it — the low-level
@@ -483,19 +345,7 @@ fails rather than falls back: there is no default entry, nothing infers a shape 
 URL, and no second shape is tried after one fails. A guess that happened to work would
 afterwards be indistinguishable from a correct answer.
 
-```mermaid
-flowchart LR
-    REQ["<b>a Turn's request</b><br/><small>from the agent loop</small>"] --> RE["<b>Routing Entry</b><br/><small>by model name; no default</small>"]
-    RE --> RSP["<b>RESPONSES</b><br/><small>passed through untranslated</small>"]
-    RE --> AM["<b>ANTHROPIC_MESSAGES</b><br/><small>translated both ways</small>"]
-    RE --> CC["<b>CHAT_COMPLETIONS</b><br/><small>translated both ways</small>"]
-    RSP --> NOTHING["<small>nothing to classify —<br/>the bytes pass through</small>"]
-    AM --> CL["<b>CLASSIFIED AHEAD OF TIME</b><br/><small>translated, dropped, or fails the Turn</small><br/><b><small>unclassified → fails</small></b><br/><small>silence is not permission</small>"]
-    CC --> CL
-
-    style RE fill:#e8f6f3,stroke:#16a085
-    style CL fill:#fdeaea,stroke:#c0392b,stroke-width:2px
-```
+![A request routed by model name to one of three wires: RESPONSES passed through, the other two translated with every construct classified ahead of time](.github/readme/10-model-gateway.svg)
 
 **The permissive outcome is the one that writes a falsehood into an append-only log.** So
 it has to be chosen deliberately rather than arrived at by omission. A construct nobody

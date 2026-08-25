@@ -16,11 +16,24 @@ SHELL := /bin/sh
 # account the ambient credentials name, which may not be this platform's. Override on
 # the command line for another account -- `make deploy AWS_PROFILE=map-prod`.
 AWS_PROFILE ?= map-dev-agent
-export AWS_PROFILE
 
-# The offline suite runs without a cluster and without AWS. The live tiers are opt-in
-# by an environment variable each, listed by `make gates`.
-PYTEST := uv run --extra dev pytest -q -p no:randomly
+# Exported to the deploy and infrastructure targets, and NOWHERE ELSE. It was exported
+# globally in the first version of this file, which put a profile name into `make test`'s
+# environment -- and the offline suite constructs a boto session at composition time, so
+# on any machine that does not have that profile the whole suite dies in
+# `aioboto3.Session()` with ProfileNotFound. That is not hypothetical: the first run of
+# this pipeline was `58 failed, 3807 passed, 112 errors`, and every one of them was that
+# line. It passed locally because the profile exists locally, which is the exact failure
+# a shared Makefile is supposed to prevent.
+_NEEDS_AWS := preflight image image-session bootstrap deploy \
+              deploy-control-plane deploy-tool-gateway deploy-model-gateway \
+              infra-plan infra-apply test-live
+$(_NEEDS_AWS): export AWS_PROFILE := $(AWS_PROFILE)
+
+# `-rs` always, not only in CI. A green summary does not mean the tiers below it ran, and
+# the skip reasons in this suite are written to say what was not checked; a flag that only
+# CI passes is a reading only CI gets.
+PYTEST := uv run --extra dev pytest -q -rs -p no:randomly
 
 .PHONY: help setup lint format format-check types residue test test-live check gates \
         api-surface preflight image image-session bootstrap deploy \
@@ -55,8 +68,12 @@ types: ## mypy --strict over source, tests and migrations
 residue: ## Fail on conflict markers a merge resolution should have removed
 	uv run python tools/merge_residue.py
 
+# `env -u` and not merely "this target does not export it": a developer with AWS_PROFILE
+# set in their own shell would otherwise hit the CI failure locally, which is the same
+# defect arriving by the other door. The offline suite has to give one answer on every
+# machine, and an ambient AWS variable is what stops it.
 test: ## The offline suite -- needs a Docker daemon, no cluster, no AWS
-	$(PYTEST)
+	env -u AWS_PROFILE $(PYTEST)
 
 # Not part of `check`, and it must not become part of it: this tier places real pods in
 # a real cluster and costs minutes and money. `make gates` lists what else it turns on.

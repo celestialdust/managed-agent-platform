@@ -78,11 +78,12 @@ jobs:
       - name: Pull the database image the fixtures start
         run: docker pull postgres:17-alpine
 
-      # `-rs` prints every skip reason. A green summary here does not mean the live
-      # tiers ran -- they are gated on environment variables this job does not set, and
-      # the reasons say plainly what was not checked.
+      # No overrides. `make test` already prints skip reasons and already strips
+      # AWS_PROFILE from the suite's environment; a flag or a variable passed only here
+      # is a difference between what CI runs and what a person runs, which is the one
+      # thing this workflow exists not to have.
       - name: Suite
-        run: make test PYTEST="uv run --extra dev pytest -q -rs -p no:randomly"
+        run: make test
 
   # The list of skip gates, printed on every run. It costs a second and it is the only
   # thing standing between "3974 passed" and a reader believing that means everything

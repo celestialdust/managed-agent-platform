@@ -29,6 +29,7 @@ any time.
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
@@ -45,6 +46,29 @@ from publish import EXCLUDED, snapshot_tree  # noqa: E402
 _MUST_SHIP = ("README.md", "pyproject.toml", "src", "tests", "deploy", "migrations")
 
 _A_PATH_UNDER_AN_EXCLUDED_PREFIX = "docs/a-design-note-this-test-invented.md"
+
+_MAY_NAME_AN_EXCLUDED_PATH = frozenset(
+    {
+        # Creates a `docs/` of its own inside `tmp_path` to prove the image build
+        # ignores one. It reads nothing from the repository's.
+        "tests/deploy/test_session_image_reaches_the_registry.py",
+        # `.claude/skills/<name>/SKILL.md` is this platform's domain vocabulary, not a
+        # path in this repository: it is where a *tenant's* uploaded repository keeps
+        # its skills, and the file posts one to `/v1/skills/repository`. The collision
+        # with the agent-instruction directory excluded here is in the name only.
+        "tests/control/test_skill_listing.py",
+        # Grades the exclusion list, so it invents a path under one on purpose --
+        # `_A_PATH_UNDER_AN_EXCLUDED_PREFIX`, which exists in no tree but the fixture's.
+        "tests/test_publish_withholds_the_design_record.py",
+    }
+)
+"""Published tests allowed to write one of these names, each with the reason.
+
+Every entry costs a reader the question "does this one really not read the record?", so
+the reason is written next to it rather than left to be re-derived. A test that reaches
+this list because it genuinely reads the design record is in the wrong list: it belongs
+in `EXCLUDED`, with the document it grades.
+"""
 
 
 def _git(*argv: str, index: str | None = None) -> str:
@@ -134,3 +158,71 @@ def test_the_snapshot_still_carries_what_ships() -> None:
         if not any(path == name or path.startswith(f"{name}/") for path in published)
     ]
     assert not missing, f"the published tree is missing {missing}"
+
+
+def _string_constants(source: str) -> list[str]:
+    return [
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    ]
+
+
+def _names_an_excluded_path(value: str) -> bool:
+    """Whether a string constant reads as a path at or under an excluded prefix.
+
+    Prefix-matching on the literal, not on a resolved path, because that is the only
+    form available: the path is assembled at runtime from `Path(...).parents[2]` and a
+    chain of `/` operands, so nothing static knows what it resolves to. What is
+    available is the pieces, and a test that names `"docs"` at all is the signal.
+    """
+    return any(value == name or value.startswith(f"{name}/") for name in EXCLUDED)
+
+
+def test_no_published_test_reads_a_path_the_publish_withholds() -> None:
+    """A test that ships must be runnable in a clone of what ships.
+
+    This is the guard for a failure that reached CI. `tests/spike/test_report_shape.py`
+    and `tests/spike/test_record_complete.py` grade a document under `docs/`, not
+    published, so on a runner they failed ten times at "the spike record does not exist"
+    -- for the absence of a file rather than for anything about the code.
+
+    The scan that was supposed to have found them beforehand was a regex over single
+    lines, and both files build their path across several:
+
+        RECORD = (
+            Path(__file__).resolve().parents[2]
+            / "docs"
+            ...
+
+    So this walks the syntax tree instead. Every string constant in every published test
+    is checked against the exclusion list, which catches the fragment `"docs"` wherever
+    in an expression it sits. It costs a parse of each test file and nothing else.
+
+    It over-reports by construction, because a literal is all it can see: three
+    published tests name one of these strings and read nothing, including this one. They
+    sit in `_MAY_NAME_AN_EXCLUDED_PATH` with the reason beside each. Over-reporting is
+    the right direction for this guard -- a false positive costs a line and a sentence,
+    and a false negative is ten setup errors on a runner.
+    """
+    offenders: list[str] = []
+    for path in sorted(_ROOT.glob("tests/**/*.py")):
+        relative = path.relative_to(_ROOT).as_posix()
+        if _names_an_excluded_path(relative) or relative in _MAY_NAME_AN_EXCLUDED_PATH:
+            continue
+        named = sorted(
+            {
+                v
+                for v in _string_constants(path.read_text())
+                if _names_an_excluded_path(v)
+            }
+        )
+        if named:
+            offenders.append(f"{relative} names {named}")
+
+    assert not offenders, (
+        "these test files ship but read something the publish withholds, so they fail "
+        "a clone for the absence of a document, not for anything about the code. So "
+        "exclude the test along with what it grades, or stop it reading the record:\n  "
+        + "\n  ".join(offenders)
+    )

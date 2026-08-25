@@ -26,6 +26,7 @@ from mcp.types import ElicitRequestParams, ElicitResult
 from schema_stdio_server import TOOL_NAME as SCHEMA_TOOL_NAME
 from starlette.types import Receive, Scope, Send
 from tool_gateway_harness import (
+    OVERSIZE_BODY_BYTES,
     TENANT,
     CountingEvidence,
     CountingVault,
@@ -446,7 +447,7 @@ async def test_a_large_result_reaches_the_caller_as_a_reference_to_stored_bytes(
     wired one step later would satisfy every unit test in
     `tests/gateway/tool/test_evidence_capture.py` and fail this one.
     """
-    body = "X" * 200_000
+    body = "X" * OVERSIZE_BODY_BYTES
     session_id = uuid4()
     built = harness(credential=body)
 
@@ -484,7 +485,7 @@ async def test_a_schema_declaring_tools_large_result_is_still_a_reference() -> N
     would: inside `call_tool`, with "has an output schema but did not return structured
     content".
     """
-    body = "R" * 200_000
+    body = "R" * OVERSIZE_BODY_BYTES
     session_id = uuid4()
     built = harness(credential=body, tool=_schema_tool())
 

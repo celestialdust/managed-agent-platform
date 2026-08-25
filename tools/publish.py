@@ -46,6 +46,11 @@ _ROOT: Final = Path(__file__).resolve().parent.parent
 # `CLAUDE.md` and `AGENTS.md` go too, and not because they are secret: every pointer in
 # them resolves into `docs/`, so published beside a tree with no `docs/` they are a page
 # of dangling references, which is worse than their absence.
+#
+# The two spike guards leave for the same reason `tests/test_gates.py` does: they grade
+# the spike record's Verdict and Measured table, so without `docs/` they fail a clone
+# for the absence of a document. `tests/spike/test_spike_image.py` stays -- it reads
+# `deploy/spike` and grades the image that gets built, which ships.
 EXCLUDED: Final[tuple[str, ...]] = (
     ".claude",
     "AGENTS.md",
@@ -53,6 +58,8 @@ EXCLUDED: Final[tuple[str, ...]] = (
     "CONTEXT.md",
     "STATE.md",
     "docs",
+    "tests/spike/test_record_complete.py",
+    "tests/spike/test_report_shape.py",
     "tests/test_gates.py",
 )
 

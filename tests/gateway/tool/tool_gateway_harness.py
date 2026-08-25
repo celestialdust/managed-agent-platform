@@ -155,6 +155,26 @@ proxy fidelity, and every one of them would otherwise assert against a reference
 sentence instead of the server's own result. A test that wants a capture sets its own.
 """
 
+OVERSIZE_BODY_BYTES: Final[int] = 100_000
+"""How large a body a test asks for when it wants one the capture point must store.
+
+Above `UNIT_TIER_THRESHOLD`, and below Linux's ceiling on a single string handed to a
+child process -- which is the half nobody expects. The only size lever either stdio
+server offers is the credential, and a credential reaches the child in its environment,
+so on Linux the whole body has to fit in one `envp` string. `MAX_ARG_STRLEN` is 32
+pages: 128 KiB wherever a page is 4 KiB, which is every runner this suite has met.
+
+Measured, not reasoned about. These tests asked for 200_000 and passed for months on
+macOS, which has no per-string limit, then failed on the first Linux CI run with
+`OSError: [Errno 7] Argument list too long` out of `subprocess.Popen`. It surfaces to
+the caller as `tool.unavailable` -- an upstream that would not start -- so it reads as a
+Gateway defect and is not one.
+
+Anything past ~128 KiB brings that back. A case that needs a genuinely larger payload
+belongs in `test_evidence_capture.py`, which calls the capture point directly and spawns
+nothing.
+"""
+
 
 def capture(
     recorder: CountingEvidence | None = None,

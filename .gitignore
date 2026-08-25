@@ -76,3 +76,12 @@ AGENTS.md
 # grades. The gate table itself is reproduced in README.md, which is where a reader
 # outside this repository looks for it.
 tests/test_gates.py
+
+# The two spike guards that read the spike record itself. They assert the Verdict is one
+# of three permitted strings and that no Measured row is blank -- properties of a document
+# under `docs/`, not of any code here. With that document untracked they fail a clone at
+# `pytest.fail("the spike record does not exist at ...")`, which is what a CI runner
+# reported on the first push. `test_spike_image.py` stays: it reads `deploy/spike`, builds
+# the image, and grades two binaries in it.
+tests/spike/test_record_complete.py
+tests/spike/test_report_shape.py

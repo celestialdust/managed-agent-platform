@@ -1,0 +1,237 @@
+# The namespace the platform runs in, and the identities its pods assume.
+#
+# The namespace name is not a choice this file makes. Three IAM roles already exist in
+# the development account -- map-control-plane, map-tool-gateway, map-model-gateway --
+# and each one's trust policy allows sts:AssumeRoleWithWebIdentity for exactly one
+# subject:
+#
+#   system:serviceaccount:map-dev:control-plane
+#   system:serviceaccount:map-dev:tool-gateway
+#   system:serviceaccount:map-dev:model-gateway
+#
+# map-cluster-autoscaler is a fourth of the same shape, made by MAP-65 rather than found
+# in the account, and it names this namespace for the same reason: the guard below
+# asserts every trusted subject shares one, so a kube-system subject would make the set
+# disagree with itself.
+#
+# So the namespace was fixed by IAM before any manifest here named one, and a pod placed
+# anywhere else holds a projected token no role will exchange. Renaming it means editing
+# four trust policies, which are AWS resources and therefore Terraform's under ADR-021,
+# not this file's. tests/deploy/test_cluster_bootstrap.py carries those four subjects as
+# measured literals and fails if this name drifts from them.
+#
+# Four ServiceAccounts, because every identity this account carries now has a workload in
+# this directory: tool-gateway.yaml names one, control-plane.yaml and schema-migration.yaml
+# both name the second, cluster-autoscaler.yaml the third, and model-gateway.yaml the
+# fourth. The test above walks every manifest in this directory for `serviceAccountName`
+# and fails when one names an account this file does not create, so a fifth identity would
+# have to arrive with its workload rather than in advance of it -- an identity for a
+# workload nobody can deploy is an identity nobody can audit.
+#
+# One Role and one RoleBinding, at the bottom, and they are the only RBAC in this
+# repository that is not the autoscaler's. They are here rather than in
+# control-plane.yaml for the same reason the ServiceAccounts are: an identity and what
+# it may do are what an auditor reads together, and a workload manifest that granted
+# itself permissions is one nobody would think to open. What grades them is
+# tests/deploy/test_the_placer_is_configured_wherever_it_is_deployed.py, which SCANS
+# every file under deploy/k8s/ for RBAC objects rather than reading a list of files --
+# the autoscaler's grader reads one manifest, and a second single-file grader beside it
+# would leave a third identity graded by nothing.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: map-dev
+---
+# The Tool Gateway's identity. It holds the tool credentials and the Session-token
+# signing key, and it reaches the vault as this role rather than with anything written
+# into a manifest -- which is the whole reason deploy/k8s/tool-gateway.yaml carries
+# secret *names* and no values.
+#
+# The annotation is what makes that work: the cluster runs the pod-identity webhook
+# (measured -- `kubectl get mutatingwebhookconfigurations` lists `pod-identity-webhook`),
+# which reads it and projects a token the role's trust policy above accepts. Without the
+# annotation the pod starts and fails at the vault; with a wrong role it starts and fails
+# at the vault the same way. Neither failure mentions this file.
+#
+# The account id is the development account's, spelled out rather than templated: this
+# repository has one account and substitution here would be a knob with one setting.
+# A second account needs a second value, and ADR-021 has already decided that AWS
+# resources -- the role this points at included -- are declared in Terraform, which is
+# where that parameter belongs when it exists.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: tool-gateway
+  namespace: map-dev
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::062677866851:role/map-tool-gateway
+---
+# The control plane's identity. Its policy grants Secrets Manager reads on
+# map/dev/platform/* and nothing else -- not S3, which the file routes in this same
+# process need, and not the RDS-managed password secret, which is why the database
+# credential arrives as a Kubernetes Secret rather than being read at start-up. Both
+# gaps are recorded in plan/MAP-63.md and neither is this file's to close.
+#
+# The annotation is what makes the projected token exchangeable, and the account id is
+# spelled out for the reason the top of this file gives: this repository has one account,
+# and ADR-021 already decided that the role this points at is Terraform's.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-plane
+  namespace: map-dev
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::062677866851:role/map-control-plane
+---
+# The autoscaler's identity, and the only one here that is not a platform service.
+#
+# In map-dev rather than the kube-system its own convention suggests, and that is a
+# guard rather than a preference: the three roles this account already carried pin one
+# namespace in their trust conditions, and the test above asserts every trusted subject
+# shares it and that this file declares exactly that one Namespace. A kube-system
+# subject fails it. Measured, both ways.
+#
+# The role this points at can call TerminateInstanceInAutoScalingGroup on a group
+# tagged as this cluster's, and nothing else. Its trust policy names this subject
+# and no other.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: cluster-autoscaler
+  namespace: map-dev
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::062677866851:role/map-cluster-autoscaler
+---
+# The Model Gateway's identity. It holds the upstream provider credentials, and it is the
+# only thing on the cluster that does -- a Session pod holds a short-lived token for that
+# service and never a provider key.
+#
+# Here rather than in deploy/k8s/model-gateway.yaml for the reason the comment at the top
+# of this file gives: a ServiceAccount a workload manifest declares is one nothing
+# creates, and admission then rejects the pod outright rather than warning. That workload
+# arrived with MAP-21, so its identity arrives here with it.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: model-gateway
+  namespace: map-dev
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::062677866851:role/map-model-gateway
+---
+# What the control plane may do in this namespace, and nothing beyond it. Every verb
+# below is one call in src/managed_agent/adapters/kubernetes/pod_runner.py and there are
+# no others: create/patch/delete on the three Secrets a Session's pod mounts, and
+# create/get/delete on the pod. tests/deploy/ derives that set from the adapter's own
+# `*_namespaced_*` call sites and asserts equality with this Role, so a widening here
+# fails as loudly as a missing grant.
+#
+# No `list` and no `watch`: `_read` names one object as a typed path parameter, so
+# nothing here can enumerate the namespace. No `pods/exec` and no `pods/log`: the
+# control plane reaches the shim over the pod network through the headless Service,
+# never through the API server.
+#
+# No `services` either, and that is checked rather than assumed: nothing in src/ calls
+# the services API at all. The headless Service a Session's shim is addressed through
+# is applied by deploy/bootstrap.py, and shim_url_for (shim/pod_channel.py) computes a
+# DNS name rather than asking the API server for one.
+#
+# `get` on secrets is deliberately NOT granted -- and that buys less than it reads
+# like. A PATCH response carries the modified object, so `patch` on secrets is a read
+# of every Secret in this namespace, this platform's database credential and both
+# signing keys included. Withholding `get` is still worth doing and it is not a
+# boundary. resourceNames cannot narrow either verb: the Secret names carry a Session
+# id generated at creation, and Kubernetes does not apply resourceNames to `create` in
+# any case. What would close it is a separate namespace for Session pods; a cheaper
+# candidate is creating the pod before its Secrets so each create carries its own
+# ownerReferences and the `patch` verb goes away entirely. Both are named in
+# docs/features/managed-agent-platform/plan/MAP-71.md blocker 4 and neither is built.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: control-plane
+  namespace: map-dev
+  labels: { map.component: control-plane }
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    # "list" is the reaper's, and it is the only verb here that reads more than one
+    # object. It is what lets the sweep see a pod whose Session ended without it --
+    # the pods that leaked are exactly the ones no Session id in the database points
+    # at any more, so they cannot be found by name. Narrowed at the call site by
+    # label_selector=map.session-id rather than by RBAC, because a label selector is
+    # not a permission: this grants the whole namespace's pods and the adapter
+    # chooses to ask for fewer.
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "patch", "delete"]
+  # `GET /v1/capacity` publishes the cluster's node ceiling beside its schedulable node
+  # count, so a reader sees the autoscaler's `--max-nodes-total` as a number rather than
+  # inferring it from a refusal. That flag is an argument on the cluster-autoscaler
+  # Deployment, which runs in THIS namespace rather than in kube-system -- see
+  # deploy/k8s/cluster-autoscaler.yaml:125-128 -- so this is a rule on the Role that
+  # already exists and needs no authority outside map-dev.
+  #
+  # Why not read the flag out of that file instead, which needs no authority at all:
+  # nothing puts `deploy/` on the serving container's filesystem, so a file read would
+  # find the flag in the test suite and nothing in the cluster. That is the worse of the
+  # two failure modes because it looks correct locally. Reading the running Deployment's
+  # own args cannot drift from the flag, because it IS the flag.
+  #
+  # `get` and `resourceNames`, which is the narrowing the Secret rule above could not
+  # have and this one can: the name is fixed at deploy time rather than generated per
+  # Session. A `list` here would return every Deployment in the namespace -- this
+  # platform's own three included -- to answer a question about one of them.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["cluster-autoscaler"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: control-plane
+  namespace: map-dev
+  labels: { map.component: control-plane }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: control-plane
+subjects:
+  - kind: ServiceAccount
+    name: control-plane
+    namespace: map-dev
+---
+# The one authority this platform holds outside its own namespace, and it is held for
+# one field. `nodes` is a cluster-scoped resource, so no Role in any namespace can grant
+# it -- a ClusterRole is not a widening chosen for convenience here, it is the only shape
+# Kubernetes offers for the question "how many nodes can take a pod".
+#
+# `list` and nothing else. Not `get`, which is no narrower for a count. Not `watch`,
+# because nothing here tails node changes -- the capacity endpoint answers on request.
+# Node objects carry no tenant data; what a reader learns from them is the shape of the
+# fleet, which is why the endpoint publishing them is authorized as an operator read
+# rather than by tenant header.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: control-plane-counts-nodes
+  labels: { map.component: control-plane }
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: control-plane-counts-nodes
+  labels: { map.component: control-plane }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: control-plane-counts-nodes
+subjects:
+  - kind: ServiceAccount
+    name: control-plane
+    namespace: map-dev

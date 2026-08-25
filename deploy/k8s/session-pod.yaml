@@ -1,0 +1,584 @@
+# One Session, one pod. The configuration is mounted, never authored in here.
+#
+# The image reference and the two secret names are substituted per Session by session-placement;
+# the paths are not, because config-compiler emits deny rules against these exact strings.
+#
+# Why the ordering below is kept, stated precisely because the answer has two readings.
+# Read off the runtime's source, a deny path outside every writable root that does not
+# exist when the sandbox argv is compiled produces no mask at all and no error. Measured
+# on codex-cli 0.149.0 (MAP-1 probe 4c) it is synthesized instead: with the socket file
+# deleted and its parent directory still present the rule was in the compiled argv and the
+# write was still refused. So this ordering is not fixing an observed failure — it is
+# insurance against a runtime version that behaves the way its source reads, and against
+# the case nobody has measured, where the parent directory is missing too.
+#
+# The same paragraph does not cover the two workspace dot-paths below it, and the
+# difference is measured rather than assumed: for a path whose basename is one of the
+# three the runtime protects under a writable root, a missing target is not dropped and
+# not synthesized -- it is masked twice in two incompatible shapes, and bwrap refuses to
+# build any sandbox for this Session. That is why they are created, and why they are
+# created as directories.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: map-session
+  labels:
+    map.role: session-pod
+spec:
+  nodeSelector:
+    map.role: session-pod
+  restartPolicy: Never
+  # A bare pod has no DNS record of its own. With the hostname and subdomain below and
+  # the headless Service of the same name in session-shim-service.yaml, this pod answers
+  # to <hostname>.map-session.<namespace>.svc.cluster.local -- which is what lets the
+  # control plane compute a Session's address from its pod name instead of storing one.
+  #
+  # The record is built from `hostname`, NOT from `metadata.name`. This file said
+  # otherwise until 2026-08-23 and carried no `hostname` at all, so the per-pod record
+  # never existed: a Session pod reached 2/2 Running and every Turn against it failed
+  # with `the shim for session ... could not be reached`. Measured from inside the
+  # control-plane pod, `map-session-<uuid>.map-session.map-dev.svc.cluster.local` raised
+  # gaierror while the Service's own name resolved to one arbitrary pod -- which is the
+  # cross-Session mix-up session-shim-service.yaml exists to prevent, arriving as a
+  # fallback nobody chose. The endpoints controller only publishes an address's
+  # `hostname` when `pod.spec.hostname` is set, so `metadata.name` reaches /etc/hostname
+  # and nothing else.
+  #
+  # Both are the pod's name, and adapters/kubernetes/pod_runner.py substitutes this one
+  # beside `metadata.name` from the same value. It is spelled here rather than left to
+  # the substitution so this file stays a complete description of a Session pod.
+  hostname: map-session
+  subdomain: map-session
+  # Kubernetes projects a ServiceAccount token into every container by default, and on
+  # this cluster that token is also AssumeRoleWithWebIdentity material -- an AWS
+  # credential inside the pod whose whole job is to hold none.
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    # Named explicitly rather than inherited: a container that names no group runs in gid
+    # 0, and runAsNonRoot checks the uid only.
+    runAsGroup: 10001
+    fsGroup: 10001
+    seccompProfile: { type: RuntimeDefault }
+  initContainers:
+    - name: seed-runtime-home
+      # Why this is a digest.
+      #
+      # core/registration/environment.py refuses a tag outright: an Environment's runtime_image must be
+      # name@sha256:<64 hex>, because "a tag is a name for whatever was pushed last; a
+      # digest is a name for bytes", and two Sessions naming one Environment id have to run
+      # the same bytes. The real reference arrives here from CompiledConfig.runtime_image,
+      # which carries the registered Environment's. This literal is the un-substituted
+      # default, and sixty-four zeros is the one digest-shaped value that is unmistakably a
+      # placeholder: it parses, so nothing downstream has to special-case it, and it
+      # resolves to no image anywhere, so an unsubstituted manifest fails at the pull
+      # instead of starting something. `:latest` was both -- the exact string Environment
+      # rejects, and unpushable more than once to an IMMUTABLE ECR repository.
+      #
+      # All three container specs carry the same value. imagePullPolicy is left unset:
+      # kubelet defaults it to IfNotPresent for anything that is not `:latest`, which is
+      # correct for a digest and saves three registry round trips per pod start.
+      image: map-session@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          # The runtime's home must exist before it starts, and config.toml is copied in
+          # rather than mounted: the runtime writes its rollout under this same root, so
+          # the root cannot be read-only.
+          mkdir -p /var/lib/map/codex /session/workspace /run/codex /run/codex/ctl
+          cp /etc/map/compiled/config.toml /var/lib/map/codex/config.toml
+          # The two workspace deny paths, and they must be DIRECTORIES.
+          #
+          # `.git`, `.agents` and `.codex` are protected by the runtime for every writable
+          # root whether or not this platform names them, and for a path with one of those
+          # basenames that does NOT exist it emits two incompatible operations against one
+          # target: the protected-metadata mask makes a directory, and the deny rule for
+          # the same missing path binds an empty file. bwrap builds the directory first,
+          # then dies `Can't create file at /session/workspace/.agents: Is a directory`
+          # -- and no confined command runs for this Session at all.
+          #
+          # Making the path exist as a directory turns both into directory operations:
+          # the mask covers it read-only, the deny rule covers it `--perms 000` on top,
+          # and the stricter one wins. Measured from inside the sandbox afterwards: mode
+          # `d---------`, read refused, write refused, and unmount `Device or resource
+          # busy`. Nothing about what is denied changes -- this creates the target the
+          # existing rules already name.
+          #
+          # `: >` -- an empty FILE -- is what the same instruction used before these two
+          # paths existed, and it does not work here: an empty file at a protected
+          # basename makes both operations file binds and bwrap fails at the second one.
+          mkdir -p /session/workspace/.codex /session/workspace/.agents
+          test -d /session/workspace/.codex
+          test -d /session/workspace/.agents
+          # Every component of the control-socket path must be a non-symlink. A deny path
+          # crossing a symlink is masked at the symlink's current target rather than at
+          # the logical path, and where that component is writable by the confined
+          # process it is fatal at argv construction -- bwrap then runs no command at all
+          # for this Session. The socket itself is absent at this point: the runtime binds
+          # it, and a path that does not exist is not a symlink, so the loop covers the
+          # two directories now and the leaf on any restart.
+          p=""
+          for c in run codex ctl app-server-control.sock; do
+            p="$p/$c"
+            if [ -L "$p" ]; then echo "symlink component: $p" >&2; exit 1; fi
+          done
+          test -d /run/codex/ctl
+      # capabilities and allowPrivilegeEscalation are container-level and are NOT
+      # inherited from spec.securityContext, so an init container without this block runs
+      # with the runtime's default capability set in its bounding set and no-new-privs
+      # off, while its sibling runs with neither. It matters beyond symmetry here: the
+      # body above is a /bin/sh -c string and this manifest is compiled per Session, which
+      # makes it the interpolation site.
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: codex-home, mountPath: /var/lib/map/codex }
+        - { name: control, mountPath: /run/codex }
+        - { name: workspace, mountPath: /session/workspace }
+        - { name: compiled, mountPath: /etc/map/compiled, readOnly: true }
+    # The Session's own working tree, put back before anything can read it.
+    #
+    # The `working` lane is written at every completed Turn and, until this container,
+    # was read by nothing: a Session's workspace survived its pod and no pod was ever
+    # given one back. This closes that direction. A Session on its first placement
+    # restores nothing and exits zero, which is the common path.
+    #
+    # WHY IT IS AFTER seed-runtime-home AND NOT PART OF IT. Init containers run in
+    # sequence, and this must land after that one creates /session/workspace/.codex and
+    # /session/workspace/.agents -- the two directories bwrap refuses to build a sandbox
+    # without -- so it cannot be appended to a script whose last act is creating the
+    # paths it would write into. That container's body is also a /bin/sh -c string
+    # compiled per Session, which the comment above names as the interpolation site, and
+    # a network fetch is the last thing to add there. And this is Python: the session
+    # image carries no `find` and no `strings`, while that body is shell.
+    #
+    # WHY IT CAN REACH ANYTHING AT ALL. It asks the Tool Gateway over the arrow this pod
+    # already has -- network-policies.yaml grants this pod egress to kube-dns and the two
+    # gateways, and nothing else -- and it presents the `x-map-session` token that is
+    # already in the `compiled` volume below, beside the Gateway's own URL. So no
+    # credential is minted, no IAM statement is added, no network arrow is opened and NO
+    # VOLUME IS DECLARED. The Gateway holds s3:GetObject and s3:ListBucket on the
+    # platform bucket and already verifies this token; the pod holds neither and still
+    # does not. See docs/adr/ADR-030.
+    #
+    # WHAT IT MOUNTS AND WHAT IT DOES NOT. The workspace read-write, because writing it
+    # is the whole job, and `compiled` read-only for the token and URL. Not `codex-home`
+    # -- seeding a restored Rollout is the same container's future job and a separate
+    # decision, and a mount taken before the decision is a capability nobody chose. Not
+    # `shim-token`, which is mounted into session-shim and no other container; this one
+    # reads a different token out of a document it already has.
+    #
+    # WHY THE MESSAGE POLICY IS NOT THE DEFAULT. On a refusal this exits non-zero, the
+    # pod never starts and the Turn is refused -- and the reason is a line on stderr.
+    # With the default `File` policy that line reaches only `kubectl logs`, while
+    # pod_runner._why_it_will_not_start reads `terminated.message` and puts it into the
+    # error a tenant's placement fails with. FallbackToLogsOnError promotes the log into
+    # that field, which is why the module is careful that no line it writes carries the
+    # token.
+    - name: restore-working-lane
+      image: map-session@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      # The venv the wheel is installed into, by absolute path rather than by relying on
+      # the image's PATH: this pod runs with no shell between kubelet and the process.
+      command:
+        - /opt/map/venv/bin/python
+        - -m
+        - managed_agent.session_shim.restore_working_lane
+      terminationMessagePolicy: FallbackToLogsOnError
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: workspace, mountPath: /session/workspace }
+        - { name: compiled, mountPath: /etc/map/compiled, readOnly: true }
+    # The Session's own conversation, put back so the runtime continues it.
+    #
+    # A Session that has completed a Turn and lost its pod must NOT be given a fresh
+    # thread: the Rollout holds compaction checkpoints that have already folded its
+    # history, so a new thread replays what was folded, bills the tenant for the replay
+    # and reports success. This container is what makes the alternative real -- the
+    # bytes land under CODEX_HOME before anything reads them, and the shim finds the
+    # file and resumes from it rather than opening a thread. See docs/adr/ADR-031.
+    #
+    # WHY IT IS A SIBLING OF restore-working-lane AND NOT PART OF IT. Least privilege,
+    # and it is a property a reader of this file can check rather than one they have to
+    # take on trust: that container mounts the workspace and NOT codex-home, this one
+    # mounts codex-home and NOT the workspace, so neither can write the other's tree.
+    # Its own comment above already names taking the codex-home mount as "a capability
+    # nobody chose". They also fail independently -- each carries its own
+    # terminationMessagePolicy, so the pod's status names which of the two refused
+    # rather than which of two jobs one container was doing. Same image, already
+    # pulled, so a second container costs a start and no registry round trip.
+    #
+    # AFTER restore-working-lane rather than before it, and the order is not arbitrary.
+    # A workspace restore that is going to refuse should do so before this writes into
+    # a second volume: init containers run in sequence and a refusal stops the ones
+    # behind it, so the cheaper, likelier failure goes first and the pod carrying no
+    # Rollout is the one that never got that far.
+    #
+    # WHAT IT MOUNTS. codex-home read-write, because writing the Rollout under it is
+    # the whole job -- the same mount, in the same direction, that seed-runtime-home
+    # already holds. `compiled` read-only for the Gateway's URL and this Session's
+    # token, exactly as its sibling reads them. NOT the workspace, and not shim-token.
+    #
+    # WHY IT CAN REACH ANYTHING. The same arrow and the same argument as the container
+    # above: egress to kube-dns and the two gateways, the `x-map-session` token already
+    # in the compiled document, and the Tool Gateway's existing bucket grant. No
+    # credential is minted, no IAM statement is added, no network arrow is opened and
+    # no volume is declared beyond one this pod already has.
+    - name: seed-rollout
+      image: map-session@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      command:
+        - /opt/map/venv/bin/python
+        - -m
+        - managed_agent.session_shim.seed_rollout
+      # Substituted per Session by session-placement, like the shim's three below.
+      # `false` is the un-substituted default and is the safe one to fail towards: a
+      # pod that never had this filled in asks for nothing and starts a thread, which
+      # is wrong only for a Session that has already run -- and the adapter refuses a
+      # manifest that does not declare this entry, so the unfilled case does not place.
+      env:
+        - { name: MAP_RESUMING, value: "false" }
+      # On a refusal this exits non-zero, the pod never starts, and the reason is a
+      # line on stderr. `File` would leave that line reachable only through
+      # `kubectl logs`, while pod_runner._why_it_will_not_start reads
+      # `terminated.message` into the error a tenant's placement fails with. The module
+      # is careful that no line it writes -- on any path, including its exception
+      # handlers -- carries the token this promotes into pod status.
+      terminationMessagePolicy: FallbackToLogsOnError
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: codex-home, mountPath: /var/lib/map/codex }
+        - { name: compiled, mountPath: /etc/map/compiled, readOnly: true }
+  containers:
+    - name: agent-runtime
+      image: map-session@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      # Equal to config-compiler's launch_argv, element for element. The compiled
+      # configuration and the process it configures cannot disagree about where the
+      # control socket is: a runtime listening somewhere else is reachable at a path no
+      # deny rule covers.
+      command:
+        - codex
+        - app-server
+        - --listen
+        - unix:///run/codex/ctl/app-server-control.sock
+      env:
+        - { name: CODEX_HOME, value: /var/lib/map/codex }
+        # Where a package the agent installed at run time is imported from.
+        #
+        # Set on THIS container because the runtime's default shell environment policy
+        # is `inherit = All`, so a confined command the agent runs receives this
+        # variable -- and PYTHONPATH matches none of the runtime's default exclude
+        # patterns (`*KEY*`, `*SECRET*`, `*TOKEN*`), which is what would otherwise strip
+        # it silently.
+        #
+        # Needed because the interpreter's own site-packages is unreachable:
+        # /opt/map/venv sits on a readOnlyRootFilesystem, so `map-pip` installs to a
+        # `--target` inside the workspace, and a --target install is on no import path
+        # by default. Set here rather than exported by the wrapper, because the
+        # wrapper's environment dies with it: the import happens in a LATER command.
+        #
+        # The path is `core/pod/workspace_contract.py`'s, compared against it by
+        # tests/deploy/test_the_image_honours_the_workspace_contract.py. A value
+        # disagreeing with the wrapper's --target would install packages nothing can
+        # import -- a Turn that installs successfully and cannot use what it installed.
+        - { name: PYTHONPATH, value: /session/workspace/.map/lib }
+        # Why this runtime's own diagnosis is worth turning on, narrowly.
+        #
+        # The runtime installs a stderr tracing layer built from RUST_LOG, and with the
+        # variable unset a Session that could not load a skill said so to nobody: the
+        # record naming the path and the errno was filtered out before it reached the
+        # container log, and the platform's own event map drops every notification it
+        # does not publish. A skill was delivered into this pod, was readable at
+        # /etc/codex/skills, and the model answered that it had none -- with no line
+        # anywhere saying why. That is what this variable buys.
+        #
+        # Scoped to the skills extension rather than set to `info`, and that is the
+        # whole care taken here: a broad filter on THIS container puts prompt and
+        # answer text into node logs, which is the disclosure ADR-013 exists to
+        # prevent. `error` globally keeps a genuine failure visible; the one target
+        # named is the subsystem whose silence is the open defect.
+        #
+        # `codex_mcp::connection_manager` is the second target, added for the same
+        # reason and measured the same way. A Session granted a tool server reported to
+        # the model that it had no such tool, the Turn completed, and no line anywhere
+        # said why -- the same shape as the skills defect above, one subsystem over.
+        #
+        # This target and not a broader one, because the runtime already emits exactly
+        # the census this needs and nothing was reading it. `tool_catalog.rs` carries an
+        # event with `available_server_count`, `unavailable_server_count` and
+        # `tool_count` on it, which is the difference between "the tenant registered
+        # nothing" and "the servers were reachable and offered no tools" -- the two
+        # possibilities the platform's own logs cannot currently tell apart. Its sibling
+        # modules under `connection_manager` cover the rest of the same decision:
+        # `startup` says whether MCP came up, `required` says what was waited for, and
+        # `resources` covers the listing beside it.
+        #
+        # `codex_mcp::rmcp_client` is deliberately EXCLUDED, and that exclusion is the
+        # care taken here. It is the transport, so it carries MCP request and response
+        # bodies, and a tool argument holds whatever the agent is working on -- tenant
+        # document text arriving in node logs by a second door, which is the same
+        # disclosure ADR-013 exists to prevent. Naming the parent crate `codex_mcp`
+        # would have swept it in. If the catalogue counts turn out not to name the
+        # cause, widening to the transport is a decision to take on purpose, for one
+        # run, not a filter loosened while debugging something else.
+        #
+        # `debug` on that subtree rather than `info`, and the reason is measured. At
+        # `info` the only thing this subtree said across two full-Turn captures was its
+        # `required` span -- `session_init.required_mcp_server_count=1`, closing in
+        # under 700ms, so the server this platform offers is REQUIRED and the runtime
+        # waits for it and is satisfied. The catalogue module emitted nothing at all,
+        # which is the one fact that matters: a module that ran and logged below the
+        # filter and a module that never ran look the same from here.
+        #
+        # CORRECTED 2026-08-25, and the correction is the point. `debug` does NOT
+        # separate them, and a third full-Turn capture at `debug` said exactly what the
+        # two at `info` said -- sixteen lines, every one of them `required`. The census
+        # this filter was widened to obtain is emitted by `trace!` in
+        # `connection_manager/tool_catalog.rs`, under a span declared
+        # `#[instrument(level = "trace")]`, and TRACE sits BELOW debug: no `debug`
+        # filter can ever surface it. So the silence read as evidence about the code
+        # was a property of this line, and the reading that "the catalogue module
+        # emitted nothing" established nothing at all.
+        #
+        # `codex_core::session::mcp=debug` is the fourth target, and it is the one that
+        # can actually answer the open question. Every target above lives in the
+        # `codex_mcp` crate, and the list the MODEL is given is not assembled there:
+        # `runtime.rs` documents `latest_list_all_tools` as serving "non-model discovery
+        # surfaces", while the model's binding comes from
+        # `core/src/session/mcp.rs::current_binding_with_required_servers`. So the whole
+        # `codex_mcp` filter above watches a road the model's tool list never travels,
+        # which is why widening it twice changed nothing.
+        #
+        # What that module does on failure is the reason to watch it. If the binding
+        # resolves to `None` it falls through to `codex_mcp::McpBinding::empty(config)`
+        # and says NOTHING -- no warn, no error, no event. A Session then runs with zero
+        # MCP tools while `session_init.required_mcp_server_count=1` closed happily 600ms
+        # earlier, which is exactly the pair of facts this platform keeps observing: the
+        # server came up, the Gateway offered one tool, and the model behaved as though
+        # it had none. Its two instrumented spans, `mcp.runtime.refresh_if_dirty` and
+        # `mcp.runtime.resolve_for_step`, are `skip_all` with explicit fields, so this
+        # adds ids and counts to node logs and not prompt or document text.
+
+        # `tool_catalog=trace` is therefore named explicitly, and only it. It is the
+        # narrowest filter that can emit `available_server_count`,
+        # `unavailable_server_count` and `tool_count` -- the counts that separate "the
+        # servers were reachable and offered no tools" from "the tenant registered
+        # nothing", which is the open question on the granted tool never being called.
+        # The `rmcp_client` exclusion above is untouched: that module is a sibling of
+        # `connection_manager`, so raising a level INSIDE this subtree cannot reach the
+        # transport, and what this adds to node logs is three integers and tool NAMES,
+        # never a tool argument.
+        - {
+            name: RUST_LOG,
+            value: "error,codex_skills_extension=debug,codex_exec_server=warn,codex_mcp::connection_manager=debug,codex_mcp::connection_manager::tool_catalog=trace,codex_core::session::mcp=debug",
+          }
+      # Why this one container is not on the pod's RuntimeDefault floor. bubblewrap
+      # enforces the Permission Profile (ADR-012) and it needs unprivileged user and
+      # mount namespaces to exist at all. Under RuntimeDefault, `unshare` is reachable
+      # only with CAP_SYS_ADMIN, which this pod drops, so unshare(CLONE_NEWUSER) is
+      # EPERM, bwrap builds no sandbox, and NO confined command runs. The profile named
+      # below is RuntimeDefault's own rule set with `mount`, `umount2` and `pivot_root`
+      # allowed and `clone`/`unshare` permitted for the five namespaces the compiled
+      # bwrap argv asks for, and nothing else: CLONE_NEWUTS and CLONE_NEWCGROUP are
+      # still refused, which is the difference between a boundary and Unconfined with
+      # extra steps.
+      #
+      # It is on this container and not on the pod, because only this container runs
+      # bwrap. The shim serves HTTP over a unix socket and the init container copies a
+      # file; both work under the floor and neither is widened.
+      #
+      # The path is relative to kubelet's seccomp root, /var/lib/kubelet/seccomp. The
+      # file gets there from session-sandbox-seccomp-installer.yaml. A node without it
+      # refuses this pod rather than running it unconfined.
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+        seccompProfile:
+          type: Localhost
+          localhostProfile: map/session-sandbox.json
+      # A Turn cannot begin before the socket is bound, because the shim reaches the
+      # runtime through it. This makes that ordering observable rather than assumed: a pod
+      # whose socket never appears never becomes ready, so it never runs a confined
+      # command against a deny rule that was dropped for want of its target.
+      startupProbe:
+        exec:
+          command: ["/bin/sh", "-c", "test -S /run/codex/ctl/app-server-control.sock"]
+        periodSeconds: 2
+        failureThreshold: 30
+      volumeMounts:
+        - { name: codex-home, mountPath: /var/lib/map/codex }
+        - { name: control, mountPath: /run/codex }
+        - { name: workspace, mountPath: /session/workspace }
+        - { name: requirements, mountPath: /etc/codex, readOnly: true }
+        # The sandbox helper's first act, before every confined command, is to create a
+        # registry of synthetic bubblewrap mount targets under the system temporary
+        # directory -- and it panics rather than degrading if it cannot. With a read-only
+        # root and nothing here, that mkdir is EROFS and NO tool call runs.
+        #
+        # This is for the helper, which runs in this container OUTSIDE bwrap. It gives the
+        # confined process nothing: the Permission Profile extends `:read-only` and its
+        # only writable root is /session/workspace, so bwrap ro-binds /tmp like the rest
+        # of `/` and a write from inside the sandbox is `Read-only file system`.
+        #
+        # Pointing TMPDIR at an existing volume instead was measured and is worse: the
+        # runtime refuses to place its arg0 helper binaries under a temporary directory,
+        # so it starts degraded rather than failing. This mount is the fix; a spare
+        # environment variable is not, and no container here sets one.
+        #
+        # On this container alone, because it is the only one that runs bwrap -- and
+        # because an emptyDir is 0777 without the sticky bit a real /tmp carries, so a
+        # single mounting container keeps "one uid can reach these files" true by
+        # construction rather than by all three happening to share a uid today.
+        - { name: scratch, mountPath: /tmp }
+    # The shim, and the same image as agent-runtime: this pod pulls one image and
+    # map/session-shim is the only ECR repository the Session pod has. It runs a second
+    # command against it, because the runtime container runs `codex` and this one runs
+    # the `managed_agent` package that speaks to it.
+    - name: session-shim
+      image: map-session@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      command:
+        - uvicorn
+        - managed_agent.session_shim.serve:build_shim_app
+        - --factory
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8081"
+      # MAP_SESSION_ID, MAP_MODEL and MAP_MODEL_PROVIDER are substituted per Session by
+      # session-placement, like the image reference and the two secret names above.
+      env:
+        - { name: MAP_SESSION_ID, value: "00000000-0000-0000-0000-000000000000" }
+        - { name: MAP_MODEL, value: "" }
+        - { name: MAP_MODEL_PROVIDER, value: "" }
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: { drop: ["ALL"] }
+      ports:
+        - { name: shim, containerPort: 8081 }
+      # The control plane must not be given this pod's DNS record before the shim can
+      # answer on it: a headless Service publishes a ready pod's address, so a shim that
+      # has not opened its Session is simply not resolvable rather than reachable and
+      # refusing. The budget matches agent-runtime's startupProbe above, because it is
+      # the same wait: the shim's own start-up is dominated by waiting for that socket.
+      readinessProbe:
+        httpGet: { path: /session/ready, port: shim }
+        periodSeconds: 2
+        failureThreshold: 30
+      volumeMounts:
+        # The runtime's control socket, read-write: this is the client end of it.
+        - { name: control, mountPath: /run/codex }
+        # The runtime's own record, read-only. The control plane reads a Session's
+        # Rollout out through this container at every completed Turn, and this container
+        # is the only process in the pod that can be reached from outside it. Read-only
+        # on purpose: ship-out reads, and a writable mount would give the pod's
+        # outward-facing process write access to the record recovery depends on.
+        # Seeding a restored Rollout would need write access and is not built.
+        - { name: codex-home, mountPath: /var/lib/map/codex, readOnly: true }
+        # This Session's bearer token, mounted into this container and no other. It is
+        # deliberately not under CODEX_HOME: a confined process reading its own
+        # configuration tree must not find it.
+        - { name: shim-token, mountPath: /etc/map/shim, readOnly: true }
+        # The files a tenant attached to this Session, and ONLY those.
+        #
+        # subPath is the security control here, not tidiness. This container is the only
+        # process in the pod reachable from outside it, and its file route writes what
+        # the control plane sends. Mounted whole, the workspace would be writable from
+        # off the pod -- over a document the agent itself produced, or over anything it
+        # is about to read. With subPath the directory below is the entire filesystem
+        # this container can reach in that volume: a traversal out of it has nowhere to
+        # arrive, because no other part of the volume is mapped in.
+        #
+        # Read-write, unavoidably, because writing is what the route does. The runtime
+        # container mounts the same volume whole at /session/workspace, so the agent
+        # reads these at /session/workspace/files/<name> -- one path in both containers,
+        # which is why shim/serve.py derives it from WORKSPACE_ROOT rather than holding
+        # a second spelling.
+        - name: workspace
+          mountPath: /session/workspace/files
+          subPath: files
+        # The same volume a second time, whole and READ-ONLY: what the agent produced.
+        #
+        # The narrowing above is untouched and this does not weaken it. What that
+        # subPath buys is that a caller holding the shim token cannot WRITE anywhere in
+        # the workspace but the attachment directory, and `readOnly: true` here keeps
+        # that exactly as true as it was. What it costs is that this container could not
+        # SEE the agent's output, and reading that out is what makes a document the agent
+        # wrote survive the pod -- without it a completed Turn leaves its product in an
+        # emptyDir that goes away with the pod, which is what shipped until this mount
+        # existed.
+        #
+        # A separate mountPath rather than the workspace's own, and not for tidiness.
+        # Mounted at /session/workspace this would be the PARENT of the read-write mount
+        # above, so which of the two governs /session/workspace/files would rest on
+        # kubelet ordering nested mounts by path depth -- true today, and a silent
+        # read-only attachment directory the day it is not. Two disjoint paths have no
+        # order to get wrong. Nothing in the pod builds an agent-visible path from this
+        # one: shim/serve.py reads bare leaf names out of it and the bytes leave over
+        # HTTP.
+        - name: workspace
+          mountPath: /session/produced
+          readOnly: true
+  volumes:
+    # codex-home and workspace are deliberately unbounded and that is a gap, named here
+    # rather than closed with an invented number. An emptyDir with no sizeLimit draws on
+    # node ephemeral storage, so one pod filling it evicts its neighbours -- but what
+    # either may hold is a capacity decision, and the pods-per-node figure the cluster is
+    # planned against was measured without a limit on them. control is bounded because its
+    # size is not a judgement: it holds one unix socket.
+    # 256Mi. This holds the compiled config plus the runtime's own sqlite state --
+    # its log, goal, memory and queue databases, which grow with the Session rather
+    # than with the workspace. Measured after three Turns: about 5Mi, nearly all of
+    # it the log database and its write-ahead file. Bounded for the same reason as
+    # the workspace below, and fifty times the measurement because nothing here
+    # rotates -- a long Session's log only grows, and the pod is evicted if it
+    # reaches this. That eviction is the tradeoff being accepted: a Turn lost beats
+    # a node's other tenants lost. Not larger, because what binds is the node budget
+    # rather than this volume -- seventeen pods share one disk, and the workspace
+    # below is where a tenant's own bytes belong.
+    - { name: codex-home, emptyDir: { sizeLimit: 256Mi } }
+    - { name: control, emptyDir: { sizeLimit: 1Mi } }
+    # 1Gi, and the number comes from the node rather than from the workload. An
+    # emptyDir with no sizeLimit is bounded only by the node's disk, so one Session
+    # writing without limit evicts every pod sharing its node -- the one isolation
+    # this pod-per-Session design does not get for free. A node holds 41865196Ki of
+    # ephemeral storage and caps at 17 pods, so 17 x 1Gi leaves room for images and
+    # the kubelet even in the worst case. Raise it by measuring a node, not by
+    # measuring a workload: the limit that matters is the one the neighbours can
+    # survive.
+    - { name: workspace, emptyDir: { sizeLimit: 1Gi } }
+    # Disk-backed on purpose, unlike the Tool Gateway's /tmp, which is `medium: Memory`
+    # for a spawned child's real output. Measured contents here after twelve confined
+    # commands: one 0-byte lock file, `du -sk` 0. A tmpfs would charge that to the pod's
+    # memory cgroup -- these nodes have ~3.2 GiB allocatable memory against ~34.9 GiB of
+    # ephemeral storage, and the pods-per-node figure the cluster is planned against was
+    # measured as cgroup-bound. Spending the scarce resource on a directory measured at
+    # zero is the wrong trade, and the usual reason to prefer memory -- keeping agent
+    # bytes off the node disk -- does not apply, because the confined process cannot
+    # write here at all.
+    #
+    # 16Mi is a blast radius rather than a size estimate. Enforcement on these nodes is
+    # kubelet's periodic du (no filesystem-quota feature gate), so exceeding it EVICTS
+    # this pod -- ending the Session, since restartPolicy is Never -- and does not return
+    # ENOSPC at the write. What the bound is for is the node-level threshold underneath
+    # it: an unbounded volume can reach `nodefs.available: 10%` and start evicting
+    # neighbours, and a per-pod limit is what stops one Session getting there.
+    - { name: scratch, emptyDir: { sizeLimit: 16Mi } }
+    # The compiled documents arrive as secret volumes, whose file entries kubelet
+    # materializes behind a `..data` symlink -- so the deny rules name the mount
+    # directories rather than the files inside them, and stay true across a secret update.
+    - { name: compiled, secret: { secretName: map-session-compiled-config } }
+    - { name: requirements, secret: { secretName: map-session-requirements } }
+    # This Session's shim token, authored by the control plane when the pod is placed
+    # and derived rather than stored: it is HMAC(signing key, session id), so no table
+    # holds it and any control-plane replica can re-derive it.
+    - { name: shim-token, secret: { secretName: map-session-shim-token } }

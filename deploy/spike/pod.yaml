@@ -1,0 +1,105 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: map-sandbox-spike
+spec:
+  nodeSelector:
+    map.role: session-pod
+  restartPolicy: Never
+  # I1: the pod holds no credential. Kubernetes projects a ServiceAccount token into every
+  # container by default, and on this cluster (OIDC + 3 roles) that token is also
+  # AssumeRoleWithWebIdentity material -- so the default puts an AWS credential inside the
+  # artifact whose job is to prove the pod is a boundary, at a path the sandbox profile's
+  # "/" = "read" made readable from inside. The probe asserts the token is absent rather
+  # than trusting this line, and the profile denies the path anyway.
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    # Named explicitly rather than inherited. A container that names no group runs in gid
+    # 0, and `runAsNonRoot` does not catch that -- it checks the uid only. The image
+    # creates a real group at 10001 and this is the half that makes the pod use it, so a
+    # file the probe writes is owned by a group nothing else on the node is in.
+    runAsGroup: 10001
+    # Measured on this cluster's AL2023 nodes, kernel 6.1.180-225.360.amzn2023, as uid
+    # 10001 with every capability dropped:
+    #
+    #   seccompProfile: RuntimeDefault  ->  unshare(CLONE_NEWUSER) is EPERM, bwrap cannot
+    #                                       create a namespace, and no confined command
+    #                                       runs at all. It fails closed, so it is not a
+    #                                       hole -- but a Session under it can never take
+    #                                       a Turn.
+    #   seccompProfile: Unconfined      ->  unshare -Ur, -Urm and -Urmpn all succeed and
+    #                                       the sandbox is built and enforces.
+    #
+    # So the two are mutually exclusive here and this spike runs under the one that lets
+    # the sandbox exist. That is a weaker posture than production wants, and the record
+    # names the follow-up: a `localhost/` profile that is RuntimeDefault plus `unshare`
+    # and `clone` with CLONE_NEWUSER|CLONE_NEWNS, installed on the node. The probe reads
+    # its own seccomp mode out of /proc and prints it, so a record produced under this
+    # setting cannot claim the stricter one.
+    seccompProfile: { type: Unconfined }
+  initContainers:
+    # Every path a deny rule names is created before bwrap compiles its argv. On the CLI
+    # version measured here that ordering turned out not to be load-bearing -- an absent
+    # target is synthesized rather than dropped, and the rule still lands in the argv --
+    # but the guarantee is the runtime's and not ours, so the ordering is kept and the
+    # probe asserts both cases rather than resting on the observed one.
+    - name: create-deny-targets
+      image: public.ecr.aws/amazonlinux/amazonlinux:2023
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -eu
+          mkdir -p /run/map /config/map
+          : > /run/map/app-server.sock
+          : > /config/map/requirements.toml
+          test -e /run/map/app-server.sock
+          test -e /config/map/requirements.toml
+          # No chown. This container is uid 10001 itself, so the two files it just
+          # created are already owned by the uid the probe runs as, and chowning an
+          # emptyDir whose mount point belongs to root is EPERM for a non-root user --
+          # which failed the init container and so failed the whole spike. A deny rule
+          # needs its target to exist; it does not care who owns it.
+      # Mirrors the probe container's. capabilities and allowPrivilegeEscalation are
+      # container-level and are NOT inherited from spec.securityContext, so an init
+      # container without this block runs with the runtime's default capability set in its
+      # bounding set and no-new-privs off -- while its sibling runs with neither. It
+      # matters here beyond symmetry: the body is a /bin/sh -c string, and MAP-11 compiles
+      # this pod per Session, which makes this the interpolation site.
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: run, mountPath: /run/map }
+        - { name: config, mountPath: /config/map }
+  containers:
+    - name: probe
+      image: 062677866851.dkr.ecr.us-east-1.amazonaws.com/map/spike:0.149.0
+      # Always, and not the default. The tag names the codex version rather than the
+      # image build, so a rebuilt probe keeps the same tag -- and under IfNotPresent the
+      # node serves whatever it cached the first time. That happened here: a run reported
+      # a transcript with two findings missing, from a probe that no longer existed.
+      imagePullPolicy: Always
+      command: ["/opt/map/probe.sh"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities: { drop: ["ALL"] }
+      volumeMounts:
+        - { name: run, mountPath: /run/map }
+        # readOnly: requirements.toml is the administrative layer the tenant must not
+        # change. The init container writes it; nothing after that has any reason to, and
+        # a read-write mount into the tenant's own container is the tenant holding the pen
+        # on its own constraints.
+        - { name: config, mountPath: /config/map, readOnly: true }
+        - { name: work, mountPath: /work }
+  volumes:
+    # sizeLimit on all three: an emptyDir with no bound is node ephemeral storage, so one
+    # pod filling it evicts its neighbours. /work is sized for the 5 MB output-cap test
+    # plus the base64 expansion it writes, with headroom; the other two hold one empty
+    # file each. No resources.limits here on purpose -- see the record's p condition: a
+    # memory limit changes the cgroup memory.peak that p rests on, so the number to set
+    # is a decision the capacity plan makes, not one this manifest should slip in.
+    - { name: run, emptyDir: { sizeLimit: 1Mi } }
+    - { name: config, emptyDir: { sizeLimit: 1Mi } }
+    - { name: work, emptyDir: { sizeLimit: 256Mi } }

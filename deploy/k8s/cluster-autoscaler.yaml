@@ -1,0 +1,241 @@
+# The thing that decides how many nodes there are.
+#
+# Until this exists the node count is a constant: deploy/terraform/eks.tf declares a
+# ceiling of 8 and a floor of 2, and nothing in the cluster ever changed the number
+# in between -- so the 21st Session pod was `Too many pods` and stayed Pending
+# for ever, because no node could arrive. This watches for exactly that and calls
+# SetDesiredCapacity on the group.
+#
+# What it does NOT do, stated here because a reader will otherwise assume it: it
+# cannot see CPU pressure. Session pods declare no requests, so the scheduler packs
+# them on pod count alone and reports ~48% of CPU allocated at every level of
+# Session load. This removes the refusal at the pod-slot ceiling; the ~100m of real
+# CPU each Session gets is unchanged by it, and adding nodes holds that roughly
+# fixed rather than improving it, because the Sessions arrive with the nodes. The
+# slice that fixes that needs a measured Turn and is plan/MAP-65.md's blocker 1.
+#
+# The RBAC below is the upstream set for this release, unmodified. Trimming rules
+# nobody has watched this exercise would trade a shorter file for a Forbidden that
+# first appears during a scale event.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: map-cluster-autoscaler
+  labels: { map.component: cluster-autoscaler }
+rules:
+  - apiGroups: [""]
+    resources: ["events", "endpoints"]
+    verbs: ["create", "patch"]
+  - apiGroups: [""]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/status"]
+    verbs: ["update"]
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    resourceNames: ["cluster-autoscaler"]
+    verbs: ["get", "update"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["watch", "list", "get", "update"]
+  - apiGroups: [""]
+    resources:
+      - "namespaces"
+      - "pods"
+      - "services"
+      - "replicationcontrollers"
+      - "persistentvolumeclaims"
+      - "persistentvolumes"
+    verbs: ["watch", "list", "get"]
+  - apiGroups: ["extensions"]
+    resources: ["replicasets", "daemonsets"]
+    verbs: ["watch", "list", "get"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["watch", "list"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets", "replicasets", "daemonsets"]
+    verbs: ["watch", "list", "get"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes", "csidrivers", "csistoragecapacities"]
+    verbs: ["watch", "list", "get"]
+  - apiGroups: ["batch", "extensions"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["create"]
+  - apiGroups: ["coordination.k8s.io"]
+    resourceNames: ["cluster-autoscaler"]
+    resources: ["leases"]
+    verbs: ["get", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: map-cluster-autoscaler
+  labels: { map.component: cluster-autoscaler }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: map-cluster-autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: cluster-autoscaler
+    namespace: map-dev
+---
+# The namespaced half: the status ConfigMap it writes, and nothing else. Both the
+# status ConfigMap and the leader-election Lease land in whatever `--namespace`
+# names, and leader election is ON by default in this release -- so this Role and
+# the Deployment's `--namespace=map-dev` are two halves of one fact. Get either
+# wrong and the pod dies on a Lease it cannot take, with nothing in the message
+# about scaling.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cluster-autoscaler
+  namespace: map-dev
+  labels: { map.component: cluster-autoscaler }
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["cluster-autoscaler-status"]
+    verbs: ["delete", "get", "update", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: cluster-autoscaler
+  namespace: map-dev
+  labels: { map.component: cluster-autoscaler }
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: cluster-autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: cluster-autoscaler
+    namespace: map-dev
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cluster-autoscaler
+  namespace: map-dev
+  labels: { map.component: cluster-autoscaler }
+spec:
+  # One replica. Leader election is on, so a second would idle rather than help,
+  # and this Deployment's own pod occupies one of the 17 pod slots on whichever
+  # node it lands on -- which is counted in plan/MAP-65.md's slot arithmetic.
+  replicas: 1
+  selector:
+    matchLabels: { map.component: cluster-autoscaler }
+  strategy:
+    type: RollingUpdate
+    # maxSurge: 0, so a rollout never runs two of these at once. Not a database
+    # argument like the control plane's: two autoscalers with leader election
+    # would be one worker and one waiter, and the waiter is a pod slot spent on
+    # nothing during every rollout.
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
+  template:
+    metadata:
+      labels: { map.component: cluster-autoscaler }
+      annotations:
+        # This pod is controller-backed, so without this the autoscaler counts its
+        # own node as drainable and can evict itself half way through a scale-down.
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      serviceAccountName: cluster-autoscaler
+      # Every Session pod is BestEffort, so under node pressure the kubelet's
+      # choice between this controller and the load it exists to relieve would
+      # otherwise be unordered. Measured admissible in this namespace on this
+      # cluster: a server-side dry run was accepted and the API server assigned
+      # priority 2000000000.
+      priorityClassName: system-cluster-critical
+      securityContext:
+        runAsNonRoot: true
+        # 65532, which is the image's own USER and its `nonroot` passwd entry
+        # (home /home/nonroot). The upstream example says 65534, whose home is
+        # /nonexistent -- a uid that disagrees with the image it runs is the
+        # no-HOME failure deploy/docker/session.Dockerfile documents at length.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: cluster-autoscaler
+          # release v1.31.5, pinned by digest. The minor matches the cluster's --
+          # the autoscaler states compatibility per Kubernetes minor, and
+          # aws_eks_cluster.version is 1.31 -- and a test compares the two, so a
+          # cluster upgrade that leaves this behind fails a check instead of
+          # drifting. The version lives in this comment because a digest does not
+          # carry one; the digest is what is resolved, because a tag can be moved.
+          image: registry.k8s.io/autoscaling/cluster-autoscaler@sha256:b90105c3470ad5059e8a7c11e2c63117dd8d499ae893d4cc76968e748a886b74
+          command: ["/cluster-autoscaler"]
+          args:
+            - "--cloud-provider=aws"
+            # Not a default. It is where the status ConfigMap and the
+            # leader-election Lease go, it defaults to kube-system, and this
+            # pod's Role covers map-dev.
+            - "--namespace=map-dev"
+            # Auto-discovery by tag rather than the group's name: the name
+            # carries the nodegroup's uuid suffix, so a nodegroup replacement
+            # changes it. Both tags are already on the group -- EKS applies
+            # them itself, PropagateAtLaunch true -- so nothing declares them.
+            - "--node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/map-dev"
+            # What THIS controller will do unattended, as against the ceiling
+            # the group may be grown to by anything (eks.tf says 8). The smaller
+            # binds, and it is smaller for two measured reasons: nothing in this
+            # cluster refuses a Session -- no LimitRange, no ResourceQuota, and
+            # Session pods request nothing -- so a runaway scales on pod count
+            # alone with only this number in its way; and the account's on-demand
+            # vCPU usage has been seen to reach 6, proving the quota is at least
+            # 6, while nothing readable here proves 16.
+            - "--max-nodes-total=4"
+            # v=4 because the first thing anyone needs from this pod is which
+            # pod it saw and what it decided; the checkpoint reads that log.
+            - "--v=4"
+            - "--stderrthreshold=info"
+          # NOT set, and the omissions are the decision: the upstream AWS example
+          # passes --skip-nodes-with-local-storage=false, and on this cluster that
+          # flag evicts live Sessions. session-pod.yaml declares three emptyDir
+          # volumes and emptyDir is exactly what the default (true) protects. A
+          # Session pod also has no ownerReferences, which blocks a drain by
+          # itself, so keeping both defaults makes a node running a Session
+          # unremovable twice over.
+          env:
+            # IRSA supplies the credential; the region is not in it.
+            - name: AWS_REGION
+              value: us-east-1
+            - name: AWS_STS_REGIONAL_ENDPOINTS
+              value: regional
+          ports:
+            - { name: metrics, containerPort: 8085 }
+          livenessProbe:
+            # /health-check on the metrics address reports whether the main loop
+            # is running, which is the failure this pod has that a process check
+            # would miss: alive, elected, and not looping.
+            httpGet: { path: /health-check, port: 8085 }
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          # A request of its own, because every Session is BestEffort and a
+          # controller with no request shares their eviction class. The numbers
+          # are upstream's; nothing here has measured this process.
+          resources:
+            requests: { cpu: "100m", memory: "300Mi" }
+            limits: { memory: "600Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      # No volumes at all, and the upstream example has one: it mounts the node's
+      # /etc/ssl/certs/ca-bundle.crt over the container's trust store. Checked
+      # inside this image -- it already carries /etc/ssl/certs/ca-certificates.crt
+      # -- so the mount buys nothing and puts a host path in the one pod that can
+      # terminate an instance.
+      #
+      # And no Service: the metrics port is reachable with `kubectl port-forward`,
+      # and a name that resolves in-cluster is a name something can call.

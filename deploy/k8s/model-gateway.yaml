@@ -1,0 +1,236 @@
+# The Model Gateway: one service, holding the upstream credential that no pod holds.
+#
+# The upstream credential is deliberately absent from this file. It is not an env var,
+# not a mounted Secret and not in the ConfigMap below — it is fetched from AWS Secrets
+# Manager at run time under this pod's IRSA identity, held for one TTL, and never
+# written down. An env var is readable by anything in the container for the process's
+# whole life and a mounted Secret is a file; both are strictly worse than a value that
+# expires.
+#
+# MAP_SESSION_TOKEN_KEY below is the one Secret reference here, and the distinction is
+# the whole of why. That is not a provider credential; it is the symmetric key that
+# signs a Session token, and it is already an environment variable in the control plane
+# that mints one and the Tool Gateway that verifies one, from this same Secret. Reading
+# it from a fourth place would not make it less exposed. Trying to made this the one
+# holder that disagreed with the other two, and what came out of that disagreement was a
+# verifier for a token layout nothing in the tree ever minted — so every model call this
+# service saw answered 401, and would have answered 503 first had the entry existed at
+# all. ADR-023 records the correction.
+#
+# The identity is created in cluster-bootstrap.yaml and not here. Three IAM roles in the
+# development account each trust exactly one ServiceAccount subject, so the namespace
+# and the account name are fixed by IAM rather than chosen here, and a ServiceAccount a
+# workload manifest declares is one the bootstrap does not create — admission rejects
+# the pod outright rather than warning.
+#
+# WHY THIS SERVES PLAIN HTTP, having terminated TLS on 8443 until now. This service has
+# exactly one caller: the Agent Runtime inside a Session pod, addressing the base_url
+# that control/pod_config/compiler.py renders into every compiled config.toml. That value is
+# `http://model-gateway.<namespace>.svc.cluster.local/v1` everywhere it appears, and
+# three separate things stood between it and a TLS listener on 8443. A plaintext request
+# to a TLS socket does not negotiate, so `http://` with no port reached nothing. Nothing
+# puts a CA bundle inside a Session pod — session-pod.yaml's volume set is fixed and it
+# sets automountServiceAccountToken: false — so the runtime had no way to trust a serving
+# certificate even had it spoken TLS. And the Secret that listener mounted,
+# `model-gateway-serving-cert`, exists in no cluster and is created by nothing in this
+# repository, so the pod would have sat in ContainerCreating rather than serving.
+#
+# What that costs, stated rather than left for a reader to discover: the Session's
+# bearer token crosses one in-cluster hop in plaintext. The provider credential never
+# crosses it — this process fetches that from the vault and attaches it on the way out,
+# which is the whole reason this service exists. Putting TLS back is a change to what a
+# Session pod trusts and to the base_url the compiler renders, so it belongs to
+# session-pod.yaml and config_compiler.py rather than to this file alone.
+#
+# RESOLVED, and kept as the reason this file no longer names a signing key. Two OWEDs
+# stood here. `deploy/iam/map-model-gateway.json` grants secretsmanager:GetSecretValue on
+# `map/dev/providers/*` and nothing else under an exclusive attachment, so the signing key
+# this file used to name sat outside everything this role can read — every verification
+# would have got AccessDenied. And the entry itself did not exist in the account:
+# `aws secretsmanager list-secrets` returns `map/dev/providers/anthropic`,
+# `map/dev/platform/db`, `map/dev/platform/db-app` and the RDS-managed secret, and nothing
+# else. Neither is fixed by widening the policy or creating the entry. Both are gone
+# because the key moved to where its two other holders already keep it (ADR-023), which
+# needs no IAM change and no new vault entry.
+#
+# RESOLVED, and this is how the third OWED went. `map/dev/providers/openai` was named by
+# a `gpt-5-codex` entry here and existed in no account, so `deploy/platform.py
+# model-gateway` refused to apply and the workload could not ship. The two ways out that
+# looked available — create the entry, or pass `--allow-absent-vault-entry` — both leave a
+# route to a provider this deployment does not use, and a Session bound to that model
+# still fails on its first request. OpenAI is not in this deployment's plan, so the entry
+# was dead configuration and is deleted. Nothing is bypassed and nothing is missing: the
+# table now names only `map/dev/providers/anthropic`, which the account holds.
+#
+# The `responses` wire keeps its handler (`composition.py`) and its tests. What went away
+# is a model declared on it, not the ability to serve one — adding an OpenAI-compatible
+# entry back is an entry plus its vault name, with no code change.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: model-gateway-routing
+  namespace: map-dev
+data:
+  # Declared, never detected: a model reaches the shape named here or it is refused.
+  # Nothing in this document is a secret — credential_name is a vault entry's name, not
+  # its contents — which is what makes the routing table safe to keep in configuration a
+  # cluster reader can read.
+  #
+  # `gsds-claude-opus-4-6` is declared on a shape this build has no handler for, and
+  # that is the intended behaviour rather than a gap: until the slice that owns the
+  # Anthropic wire registers its handler, that model is refused loudly. The alternative
+  # would be sending a Responses body to an endpoint that does not accept one, down a
+  # wire nobody declared.
+  #
+  # `base_url` is a prefix each wire appends its own path to. Foundry's Anthropic route
+  # is `{resource}.services.ai.azure.com/anthropic/v1/messages`, so the prefix stops
+  # before `v1` and carries no `api-version` — that query parameter is an Azure-OpenAI
+  # convention and does not appear on this route.
+  #
+  # Both values on the Anthropic entry were wrong until 2026-08-23, and neither could
+  # fail anywhere: the host `map-foundry.services.ai.azure.com` does not resolve at all
+  # (DNS NXDOMAIN) and the model `claude-opus-5` is not the name this account deployed.
+  # The pair below is measured — one POST to `{base_url}/v1/messages` with `x-api-key`
+  # and `anthropic-version: 2023-06-01` returned HTTP 200. `model` here is the Foundry
+  # **deployment** name and not a model id, which is Foundry's own rule: "the deployment
+  # name you choose becomes the value you pass in the `model` parameter". The response
+  # comes back naming `claude-opus-4-6`, so the two are not interchangeable and this one
+  # is the one that goes on the request.
+  #
+  # Nothing local can check either value. A hostname that does not resolve and a
+  # deployment that does not exist both look like well-formed configuration, and the only
+  # thing that disagrees is the upstream. The guard is
+  # `tests/deploy/test_model_gateway_manifest.py`'s opt-in live probe, which is SKIPPED
+  # by default -- and skipped means this pair was not checked on that run.
+  routing.json: |
+    {
+      "entries": [
+        {
+          "model": "gsds-claude-opus-4-6",
+          "wire": "anthropic_messages",
+          "base_url": "https://alex-m8e2ebny-eastus2.services.ai.azure.com/anthropic",
+          "auth_scheme": "api_key",
+          "credential_name": "map/dev/providers/anthropic",
+          "query_params": {}
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: model-gateway
+  namespace: map-dev
+  labels: { map.component: model-gateway }
+spec:
+  # Two, and unlike its two siblings the number is not connection arithmetic: this
+  # process opens no database. It calls `create_model_gateway_app` directly and never
+  # `composition.build`, so it holds no SQLAlchemy engine and adds nothing to the pool
+  # demand tests/deploy/test_control_plane_manifest.py sums. No `strategy` block for the
+  # same reason — the default surge costs a third pod for the length of a rollout and
+  # costs the database nothing, where a relay that is down during a rollout is every
+  # live Session's model call failing.
+  replicas: 2
+  selector:
+    matchLabels: { map.component: model-gateway }
+  template:
+    metadata:
+      labels: { map.component: model-gateway }
+    spec:
+      serviceAccountName: model-gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          # The un-substituted placeholder. It replaces a registry-placeholder prefix
+          # over a hyphenated repository name and a mutable tag — the exact spelling is
+          # quoted in deploy/k8s/tool-gateway.yaml, which carried the same one — and
+          # that was wrong three ways: the repository ECR holds is `map/model-gateway`
+          # with a slash, the tag it named is the one string core/registration/environment.py refuses
+          # outright, and an IMMUTABLE repository accepts any tag exactly once. Nothing
+          # of that spelling is left in this file, and the test asserts the absence over
+          # the whole text rather than over the image field, because a value that can be
+          # copied out of a comment is a value.
+          #
+          # Sixty-four zeros is digest-shaped, so it parses and resolves nowhere — an
+          # unsubstituted manifest fails at the pull instead of starting something. The
+          # same value and the same argument as deploy/k8s/tool-gateway.yaml's.
+          # deploy/platform.py substitutes the digest ECR holds for this commit's tag.
+          image: map/model-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          command: ["uvicorn"]
+          args:
+            - "managed_agent.composition:model_gateway_app"
+            - "--factory"
+            - "--host=0.0.0.0"
+            - "--port=8080"
+          env:
+            # Names and numbers, and one Secret reference. The header above says why
+            # that one is here and why no provider credential joins it.
+            - name: MAP_ROUTING_TABLE_PATH
+              value: /etc/map/routing/routing.json
+            - name: MAP_SESSION_TOKEN_KEY
+              valueFrom:
+                secretKeyRef: { name: map-tool-gateway, key: session-token-key }
+            - name: MAP_CREDENTIAL_TTL_MS
+              value: "300000"
+            - name: MAP_ANTHROPIC_MAX_TOKENS
+              # The cap the Messages API requires on every request, which the Responses
+              # body this service receives has no field for. Here rather than compiled
+              # in because it trades a truncated answer against a runaway one, and that
+              # is an operator's call. 32k is well inside what the routed deployment
+              # allows and is large enough for a long file edit in one answer.
+              value: "32000"
+            - name: MAP_UPSTREAM_READ_TIMEOUT_S
+              # Inside the Agent Runtime's own 300 s stream-idle timeout, so this
+              # service gives up first and the runtime sees a failed request rather than
+              # a stall it will blame on the network.
+              value: "240"
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /v1/healthz, port: http }
+          livenessProbe:
+            httpGet: { path: /v1/healthz, port: http }
+            periodSeconds: 10
+          resources:
+            # Derived from the one thing this process holds in memory: a request body
+            # per in-flight Turn, capped at 8 MiB by MAX_REQUEST_BODY_BYTES in
+            # `gateway/model/router.py`. Response bodies are streamed and never buffered. So
+            # 256Mi covers the interpreter plus a few dozen concurrent bodies, and the
+            # 512Mi limit is the number a body-cap regression gets killed at instead of
+            # being reclaimed from a co-tenant pod.
+            #
+            # Without any block at all this pod was BestEffort at replicas: 2, which on
+            # the measured two-node t3.medium cluster means the kubelet takes memory
+            # from whatever else is on the node rather than from the process that asked
+            # for it.
+            #
+            # No CPU limit, matching tool-gateway.yaml: this is a latency-sensitive
+            # relay and a CPU limit throttles it rather than shedding load.
+            requests: { cpu: "200m", memory: "256Mi" }
+            limits: { memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          volumeMounts:
+            - { name: routing, mountPath: /etc/map/routing, readOnly: true }
+      volumes:
+        - name: routing
+          configMap: { name: model-gateway-routing }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: model-gateway
+  namespace: map-dev
+spec:
+  selector: { map.component: model-gateway }
+  # Port 80, because this address is not this file's to choose: every compiled
+  # config.toml names `http://model-gateway.<namespace>.svc.cluster.local/v1` with no
+  # port, and a URL with no port is port 80. Any other number here is a Service that
+  # nothing in the platform addresses.
+  ports:
+    - { name: http, port: 80, targetPort: http }

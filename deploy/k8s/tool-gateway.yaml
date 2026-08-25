@@ -1,0 +1,134 @@
+# The Tool Gateway: one service for the whole platform, outside every Session pod.
+#
+# It holds the tool credentials and the Session-token signing key; no Session pod holds
+# either. It is reachable *from* Session pods and reaches registered servers outward, and
+# it never reaches into a pod — the arrows only run one way.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tool-gateway
+  labels: { map.component: tool-gateway }
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    # maxSurge: 0 costs a rollout that drops to one serving replica instead of
+    # overlapping at three. It buys headroom rather than survival, and that distinction
+    # is worth being exact about because it changed on 2026-08-23 and the old wording
+    # would now be false.
+    #
+    # Without this, Kubernetes' default 25% starts a third pod during a rollout, and a
+    # surging pod opens a pool of its own while the two it replaces still hold theirs --
+    # 60 more connections at pool_size 50 + max_overflow 10. On db.t4g.small that was
+    # fatal: the instance offered 178 and the platform already wanted 180. On the
+    # db.t4g.medium it runs on now, measured, `show max_connections` is 400 and three are
+    # reserved for superusers, which map_app is not; about 15 more belong to backends the
+    # platform does not open, leaving 382. Five peak pods is 300. It fits, so this pin is
+    # no longer load-bearing -- it is kept because a rollout that briefly doubles the
+    # platform's database footprint is a bad habit to acquire while there is no reason to.
+    #
+    # The sum is not maintained here. test_control_plane_manifest.py reads every manifest
+    # declaring the database Secret and recomputes it, surge included, so a change that
+    # does not fit fails a test rather than the database. Past the ceiling the instance
+    # answers `FATAL: too many connections` -- environment.md's postgres row records that
+    # as "a total outage, as the designed response to load".
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
+  selector:
+    matchLabels: { map.component: tool-gateway }
+  template:
+    metadata:
+      labels: { map.component: tool-gateway }
+    spec:
+      serviceAccountName: tool-gateway
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        fsGroup: 10002
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: gateway
+          # The un-substituted placeholder, and it replaces `PLACEHOLDER_ECR/
+          # map-tool-gateway:latest`, which was wrong three ways: the repository is
+          # `map/tool-gateway` with a slash, `:latest` is the one string
+          # core/registration/environment.py refuses, and an IMMUTABLE repository takes that tag once.
+          # Sixty-four zeros is digest-shaped, so it parses and resolves nowhere — an
+          # unsubstituted manifest fails at the pull instead of starting something. The
+          # same value and the same argument as deploy/k8s/session-pod.yaml's.
+          # deploy/platform.py substitutes the digest ECR holds for this commit's tag.
+          image: map/tool-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          args:
+            - "uvicorn"
+            - "managed_agent.composition:tool_gateway_app"
+            - "--factory"
+            - "--host"
+            - "0.0.0.0"
+            - "--port"
+            - "8080"
+          ports:
+            - { name: mcp, containerPort: 8080 }
+          securityContext:
+            # A stdio registration names a command this container runs. That is the
+            # reason for every line in this block rather than a default worth copying.
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          env:
+            # Names only. No value of either secret appears in this manifest, and the
+            # vault the credentials themselves live behind is reached by the service
+            # account above rather than by anything written down here.
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: map-control-plane, key: database-url }
+            - name: MAP_SESSION_TOKEN_KEY
+              valueFrom:
+                secretKeyRef: { name: map-tool-gateway, key: session-token-key }
+            # Where captured Evidence goes. Absent, this process answers every tool call
+            # with platform.internal AFTER the upstream has already run and returned an
+            # answer -- so the tool worked, the agent was told it failed, and the model
+            # then apologised and answered from memory. Measured, in those words, on a
+            # live Turn. A literal and not a secretKeyRef: a bucket name is not a
+            # credential, and this role's grant on it is the thing that decides what may
+            # be written there.
+            - name: MAP_OBJECT_BUCKET
+              value: map-dev-062677866851-us-east-1-an
+            # Where a resuming Session's Rollout is read back from, for the seed route
+            # this service serves to an init container. The same bucket as above and
+            # the same literal as control-plane.yaml, under its own variable for the
+            # reason that file gives: the day resume state needs its own bucket or its
+            # own lifecycle policy, that is one value here and no code change.
+            #
+            # Absent, this process refuses to start. That is deliberate and it is the
+            # opposite of what the variable above does on the control plane: unset
+            # there, ship-out silently writes nothing; unset here, every seeding pod is
+            # told its Session has no Rollout, opens a fresh thread over one it should
+            # have continued, and replays folded history at the tenant's cost while
+            # reporting success. A pod that will not start is the cheaper failure.
+            #
+            # This role already reads it: map-tool-gateway.json grants s3:GetObject on
+            # every key of this bucket, so no IAM statement is added for the prefix.
+            - name: MAP_ROLLOUT_BUCKET
+              value: map-dev-062677866851-us-east-1-an
+          volumeMounts:
+            # A spawned stdio child needs somewhere writable; the root filesystem is not.
+            - { name: scratch, mountPath: /tmp }
+          readinessProbe:
+            httpGet: { path: /healthz, port: mcp }
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: mcp }
+            periodSeconds: 20
+          resources:
+            requests: { cpu: "500m", memory: "1Gi" }
+            limits: { memory: "4Gi" }
+      volumes:
+        - name: scratch
+          emptyDir: { medium: Memory, sizeLimit: 512Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tool-gateway
+spec:
+  selector: { map.component: tool-gateway }
+  ports:
+    - { name: mcp, port: 80, targetPort: mcp }

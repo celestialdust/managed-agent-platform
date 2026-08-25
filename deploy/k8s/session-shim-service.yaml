@@ -1,0 +1,29 @@
+# The DNS record every Session pod answers to, and nothing else.
+#
+# clusterIP: None makes this headless: it allocates no virtual IP and load-balances
+# nothing. That is the point -- a load-balanced Service across every Session pod would
+# send one Session's Turn to another Session's shim, which is the one thing that must be
+# impossible here. What a headless Service gives instead is a per-pod A record at
+# <pod-name>.map-session.<namespace>.svc.cluster.local, and pod-name is already a pure
+# function of the Session id (control/session/placement.py).
+#
+# The name must equal the pod's `subdomain` and the SHIM_SERVICE constant the control
+# plane computes with; tests/deploy/test_session_pod_runs_a_shim.py compares all three.
+#
+# Note that `None` here is the string "None" once this file is parsed, not a YAML null.
+# Kubernetes wants that literal, and a test asserting `is None` fails on a correct file.
+apiVersion: v1
+kind: Service
+metadata:
+  name: map-session
+spec:
+  clusterIP: None
+  # Not published before the shim is ready. A pod whose shim has not opened its Session
+  # is unresolvable rather than reachable-and-refusing, so a Turn dispatched into that
+  # window fails as undeliverable and the Turn is closed, instead of being accepted by a
+  # process that cannot run it.
+  publishNotReadyAddresses: false
+  selector:
+    map.role: session-pod
+  ports:
+    - { name: shim, port: 8081, targetPort: shim }

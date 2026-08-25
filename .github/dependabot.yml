@@ -1,0 +1,27 @@
+# Dependency updates as pull requests, so a security advisory arrives as a diff the
+# gates run against rather than as a dashboard nobody opens.
+#
+# There is no `npm audit` equivalent step in the CI workflow on purpose. GitHub already
+# raises an advisory against `uv.lock` and opens the fix as a PR here; a second scanner
+# in CI would be a second answer to the same question, free to disagree with the first
+# and adding a dependency to check dependencies.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    # Grouped, because the lockfile is resolved as a whole: five separate PRs each
+    # bumping one entry conflict with each other on `uv.lock` and only the first
+    # merges cleanly.
+    groups:
+      python:
+        patterns: ["*"]
+
+  # The workflow's own actions pin to major tags, which move. This is what notices when
+  # one of them has been abandoned.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

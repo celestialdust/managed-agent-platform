@@ -1,0 +1,202 @@
+[project]
+name = "managed-agent-platform"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "pydantic>=2.9",
+  "sqlalchemy[asyncio]>=2.0.36",
+  "asyncpg>=0.30",
+  "alembic>=1.14",
+  "httpx>=0.28",
+  "aioboto3>=13.2",
+  # 2.0, not 1.x. The Tool Gateway is written against names that do not exist in 1.x --
+  # `streamable_http_client` yielding two streams, `MCPError`, constructor-argument
+  # lowlevel handlers -- so a resolver free to pick 1.x would install a tree that fails
+  # at import. The lock already pins 2.0.0; this makes the constraint say so.
+  "mcp>=2.0",
+  # The transport under a Streamable HTTP registration. A separate distribution from
+  # `httpx` sharing no base class with it, so the Tool Gateway's error map imports it by
+  # name to classify a connect failure. It arrives transitively via `mcp` today, and a
+  # module that imports a package should declare it rather than rest on another
+  # package's dependency graph.
+  "httpx2>=2.12",
+  "openai-codex>=0.147.0",
+  # The Kubernetes client the pod adapter speaks to the cluster with. Declared even
+  # though every one of its six dependencies -- aiohttp, certifi, python-dateutil,
+  # pyyaml, six, urllib3 -- is already installed by something else here, because a
+  # module that imports a package should say so rather than rest on another package's
+  # graph. Measured: it adds exactly one distribution to the lock and one to the
+  # `--no-dev` install set.
+  #
+  # Not the official synchronous `kubernetes`: every port in this codebase is
+  # `async def`, and placement polls for up to 180 s, so a sync call from the event
+  # loop stops the process serving for that long. It is also five distributions in the
+  # lock and seven in the runtime set, two of them (`requests`, `charset-normalizer`)
+  # a second HTTP stack that is dev-only today.
+  #
+  # Not `httpx` directly, which is already here and would add nothing: in-cluster
+  # credentials are two file reads, but locally they are the `aws eks get-token` exec
+  # plugin, and every response becomes `dict[str, Any]` -- so `mypy --strict` would
+  # prove nothing about the four pod-status fields the adapter branches on.
+  "kubernetes-asyncio>=36.1.0",
+  # The YAML parser. Two readers: the pod adapter loads the manifest named by
+  # `MAP_POD_MANIFEST` off disk to build a Session's pod, and the drift check between
+  # that manifest and the paths config-compiler emits deny rules against has to read
+  # its structure -- a substring search over the file is satisfied by the file's own
+  # comments, which name every one of those paths.
+  #
+  # Runtime, not dev, from this slice on. It sat in the `dev` extra while only tests
+  # read it, and `src/` had no `import yaml` at all until the pod adapter needed one.
+  # The Session image is built with `uv sync --locked --no-dev`, so a dev-extra
+  # declaration produces an image that fails at `import managed_agent.composition`
+  # rather than at build time. It was already in the `--no-dev` install set
+  # transitively via `uvicorn[standard]`; what changes is that the declaration matches
+  # the import.
+  "pyyaml>=6.0",
+  # FastAPI raises at route-definition time when a route declares UploadFile and this
+  # parser is absent, so its absence is a start-up failure rather than a test failure.
+  # Declared here with everything else because this file has one writer (invariant I14).
+  "python-multipart>=0.0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3",
+  "pytest-asyncio>=0.24",
+  "testcontainers[postgres]>=4.8",
+  "ruff>=0.8",
+  "mypy>=1.13",
+  # Stubs only; the parser itself is a runtime dependency above. `pyyaml` ships no
+  # `py.typed`, so without these `mypy --strict` stops at `Library stubs not installed
+  # for "yaml"  [import-untyped]` on every module that reads a manifest. Nothing
+  # imports a stub at runtime, so promoting these beside the parser would put a
+  # distribution with no runtime use into every Session pod.
+  "types-PyYAML>=6.0",
+  # The suite has to READ a PDF, not only cause one to be written. The whole-journey
+  # cluster test downloads what the agent produced and parses it, because a file can
+  # carry the `%PDF-` header and still be unopenable -- and an unopenable PDF is a
+  # failed errand a magic-byte check reports as a pass.
+  #
+  # Declared here as well as in `agent-tools`, and the duplication is deliberate: the
+  # two reasons are unrelated. `agent-tools` puts pypdf in the Session image for the
+  # AGENT to use, and dropping the skill from this platform would remove it from there;
+  # this entry is what lets the test suite read a PDF at all, and it must survive that.
+  "pypdf>=6.16.2",
+]
+# Not this package's dependencies -- the confined AGENT's. Nothing under `src/` imports
+# any of them, and `mypy --strict` would flag it if something did.
+#
+# This list is not a guess at what a document-writing agent might want. It is the six
+# distributions Anthropic's published `pdf` skill names in its own text, in the order
+# that skill introduces them, and `tests/fixtures/anthropic_pdf_skill.py` carries the
+# skill verbatim with the same six in `REQUIRED_PYTHON_PACKAGES`. A skill instructs the
+# model to `pip install` what it needs; an agent under an Environment that granted no
+# egress cannot, and the instruction fails for a reason found nowhere in the skill's own
+# text. So the set is decided here, once, and locked.
+#
+# `pytesseract` is present and its OCR branch still cannot run: it is a wrapper around
+# the `tesseract` binary, which is not packaged for Amazon Linux 2023 (measured). The
+# import succeeds, so a model following the skill reaches the binary's absence rather
+# than a missing module. Left installed deliberately -- dropping it would make the same
+# branch fail one step earlier with a message that reads as a platform packaging bug.
+#
+# They are here, in an extra, rather than pip-installed into the image, because the
+# image's PATH puts the venv first: the agent's bare `python3` IS the venv's, so a
+# system-interpreter install is invisible to every command the agent runs. Measured --
+# the session image's own build assertion failed on exactly that.
+#
+# An extra rather than a plain dependency so the platform image, which shares this file
+# and syncs without it, does not carry a PDF writer it has no use for. Locked either
+# way, which is the point: a version resolved at build time means two Sessions in one
+# Environment can run different code.
+agent-tools = [
+  "reportlab>=5.0.1",
+  "pypdf>=6.16.2",
+  "pdfplumber>=0.11.10",
+  "pdf2image>=1.17.0",
+  "pytesseract>=0.3.13",
+  "pandas>=3.0.5",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+# A bare `pytest` must be deterministic and offline. `testpaths` sweeps the whole tests
+# tree, and the MCP conformance suite reaches a third-party server on the public
+# internet -- so without this line the project's own gate fails when that server is slow,
+# rate-limits, or is down, for a reason that is not a defect in this repo. Deselected
+# rather than skipped: a skip reads as "this ran and had nothing to say".
+#
+# The marked tests are still meant to be RUN. `-m` given twice takes the last one, so
+# `pytest -m network` overrides this and executes exactly them.
+#
+# One expression, and `and` is load-bearing. A second opt-in mark cannot be a second
+# `-m`: measured, `-m 'not network' -m 'not image'` keeps only the last, so the network
+# suite silently returns to the offline gate. `or` is worse -- `not network or not
+# image` deselects only a test carrying both marks, so both opt-in suites run.
+addopts = "-m 'not network and not image'"
+markers = [
+  "network: reaches a service on the public internet; excluded from the default run",
+  # A container build: needs a Docker daemon, public.ecr.aws, registry.npmjs.org and
+  # pypi.org, and costs 55 s cold. Registered rather than left to `skipif` so the
+  # deselect is one expression a reader can check, and so a typo in the mark name is a
+  # PytestUnknownMarkWarning instead of a build quietly rejoining the default run.
+  "image: builds a container image; excluded from the default run",
+]
+
+[tool.mypy]
+strict = true
+# The whole annotated tree, not just the package. `migrations/` is where the DDL lives and
+# `tests/` is where the properties are asserted. Both are fully annotated and both already
+# pass, so the narrower setting was leaving 14 of 23 files ungraded for nothing.
+files = ["src", "tests", "migrations"]
+# `tools/` is not in `files` and is not meant to be: those scripts are run from the command
+# line, and a test that drives one drives it as a subprocess. `tools/publish.py` is the one
+# exception -- `tests/test_publish_withholds_the_design_record.py` imports it, because the
+# CLI refuses a dirty working tree and a developer mid-edit must not see that test fail for
+# a reason that is not about publishing. This is what lets mypy resolve that import; the
+# module is followed and graded like any other, and nothing else under `tools/` is pulled in
+# unless something imports it too.
+mypy_path = "tools"
+
+[tool.ruff]
+# ruff formats Python code blocks inside Markdown, and `docs/` is full of them: every
+# slice's plan step file carries the exact snippet that will appear in its diff. So a
+# bare `ruff format .` rewrites plan files -- it reformatted `plan/MAP-44.md` after a
+# snippet edit left a three-blank-line run ruff disagreed with. That is worse than the
+# one blank line it moves. A slice running the format gate gets a dirty tree in a file
+# it does not own and gets no hint that a plan file was in scope, and a slice that then
+# runs `git add -A` commits another slice's plan edit silently. The snippets are also
+# what implementers build against, so a formatter with an opinion about them is editing
+# the specification.
+#
+# Excluded here rather than by scoping each invocation, because the mistake has to be
+# unavailable and not merely avoidable: `ruff format .` is what anyone types.
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "TID"]
+
+# The layer linter behind invariant I13: nothing under core/ may import an adapter or a
+# third-party infrastructure client. Only composition.py constructs a concrete type.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"managed_agent.adapters".msg = "core and control must depend on ports; wire adapters at composition.py"
+"aioboto3".msg = "infrastructure client: import it in adapters/ only"
+"sqlalchemy".msg = "infrastructure client: import it in adapters/ only"
+
+[tool.ruff.lint.per-file-ignores]
+"src/managed_agent/adapters/**" = ["TID251"]
+"src/managed_agent/composition.py" = ["TID251"]
+# Migrations are DDL against the one relational store; they are infrastructure by
+# definition and sit outside the package the ban protects.
+"migrations/**" = ["TID251"]
+"tests/**" = ["TID251"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/managed_agent"]

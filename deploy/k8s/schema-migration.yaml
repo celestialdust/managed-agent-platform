@@ -1,0 +1,77 @@
+# Upgrade the relational schema to the head revision in the tree, once, before the
+# workloads that read it start.
+#
+# Nothing else in this repository does this. `grep -rn alembic deploy/` returned nothing
+# before this file, and a control-plane pod started against an unmigrated database serves
+# its probe -- which reads nothing -- and 500s on the first query. deploy/platform.py
+# deletes and recreates this Job on every run and waits for it to complete before
+# applying the Deployment.
+#
+# It runs from the platform image, which carries alembic.ini and migrations/ as files:
+# the wheel packages src/managed_agent only, so an image built without them has the
+# runner on PATH and no revisions to run -- and `alembic upgrade head` then reports
+# success having applied nothing.
+#
+# It reads DATABASE_URL, the same Secret key the Deployment reads. migrations/env.py
+# checks MAP_DATABASE_URL first and DATABASE_URL second, specifically so a deployment can
+# hand the runner a role that may ALTER TABLE without granting that to every request
+# handler. That split has no consumer yet -- there is one database role here -- and
+# inventing a second Secret key for a role nobody has created would be configuration
+# ahead of its need. plan/MAP-63.md's blocker 4 records it as the follow-on.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: map-schema-migration
+  namespace: map-dev
+  labels: { map.component: schema-migration }
+spec:
+  # No retry. alembic is safe to re-run -- it reads alembic_version and applies only what
+  # is missing -- so this is not about correctness; it is about who finds out. A retried
+  # Job that succeeded on its second attempt reports Complete, and the transient failure
+  # that caused the first attempt is then something only the pod list remembers. The
+  # applier recreates this Job on every run, so re-running is one command away.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { map.component: schema-migration }
+    spec:
+      restartPolicy: Never
+      # The same identity as the workload whose schema this is. It needs no AWS call --
+      # the URL arrives as an environment variable -- so the annotation's projected token
+      # goes unused here, and reusing the account is one identity to audit rather than
+      # two.
+      serviceAccountName: control-plane
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10002
+        fsGroup: 10002
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: alembic
+          image: map/control-plane@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          # Load-bearing, and measured rather than assumed. alembic resolves
+          # `script_location = migrations` against the process's working directory, not
+          # against the directory holding alembic.ini: run from anywhere else it answers
+          # `CommandError: Path doesn't exist: migrations.` The image sets WORKDIR to the
+          # same path; this says it too, so a change to either is caught by the other.
+          workingDir: /opt/map
+          command:
+            - "alembic"
+            - "-c"
+            - "/opt/map/alembic.ini"
+            - "upgrade"
+            - "head"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef: { name: map-control-plane, key: database-url }
+          resources:
+            # One connection and one statement at a time: migrations/env.py builds its
+            # engine with poolclass=pool.NullPool, so this is not the serving process's
+            # pool arithmetic and needs none of its headroom.
+            requests: { cpu: "100m", memory: "256Mi" }
+            limits: { memory: "512Mi" }

@@ -1,0 +1,23 @@
+# The build context for platform.Dockerfile, and nothing else.
+#
+# BuildKit reads "<dockerfile-path>.dockerignore" in preference to a root .dockerignore,
+# so this scopes the filter to this one image instead of claiming a repository-root file
+# every future image build would share.
+#
+# An allowlist, and that is the whole design. The repository root is several gigabytes --
+# .claude is worktrees and tool output, .venv, .reference and .mypy_cache are hundreds of
+# megabytes each -- and a denylist would have to name each of those and would silently
+# ship the next large directory somebody adds.
+#
+# Two entries more than session.Dockerfile.dockerignore, and both are the migration
+# runner: hatchling packages src/managed_agent only, so alembic.ini and migrations/ reach
+# the image as files rather than through the wheel.
+#
+# src/** and migrations/** rather than src and migrations: the pattern must match the
+# files inside the directory, not only the directory entry.
+*
+!pyproject.toml
+!uv.lock
+!src/**
+!alembic.ini
+!migrations/**

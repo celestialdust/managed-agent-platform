@@ -1,0 +1,154 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "BuildTheEnvironmentInOneRegion",
+      "Effect": "Allow",
+      "Action": [
+        "eks:*",
+        "ec2:*",
+        "ecr:*",
+        "rds:*",
+        "secretsmanager:*",
+        "cloudformation:*",
+        "autoscaling:*",
+        "elasticloadbalancing:*",
+        "logs:*",
+        "s3files:*",
+        "elasticfilesystem:*",
+        "ssm:GetParameter",
+        "ssm:GetParameters",
+        "kms:Describe*",
+        "kms:List*",
+        "kms:CreateGrant"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "us-east-1"
+        }
+      }
+    },
+    {
+      "Sid": "TheOneBucketAndNoOther",
+      "Effect": "Allow",
+      "Action": [
+        "s3:*"
+      ],
+      "Resource": [
+        "arn:aws:s3:::map-dev-*",
+        "arn:aws:s3:::map-dev-*/*"
+      ]
+    },
+    {
+      "Sid": "ListBucketsSoTheCliCanOrientItself",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListAllMyBuckets",
+        "sts:GetCallerIdentity"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RolesForThisPlatformOnly",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:TagRole",
+        "iam:UntagRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:ListRolePolicies",
+        "iam:ListAttachedRolePolicies",
+        "iam:ListRoleTags",
+        "iam:ListInstanceProfilesForRole",
+        "iam:UpdateAssumeRolePolicy"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/map-*",
+        "arn:aws:iam::*:role/eksctl-map-*"
+      ]
+    },
+    {
+      "Sid": "VersionTheFourWorkloadPoliciesAndNothingElse",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreatePolicyVersion",
+        "iam:DeletePolicyVersion"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:policy/map-control-plane",
+        "arn:aws:iam::*:policy/map-tool-gateway",
+        "arn:aws:iam::*:policy/map-model-gateway",
+        "arn:aws:iam::*:policy/map-cluster-autoscaler"
+      ]
+    },
+    {
+      "Sid": "ReadPoliciesAndLetAwsMakeItsOwnServiceRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetPolicy",
+        "iam:GetPolicyVersion",
+        "iam:ListPolicies",
+        "iam:ListPolicyVersions",
+        "iam:CreateServiceLinkedRole",
+        "iam:CreateOpenIDConnectProvider",
+        "iam:GetOpenIDConnectProvider",
+        "iam:ListOpenIDConnectProviders",
+        "iam:TagOpenIDConnectProvider",
+        "iam:DeleteOpenIDConnectProvider"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "ReadEnoughToCheckAClaimInsteadOfInferringIt",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:GetMetricStatistics",
+        "cloudwatch:GetMetricData",
+        "cloudwatch:ListMetrics",
+        "iam:GetUser",
+        "iam:ListUserPolicies",
+        "iam:GetUserPolicy",
+        "iam:ListAttachedUserPolicies",
+        "iam:ListRoles",
+        "iam:SimulatePrincipalPolicy",
+        "iam:SimulateCustomPolicy",
+        "access-analyzer:ValidatePolicy"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "NeverTouchAccountIdentityOrAudit",
+      "Effect": "Deny",
+      "Action": [
+        "iam:CreateUser",
+        "iam:DeleteUser",
+        "iam:CreateAccessKey",
+        "iam:DeleteAccessKey",
+        "iam:UpdateAccessKey",
+        "iam:CreateLoginProfile",
+        "iam:UpdateLoginProfile",
+        "iam:AttachUserPolicy",
+        "iam:PutUserPolicy",
+        "iam:DeleteAccountPasswordPolicy",
+        "organizations:*",
+        "account:*",
+        "cloudtrail:StopLogging",
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:UpdateTrail",
+        "config:Delete*",
+        "config:Stop*",
+        "guardduty:Delete*",
+        "guardduty:Disassociate*"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

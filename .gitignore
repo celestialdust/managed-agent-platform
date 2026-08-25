@@ -1,0 +1,78 @@
+# Local reference material — pulled, not authored. Never committed.
+.reference/
+
+# Scratch
+*.log
+.DS_Store
+
+# Secrets — never committed. Values live here; only names go in environment.md.
+.env
+.env.*
+!.env.example
+
+# Orchestrator slice worktrees — branches, not content
+.claude/worktrees/
+
+# Python build and cache artefacts. MAP-2 is the first Python in this repo, so these
+# arrive with it.
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Agent scratch space. Never linted, never committed: a subagent staging a probe in the
+# repo root would otherwise fail `test_ruff_passes_over_the_whole_tree`, which lints the
+# whole tree by design and cannot tell a probe from a source file.
+.tmp-*/
+
+# Same reason, for a probe staged as a file rather than a directory. No source file in this
+# tree is a root-level dotfile — `[tool.mypy] files` names src/tests/migrations and nothing
+# else — so a root-level `.something.py` is scratch by construction. `.map54_rerun.py`, left
+# by a live implementer, failed `ruff format --check` on the whole-tree gate.
+/.[!.]*.py
+
+# Terraform working state. `.terraform/` is the downloaded provider -- hundreds of MB
+# for hashicorp/aws alone. The state files hold the account's resource metadata, and
+# git does not forget: committing one publishes it into history where deleting the
+# file does not remove it. `.terraform.lock.hcl` is NOT here and is committed on
+# purpose -- it pins the provider version and its checksums, which is what makes two
+# people's plans comparable.
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.tfstate.lock.info
+tfplan
+
+# The design record. Untracked on purpose, and still on disk: `docs/`, `CONTEXT.md` and
+# `STATE.md` are how the work here is planned, decided and remembered, and they are read
+# every session. None of it is part of what somebody deploying or extending this platform
+# needs, and some of it names internal accounts, incidents and working assumptions that
+# should not leave with the source.
+#
+# Ignoring alone would have done nothing -- every one of these was tracked, and a
+# `.gitignore` entry has no effect on a file git already follows. They were removed from
+# the index with `git rm --cached`, which is what these lines then keep out.
+#
+# History still holds them, so a push of this branch's history publishes what these lines
+# withhold from its tip. `tools/publish.py` is the answer to that: one squashed snapshot,
+# one tree, exactly what `--dry-run` prints.
+docs/
+CONTEXT.md
+STATE.md
+
+# The agent pipeline's own instructions. Not secret -- but every pointer in them resolves
+# into `docs/`, so beside a tree with no `docs/` they are a page of dangling references,
+# which is worse than their absence.
+CLAUDE.md
+AGENTS.md
+.claude/
+
+# The one test that reads the design record: it asserts every skip gate in the suite
+# appears in `docs/test-gates.md`. With that document untracked the test fails a clone for
+# the absence of a file rather than for anything about the code, so it leaves with what it
+# grades. The gate table itself is reproduced in README.md, which is where a reader
+# outside this repository looks for it.
+tests/test_gates.py

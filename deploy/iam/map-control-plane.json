@@ -8,7 +8,7 @@
         "secretsmanager:GetSecretValue",
         "secretsmanager:DescribeSecret"
       ],
-      "Resource": "arn:aws:secretsmanager:us-east-1:062677866851:secret:map/dev/platform/*"
+      "Resource": "arn:aws:secretsmanager:us-east-1:000000000000:secret:map/dev/platform/*"
     },
     {
       "Sid": "WebhookSigningSecretsOnly",
@@ -17,7 +17,7 @@
         "secretsmanager:GetSecretValue",
         "secretsmanager:DescribeSecret"
       ],
-      "Resource": "arn:aws:secretsmanager:us-east-1:062677866851:secret:map/webhook-secret/*"
+      "Resource": "arn:aws:secretsmanager:us-east-1:000000000000:secret:map/webhook-secret/*"
     },
     {
       "Sid": "WriteToolCredentialsNeverReadThem",
@@ -28,7 +28,7 @@
         "secretsmanager:DeleteSecret",
         "secretsmanager:TagResource"
       ],
-      "Resource": "arn:aws:secretsmanager:us-east-1:062677866851:secret:map/tool-credential/*"
+      "Resource": "arn:aws:secretsmanager:us-east-1:000000000000:secret:map/tool-credential/*"
     },
     {
       "Sid": "UploadedFilesOnly",
@@ -37,7 +37,7 @@
         "s3:GetObject",
         "s3:PutObject"
       ],
-      "Resource": "arn:aws:s3:::map-dev-062677866851-us-east-1-an/*"
+      "Resource": "arn:aws:s3:::map-dev-000000000000-us-east-1-an/*"
     },
     {
       "Sid": "ListTheObjectBucketOnly",
@@ -45,7 +45,7 @@
       "Action": [
         "s3:ListBucket"
       ],
-      "Resource": "arn:aws:s3:::map-dev-062677866851-us-east-1-an"
+      "Resource": "arn:aws:s3:::map-dev-000000000000-us-east-1-an"
     }
   ]
 }

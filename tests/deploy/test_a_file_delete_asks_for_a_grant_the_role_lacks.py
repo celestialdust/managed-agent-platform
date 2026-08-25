@@ -15,7 +15,7 @@ Adding the grant will break these cases, and that is the point -- whoever adds i
 delete this file in the same commit and say so, rather than find a stale test.
 
 Verified against the live account rather than inferred from the file: for
-`arn:aws:iam::062677866851:role/map-control-plane`, `iam simulate-principal-policy`
+the deployed `map-control-plane` role, `iam simulate-principal-policy`
 answers `implicitDeny` for `s3:DeleteObject` and `allowed` for `s3:PutObject` and
 `s3:GetObject` on that bucket.
 """

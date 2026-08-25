@@ -75,7 +75,7 @@ spec:
         - { name: config, mountPath: /config/map }
   containers:
     - name: probe
-      image: 062677866851.dkr.ecr.us-east-1.amazonaws.com/map/spike:0.149.0
+      image: 000000000000.dkr.ecr.us-east-1.amazonaws.com/map/spike:0.149.0
       # Always, and not the default. The tag names the codex version rather than the
       # image build, so a rebuilt probe keeps the same tag -- and under IfNotPresent the
       # node serves whatever it cached the first time. That happened here: a run reported

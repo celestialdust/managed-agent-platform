@@ -90,7 +90,7 @@ spec:
             # credential, and this role's grant on it is the thing that decides what may
             # be written there.
             - name: MAP_OBJECT_BUCKET
-              value: map-dev-062677866851-us-east-1-an
+              value: map-dev-000000000000-us-east-1-an
             # Where a resuming Session's Rollout is read back from, for the seed route
             # this service serves to an init container. The same bucket as above and
             # the same literal as control-plane.yaml, under its own variable for the
@@ -107,7 +107,7 @@ spec:
             # This role already reads it: map-tool-gateway.json grants s3:GetObject on
             # every key of this bucket, so no IAM statement is added for the prefix.
             - name: MAP_ROLLOUT_BUCKET
-              value: map-dev-062677866851-us-east-1-an
+              value: map-dev-000000000000-us-east-1-an
           volumeMounts:
             # A spawned stdio child needs somewhere writable; the root filesystem is not.
             - { name: scratch, mountPath: /tmp }

@@ -451,7 +451,7 @@ def test_the_role_grants_no_action_outside_a_written_down_set() -> None:
     for statement in document["Statement"]:
         if "eks:DescribeNodegroup" in statement["Action"]:
             assert statement["Resource"].startswith(
-                "arn:aws:eks:us-east-1:062677866851:nodegroup/map-dev/"
+                "arn:aws:eks:us-east-1:000000000000:nodegroup/map-dev/"
             )
 
 

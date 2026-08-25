@@ -87,6 +87,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import subprocess
 import sys
 import time
@@ -107,6 +108,22 @@ Digest-shaped so that nothing downstream needs a special case for it, and sixty-
 zeros so it resolves to no image anywhere -- an unsubstituted manifest fails at the pull
 rather than starting something. The same value and the same argument as
 `deploy/k8s/session-pod.yaml`'s.
+"""
+
+ACCOUNT_PLACEHOLDER: Final = "0" * 12
+"""The un-substituted AWS account id every committed manifest carries.
+
+Twelve digits, so an ARN built around it parses everywhere an ARN is parsed, and all
+zeros so it names no account that exists -- the same argument as `DIGEST_PLACEHOLDER`
+above, one field over. An IRSA annotation left at this value gets the pod a role that
+cannot be assumed, and a bucket name left at it gets an S3 call that 404s, both of which
+are loud. A *real* account id written into a committed manifest is the failure worth
+preventing: it is silent, it works on the machine that wrote it, and it is published.
+
+The value the deploy substitutes in comes from `aws sts get-caller-identity`, which is
+where `deploy/docker/push-platform-image.sh` already gets the registry host and where
+`deploy/terraform/account.tf` already gets every ARN. One authority, asked three times,
+rather than one literal copied into ninety places.
 """
 
 _K8S: Final = Path("deploy/k8s")
@@ -582,6 +599,84 @@ def substituted(text: str, repository: str, reference: str) -> str:
     return done
 
 
+def with_account(text: str, account_id: str) -> str:
+    """Replace the placeholder account id in a manifest with the caller's own.
+
+    Unlike `substituted()` this does not raise when the placeholder is absent. Most
+    manifests here name no account at all -- only the IRSA annotations and the two
+    bucket-name variables do -- and a manifest that legitimately has none must not be
+    refused. What is refused is the opposite case, and it is checked by the caller: a
+    twelve-digit literal that is neither the placeholder nor the account being deployed
+    to would be somebody else's account, applied.
+    """
+    return text.replace(ACCOUNT_PLACEHOLDER, account_id)
+
+
+def caller_account(root: Path) -> str:
+    """The account the ambient credentials belong to, as AWS itself reports it.
+
+    Asked rather than configured. A variable naming the account would be a second answer
+    free to disagree with the credentials actually in the environment, and it would
+    disagree in the direction nobody notices: a manifest applied to the account the
+    credentials name, carrying ARNs for the account the variable named.
+    """
+    found = subprocess.run(
+        ("aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"),
+        cwd=root,
+        capture_output=True,
+        text=True,
+    )
+    if found.returncode != 0:
+        raise RuntimeError(
+            "cannot read the AWS account from the current credentials, so no manifest "
+            f"can be given one: {found.stderr.strip()}"
+        )
+    account = found.stdout.strip()
+    if not (len(account) == 12 and account.isdigit()):
+        raise RuntimeError(
+            f"aws sts get-caller-identity answered {account!r}, which is not an "
+            "account id"
+        )
+    return account
+
+
+FOUNDRY_RESOURCE_VAR: Final = "MAP_FOUNDRY_RESOURCE"
+FOUNDRY_PLACEHOLDER: Final = "map-foundry.services.ai.azure.com"
+"""The un-substituted Azure Foundry host the committed routing table carries.
+
+A Foundry resource name identifies one company's Azure account, so the value in the
+repository names nobody: this host returns NXDOMAIN, measured. That is the same property
+`DIGEST_PLACEHOLDER` and `ACCOUNT_PLACEHOLDER` are chosen for -- a deploy that did not
+configure the real resource fails at DNS, rather than sending a tenant's prompts to
+whatever host happened to be committed.
+
+Unlike those two it cannot be derived. An account id is a property of the credentials
+already in the environment; a Foundry resource is a choice, so it is read from
+`MAP_FOUNDRY_RESOURCE` and its absence is a refusal rather than a default.
+"""
+
+
+def with_foundry(text: str, resource: str | None) -> str:
+    """Point the routing table at this deployment's Foundry resource.
+
+    A manifest carrying no placeholder is returned untouched -- only the Model Gateway's
+    routing table names a host, and the other two workloads must not be refused for
+    lacking one. A manifest that *does* carry it and has no resource configured is
+    refused here, before anything is applied, because the alternative is a Model Gateway
+    that rolls out cleanly, reports itself healthy, and fails every Turn at DNS.
+    """
+    if FOUNDRY_PLACEHOLDER not in text:
+        return text
+    if not resource:
+        raise RuntimeError(
+            f"this manifest's routing table is still at {FOUNDRY_PLACEHOLDER}, which "
+            f"resolves nowhere. Set {FOUNDRY_RESOURCE_VAR} to this deployment's Azure "
+            "Foundry resource name -- the name alone, not the whole host -- and deploy "
+            "again."
+        )
+    return text.replace(FOUNDRY_PLACEHOLDER, f"{resource}.services.ai.azure.com")
+
+
 def deployment_shortfall(status: Mapping[str, object], desired: object) -> str | None:
     """Say why a finished rollout does not mean the workload is serving, or None.
 
@@ -994,11 +1089,23 @@ def main(argv: tuple[str, ...] | None = None) -> int:
 
     reference = _reference(root, workload.repository)
     print(f"== image {reference}")
+    account = caller_account(root)
+    print(f"== account {account}")
 
     for companion in workload.companions:
-        # Unsubstituted: a companion carries identities and permissions, never an image.
+        # No image to substitute -- a companion carries identities and permissions. It
+        # does carry account ids, in the `eks.amazonaws.com/role-arn` annotation on
+        # each ServiceAccount, so it goes through stdin rather than by path: left at the
+        # placeholder those annotations name a role in account 000000000000 and every
+        # pod using them fails to assume anything.
         print(f"== {companion.name}")
-        _kubectl(root, "apply", "-f", str(root / companion))
+        _kubectl(
+            root,
+            "apply",
+            "-f",
+            "-",
+            stdin=with_account((root / companion).read_text(), account),
+        )
 
     if workload.schema_job is not None:
         print(f"== {workload.schema_job.name}, from scratch")
@@ -1012,8 +1119,13 @@ def main(argv: tuple[str, ...] | None = None) -> int:
             "apply",
             "-f",
             "-",
-            stdin=substituted(
-                (root / workload.schema_job).read_text(), workload.repository, reference
+            stdin=with_account(
+                substituted(
+                    (root / workload.schema_job).read_text(),
+                    workload.repository,
+                    reference,
+                ),
+                account,
             ),
         )
         _kubectl(
@@ -1056,8 +1168,16 @@ def main(argv: tuple[str, ...] | None = None) -> int:
         "apply",
         "-f",
         "-",
-        stdin=substituted(
-            (root / workload.manifest).read_text(), workload.repository, reference
+        stdin=with_foundry(
+            with_account(
+                substituted(
+                    (root / workload.manifest).read_text(),
+                    workload.repository,
+                    reference,
+                ),
+                account,
+            ),
+            os.environ.get(FOUNDRY_RESOURCE_VAR),
         ),
     )
     _kubectl(

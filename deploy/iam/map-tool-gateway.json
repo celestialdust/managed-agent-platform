@@ -10,7 +10,7 @@
         "s3:PutObject",
         "s3:DeleteObject"
       ],
-      "Resource": "arn:aws:s3:::map-dev-062677866851-us-east-1-an/*"
+      "Resource": "arn:aws:s3:::map-dev-000000000000-us-east-1-an/*"
     },
     {
       "Sid": "FindThemAgain",
@@ -19,7 +19,7 @@
         "s3:ListBucket",
         "s3:ListBucketVersions"
       ],
-      "Resource": "arn:aws:s3:::map-dev-062677866851-us-east-1-an"
+      "Resource": "arn:aws:s3:::map-dev-000000000000-us-east-1-an"
     },
     {
       "Sid": "ToolCredentialsThatNeverLeaveThisProcess",
@@ -28,7 +28,7 @@
         "secretsmanager:GetSecretValue",
         "secretsmanager:DescribeSecret"
       ],
-      "Resource": "arn:aws:secretsmanager:us-east-1:062677866851:secret:map/tool-credential/*"
+      "Resource": "arn:aws:secretsmanager:us-east-1:000000000000:secret:map/tool-credential/*"
     }
   ]
 }

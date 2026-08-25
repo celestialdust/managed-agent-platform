@@ -90,7 +90,7 @@ resource "aws_db_instance" "map_dev" {
   allocated_storage = 20
   storage_type      = "gp3"
   storage_encrypted = true
-  kms_key_id        = "arn:aws:kms:us-east-1:062677866851:key/244d6552-ae49-4f43-8655-0ae9d9e9cbda"
+  kms_key_id        = "arn:aws:kms:us-east-1:${local.account_id}:key/244d6552-ae49-4f43-8655-0ae9d9e9cbda"
 
   db_name  = "managed_agent"
   username = "mapadmin"

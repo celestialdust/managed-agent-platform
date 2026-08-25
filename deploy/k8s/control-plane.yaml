@@ -298,7 +298,7 @@ spec:
             # region is injected by the IRSA webhook, which puts AWS_REGION=us-east-1
             # into this pod next to AWS_ROLE_ARN; read off the running pod, not assumed.
             - name: MAP_OBJECT_BUCKET
-              value: map-dev-062677866851-us-east-1-an
+              value: map-dev-000000000000-us-east-1-an
             # The same bucket, under its own variable, and the two are not redundant.
             #
             # Unset until now, and the consequence was not "no Rollouts": composition.py
@@ -314,7 +314,7 @@ spec:
             # its own bucket, or its own lifecycle policy, that is one value here and no
             # code change. Merging them would make the split a code change instead.
             - name: MAP_ROLLOUT_BUCKET
-              value: map-dev-062677866851-us-east-1-an
+              value: map-dev-000000000000-us-east-1-an
           volumeMounts:
             # The Session-pod manifest, as a ConfigMap deploy/platform.py generates from
             # deploy/k8s/session-pod.yaml itself rather than from a checked-in copy --

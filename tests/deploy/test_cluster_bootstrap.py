@@ -40,7 +40,7 @@ _K8S = _ROOT / "deploy" / "k8s"
 _MANIFEST = _K8S / "cluster-bootstrap.yaml"
 
 # Measured with one `aws iam get-role` per role, profile `map-dev-agent`, account
-# 062677866851 -- the first three on 2026-08-22, the fourth when it was created.
+# this account -- the first three on 2026-08-22, the fourth when it was created.
 # Each of the four roles trusts exactly one subject, and the namespace component is
 # the same in all four -- which is what makes it a fact about the account rather
 # than a preference this repository gets to hold. The fourth is the autoscaler's and
@@ -54,6 +54,13 @@ _TRUSTED_SUBJECTS: Final = {
 }
 
 _ROLE_ANNOTATION: Final = "eks.amazonaws.com/role-arn"
+
+_AN_ACCOUNT: Final = "210987654321"
+"""Any twelve digits. `steps()` substitutes whatever it is handed into the IRSA
+annotations, and no case here grades the value -- only that the substitution happened,
+and that every file the steps read was checked for first. Deliberately neither this
+deployment's account nor the placeholder, so a case that accidentally asserted either
+would fail rather than pass by coincidence."""
 
 
 def _bootstrap() -> ModuleType:
@@ -162,19 +169,25 @@ def test_bootstrap_checks_for_every_file_it_will_apply() -> None:
     would leave a cluster with a DaemonSet and no profile for it to install."""
     module = _bootstrap()
     required = set(module.required_inputs(_ROOT))
+    built = module.steps(_ROOT, _AN_ACCOUNT)
     applied = {
         Path(step.argv[index + 1])
-        for step in module.steps(_ROOT)
+        for step in built
         for index, token in enumerate(step.argv)
         if token == "-f" and step.argv[index + 1] != "-"
     }
     generated = {
         Path(token.split("=", 1)[1])
-        for step in module.steps(_ROOT)
+        for step in built
         for token in (step.generate or ())
         if token.startswith("--from-file=")
     }
-    assert applied | generated == required
+    # A step whose document is text this process produced applies `-f -`, so its file is
+    # nowhere in argv. It names the file it read in `source`, which is why that field
+    # exists: without it the identities manifest would drop out of this set and the
+    # check would go on passing while no longer covering it.
+    from_text = {step.source for step in built if step.source is not None}
+    assert applied | generated | from_text == required
 
 
 def test_missing_inputs_names_each_absent_file() -> None:
@@ -189,7 +202,9 @@ def test_the_profile_config_map_is_generated_and_applied_rather_than_created() -
     the document and applying it converges instead, and keeps the profile's bytes in one
     file rather than pasting them into a manifest."""
     module = _bootstrap()
-    generating = [step for step in module.steps(_ROOT) if step.generate is not None]
+    generating = [
+        step for step in module.steps(_ROOT, _AN_ACCOUNT) if step.generate is not None
+    ]
     assert len(generating) == 1
     step = generating[0]
     assert step.generate[:2] == ("kubectl", "create")
@@ -207,7 +222,7 @@ def test_bootstrap_applies_no_manifest_that_belongs_to_a_workload() -> None:
     module = _bootstrap()
     applied = {
         Path(token).name
-        for step in module.steps(_ROOT)
+        for step in module.steps(_ROOT, _AN_ACCOUNT)
         for token in step.argv
         if token.endswith(".yaml")
     }
@@ -222,7 +237,7 @@ def test_every_namespaced_step_names_the_same_namespace() -> None:
     addresses for pods in a namespace nothing dials."""
     module = _bootstrap()
     namespace = _of_kind("Namespace")[0]["metadata"]["name"]
-    for step in module.steps(_ROOT):
+    for step in module.steps(_ROOT, _AN_ACCOUNT):
         for argv in (step.argv, step.generate or ()):
             if "-n" in argv:
                 assert argv[argv.index("-n") + 1] == namespace, step.describe

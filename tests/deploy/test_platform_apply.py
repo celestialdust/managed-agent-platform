@@ -606,11 +606,21 @@ def test_it_applies_no_manifest_bootstrap_already_applies() -> None:
     """Two appliers reaching for one object is two places a change has to be made, and
     the one that is not run wins the next time somebody runs it."""
     bootstrap = _module("map_bootstrap_for_overlap", "deploy/bootstrap.py")
+    # Any twelve digits: `steps()` substitutes what it is handed into the IRSA
+    # annotations, and nothing here reads the result.
+    built = bootstrap.steps(_ROOT, "210987654321")
     already = {
         Path(token).name
-        for step in bootstrap.steps(_ROOT)
+        for step in built
         for token in step.argv
         if token.endswith(".yaml")
+    } | {
+        # A step applying text this process produced says `-f -`, so its file is not in
+        # argv and would silently leave this set -- taking the overlap it is meant to
+        # catch with it.
+        step.source.name
+        for step in built
+        if step.source is not None
     }
     for workload in _platform().WORKLOADS:
         assert workload.manifest.name not in already

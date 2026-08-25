@@ -64,7 +64,7 @@ metadata:
   name: tool-gateway
   namespace: map-dev
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::062677866851:role/map-tool-gateway
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/map-tool-gateway
 ---
 # The control plane's identity. Its policy grants Secrets Manager reads on
 # map/dev/platform/* and nothing else -- not S3, which the file routes in this same
@@ -81,7 +81,7 @@ metadata:
   name: control-plane
   namespace: map-dev
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::062677866851:role/map-control-plane
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/map-control-plane
 ---
 # The autoscaler's identity, and the only one here that is not a platform service.
 #
@@ -100,7 +100,7 @@ metadata:
   name: cluster-autoscaler
   namespace: map-dev
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::062677866851:role/map-cluster-autoscaler
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/map-cluster-autoscaler
 ---
 # The Model Gateway's identity. It holds the upstream provider credentials, and it is the
 # only thing on the cluster that does -- a Session pod holds a short-lived token for that
@@ -116,7 +116,7 @@ metadata:
   name: model-gateway
   namespace: map-dev
   annotations:
-    eks.amazonaws.com/role-arn: arn:aws:iam::062677866851:role/map-model-gateway
+    eks.amazonaws.com/role-arn: arn:aws:iam::000000000000:role/map-model-gateway
 ---
 # What the control plane may do in this namespace, and nothing beyond it. Every verb
 # below is one call in src/managed_agent/adapters/kubernetes/pod_runner.py and there are

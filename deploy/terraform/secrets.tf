@@ -10,7 +10,7 @@
 # special characters are allowed in "name"`. AWS creates, rotates and recreates it.
 import {
   to = aws_secretsmanager_secret.platform_db
-  id = "arn:aws:secretsmanager:us-east-1:062677866851:secret:map/dev/platform/db-qOB2YZ"
+  id = "arn:aws:secretsmanager:us-east-1:${local.account_id}:secret:map/dev/platform/db-qOB2YZ"
 }
 resource "aws_secretsmanager_secret" "platform_db" {
   name        = "map/dev/platform/db"
@@ -22,7 +22,7 @@ resource "aws_secretsmanager_secret" "platform_db" {
 
 import {
   to = aws_secretsmanager_secret.provider_anthropic
-  id = "arn:aws:secretsmanager:us-east-1:062677866851:secret:map/dev/providers/anthropic-yNBhsj"
+  id = "arn:aws:secretsmanager:us-east-1:${local.account_id}:secret:map/dev/providers/anthropic-yNBhsj"
 }
 resource "aws_secretsmanager_secret" "provider_anthropic" {
   name        = "map/dev/providers/anthropic"

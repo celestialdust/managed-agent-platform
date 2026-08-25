@@ -150,7 +150,7 @@ resource "aws_iam_role_policies_exclusive" "eks_node" {
 # rather than a Session failing to assume a role.
 import {
   to = aws_iam_openid_connect_provider.cluster
-  id = "arn:aws:iam::062677866851:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/F672DDC4DEB48BB78E47544C237E5B77"
+  id = "arn:aws:iam::${local.account_id}:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/F672DDC4DEB48BB78E47544C237E5B77"
 }
 resource "aws_iam_openid_connect_provider" "cluster" {
   url             = "https://oidc.eks.us-east-1.amazonaws.com/id/F672DDC4DEB48BB78E47544C237E5B77"
@@ -173,7 +173,7 @@ resource "aws_iam_openid_connect_provider" "cluster" {
 # correct one for a policy that governs the identity Terraform itself runs as.
 import {
   to = aws_iam_policy.provisioning
-  id = "arn:aws:iam::062677866851:policy/map-dev-provisioning"
+  id = "arn:aws:iam::${local.account_id}:policy/map-dev-provisioning"
 }
 resource "aws_iam_policy" "provisioning" {
   name   = "map-dev-provisioning"

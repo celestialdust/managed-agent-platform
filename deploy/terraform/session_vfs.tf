@@ -165,11 +165,11 @@ resource "aws_iam_role" "session_vfs_service" {
       # shared -- EFS proper assumes as this same string, so without it any other
       # elasticfilesystem-backed resource in this account fits the policy too.
       # The account is a literal because this whole directory is single-account by
-      # construction (every import id names 062677866851), not because it could be
+      # construction (every import id names this account), not because it could be
       # derived and was not.
       Condition = {
-        StringEquals = { "aws:SourceAccount" = "062677866851" }
-        ArnLike      = { "aws:SourceArn" = "arn:aws:s3files:us-east-1:062677866851:file-system/*" }
+        StringEquals = { "aws:SourceAccount" = local.account_id }
+        ArnLike      = { "aws:SourceArn" = "arn:aws:s3files:us-east-1:${local.account_id}:file-system/*" }
       }
     }]
   })
@@ -202,7 +202,7 @@ resource "aws_iam_role_policy" "session_vfs_service_bucket" {
           "s3:ListBucketVersions",
         ]
         Resource  = aws_s3_bucket.platform.arn
-        Condition = { StringEquals = { "aws:ResourceAccount" = "062677866851" } }
+        Condition = { StringEquals = { "aws:ResourceAccount" = local.account_id } }
       },
       {
         Effect = "Allow"
@@ -214,7 +214,7 @@ resource "aws_iam_role_policy" "session_vfs_service_bucket" {
           "s3:PutObject*",
         ]
         Resource  = "${aws_s3_bucket.platform.arn}/*"
-        Condition = { StringEquals = { "aws:ResourceAccount" = "062677866851" } }
+        Condition = { StringEquals = { "aws:ResourceAccount" = local.account_id } }
       },
       # S3 Files watches the bucket through EventBridge rules that IT creates, under a
       # reserved `DO-NOT-DELETE-S3-Files*` name, and this role is what creates them. With

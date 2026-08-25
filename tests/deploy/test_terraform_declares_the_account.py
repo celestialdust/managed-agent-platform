@@ -49,7 +49,12 @@ _TERRAFORM = _ROOT / "deploy" / "terraform"
 _K8S = _ROOT / "deploy" / "k8s"
 _DRIFT_TOOL = _ROOT / "tools" / "terraform_drift.py"
 
-_PLATFORM_BUCKET = "map-dev-062677866851-us-east-1-an"
+_PLATFORM_BUCKET = "map-dev-000000000000-us-east-1-an"
+"""The platform bucket as the committed tree spells it, at the account placeholder.
+
+Both names compared against this carry the same placeholder, so the comparison is still
+between two bucket names rather than between a placeholder and a real account -- which
+would differ for free and prove nothing."""
 
 # Losing any of these breaks the development environment, and the reasons differ
 # enough to be worth separating. The RDS instance holds the Event Log and the
@@ -460,17 +465,31 @@ def test_a_created_not_imported_files_roles_are_graded_like_any_other() -> None:
     )
 
 
-def test_every_import_id_is_a_literal_a_reader_can_check() -> None:
-    """No interpolation in an import id.
+def test_every_import_id_is_readable_once_the_account_is_substituted() -> None:
+    """An import id may interpolate the account, and nothing else.
 
-    A wrong id fails loudly at plan time (`Cannot import non-existent remote
-    object`, exit 1 -- measured), but only if a human can compare it to the
-    account. An id assembled from an expression cannot be read off the page.
+    A wrong id fails loudly at plan time (`Cannot import non-existent remote object`,
+    exit 1 -- measured), but only if a human can read what it names. An id assembled
+    from an arbitrary expression cannot be read off the page, and worse, one that
+    referenced a *managed resource* would not be known at plan time at all.
+
+    This asserted no interpolation whatsoever until the account stopped being written
+    down. `local.account_id` is now the one permitted reference: it comes from
+    `aws_caller_identity`, resolves at plan time -- measured, a scratch configuration
+    importing an IAM policy by an id built from it planned `1 to import` -- and it is
+    the same value in every id, so an id carrying it is still one fixed string a reader
+    can check. Every other interpolation stays refused, which is the half of this that
+    was doing the work.
     """
+    permitted = "${local.account_id}"
     for path in _tf_files():
         for target, ident, _ in _pairs(path):
-            assert "${" not in ident, f"{path.name}: {target} has a computed id"
             assert ident.strip() == ident and ident, f"{path.name}: {target} blank id"
+            rest = ident.replace(permitted, "")
+            assert "${" not in rest, (
+                f"{path.name}: {target} has a computed id. {permitted} is the only "
+                f"interpolation an import id may carry; this one is {ident!r}"
+            )
 
 
 def test_the_irreplaceable_resources_refuse_to_be_destroyed() -> None:
@@ -601,12 +620,26 @@ def test_state_is_not_kept_in_the_bucket_a_session_pod_can_read() -> None:
     """The Session VFS synchronises the platform bucket into the pod filesystem.
 
     State there would be readable, and writable, by whatever the agent runs.
+
+    The bucket is not in `versions.tf` any more -- its name embeds the account id and a
+    backend block takes no expressions, so it arrives through `-backend-config` and the
+    committed file is a partial configuration. That moves this check rather than ending
+    it: the name a reader is told to use lives in `backend.hcl.example`, so that is what
+    is graded, plus the fact that `versions.tf` names no bucket at all. A bucket
+    reappearing inline would put the account back in the repository, which is the other
+    half of what this now guards.
     """
     backend = (_TERRAFORM / "versions.tf").read_text()
     assert 'backend "s3"' in backend, "no s3 backend declared"
-    bucket = re.search(r'bucket\s*=\s*"([^"]+)"', backend)
-    assert bucket, "the s3 backend names no bucket"
-    assert bucket.group(1) != _PLATFORM_BUCKET, (
+    assert not re.search(r'bucket\s*=\s*"', backend), (
+        "versions.tf names the state bucket inline again. The name carries the account "
+        "id, so it belongs in the gitignored backend.hcl -- see the comment there."
+    )
+
+    example = (_TERRAFORM / "backend.hcl.example").read_text()
+    named = re.search(r'bucket\s*=\s*"([^"]+)"', example)
+    assert named, "backend.hcl.example names no bucket, so nobody can init from it"
+    assert named.group(1) != _PLATFORM_BUCKET, (
         f"state is in {_PLATFORM_BUCKET}, which the Session VFS mounts"
     )
 

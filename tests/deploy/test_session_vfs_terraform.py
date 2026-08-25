@@ -91,7 +91,13 @@ _CONFIG = _REPO / "deploy" / "terraform" / "session_vfs.tf"
 _SESSION_POD = _REPO / "deploy" / "k8s" / "session-pod.yaml"
 
 NFS_PORT = "2049"
-ACCOUNT = "062677866851"
+ACCOUNT = "${local.account_id}"
+"""How the configuration spells this account: derived from the caller's credentials.
+
+Not a twelve-digit literal, and it stopped being one deliberately -- `deploy/terraform/
+account.tf` says why. What the cases below grade is unchanged: that each condition keys
+the policy to THIS account rather than leaving it open, and an expression that resolves
+to the caller's own account is that, in a form a public repository can carry."""
 
 # The service account each CSI role may be assumed by, and nothing else. Both roles
 # carry `AmazonS3FilesClientFullAccess` -- ClientMount + ClientWrite +
@@ -1061,7 +1067,7 @@ def test_no_id_is_copied_in_that_a_resource_here_already_holds(source: str) -> N
     group locals, both CSI trust policies, the addon's cluster name.
 
     Falsified: restoring any of the six copies this replaced -- e.g. the bucket as
-    `arn:aws:s3:::map-dev-tfstate-062677866851-us-east-1`, which mounts Terraform
+    the state bucket `map-dev-tfstate-<account>-us-east-1`, which mounts Terraform
     state into every Session read-write -- fails here.
     """
     for pattern, owner, sites in COPIED_ID_PATTERNS:
@@ -1225,7 +1231,7 @@ def test_the_file_system_synchronises_the_platform_bucket(config: str) -> None:
 
     Two things, because both were unguarded and the second is what makes the first
     apply. `bucket` as a literal made the whole mount retargetable by one edit -- at
-    `map-dev-tfstate-062677866851-us-east-1` every Session would have mounted
+    `map-dev-tfstate-<account>-us-east-1` every Session would have mounted
     Terraform's own state, and the service role grants PutObject, DeleteObject and
     DeleteObjectVersion on it. The existing state guard in
     `test_terraform_declares_the_account.py` only points the other way (state must not
@@ -2381,7 +2387,23 @@ def test_the_file_system_is_available_and_not_merely_created(config: str) -> Non
 # --- Tier B: the real mount, opt-in. ------------------------------------------
 
 _PROVISION_GATE = "MAP_PROVISION_SESSION_VFS"
-VFS_BUCKET = "map-dev-062677866851-us-east-1-an"
+
+
+def _vfs_bucket() -> str:
+    """The platform bucket this account calls it.
+
+    Composed from the account the credentials name rather than written down. Only the
+    live tier below reads it, and that tier already talks to AWS.
+    """
+    account = subprocess.run(
+        ("aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    return f"map-dev-{account}-us-east-1-an"
+
+
 PROBE_POD = "map61-vfs-probe"
 PROBE_PVC = "map61-vfs-probe"
 PROBE_PV = "map61-vfs-probe"
@@ -2558,6 +2580,7 @@ def test_the_file_system_mounts_and_a_write_reaches_the_bucket(probe_pod: str) -
     key = f"probe-{os.getpid()}.txt"
     assert "mount_dev=" in _probe_logs(key)
 
+    bucket = _vfs_bucket()
     deadline = time.monotonic() + 240
     last = ""
     while time.monotonic() < deadline:
@@ -2567,7 +2590,7 @@ def test_the_file_system_mounts_and_a_write_reaches_the_bucket(probe_pod: str) -
                 "s3api",
                 "head-object",
                 "--bucket",
-                VFS_BUCKET,
+                bucket,
                 "--key",
                 f"artifacts/map61/{key}",
             ],
@@ -2579,7 +2602,7 @@ def test_the_file_system_mounts_and_a_write_reaches_the_bucket(probe_pod: str) -
             return
         last = found.stderr
         time.sleep(15)
-    pytest.fail(f"artifacts/map61/{key} never reached {VFS_BUCKET}: {last}")
+    pytest.fail(f"artifacts/map61/{key} never reached {bucket}: {last}")
 
 
 @requires_a_provisioned_mount

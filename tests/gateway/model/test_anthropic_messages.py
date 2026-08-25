@@ -60,7 +60,7 @@ _CALLER = CallerSession(session_id=_SESSION, tenant_id=_TENANT)
 
 _MESSAGES_MODEL = "gsds-claude-opus-4-6"
 _RESPONSES_MODEL = "gpt-5-codex"
-_FOUNDRY = "https://alex-m8e2ebny-eastus2.services.ai.azure.com/anthropic"
+_FOUNDRY = "https://map-foundry.services.ai.azure.com/anthropic"
 
 _POD_SUPPLIED_API_KEY = "POD-SUPPLIED-PROVIDER-KEY"
 """A provider key a Session pod attached itself, under the header this module presents
@@ -263,7 +263,7 @@ async def _drain(
 def test_the_path_is_appended_to_the_configured_prefix() -> None:
     assert (
         upstream_url(_entry())
-        == "https://alex-m8e2ebny-eastus2.services.ai.azure.com/anthropic/v1/messages"
+        == "https://map-foundry.services.ai.azure.com/anthropic/v1/messages"
     )
 
 

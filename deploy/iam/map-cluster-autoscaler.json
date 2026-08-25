@@ -23,7 +23,7 @@
       "Action": [
         "eks:DescribeNodegroup"
       ],
-      "Resource": "arn:aws:eks:us-east-1:062677866851:nodegroup/map-dev/*/*"
+      "Resource": "arn:aws:eks:us-east-1:000000000000:nodegroup/map-dev/*/*"
     },
     {
       "Sid": "ChangeCapacityOnlyInGroupsThisClusterOwns",

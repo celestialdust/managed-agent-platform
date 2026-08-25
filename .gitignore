@@ -85,3 +85,10 @@ tests/test_gates.py
 # the image, and grades two binaries in it.
 tests/spike/test_record_complete.py
 tests/spike/test_report_shape.py
+
+# Terraform's account-specific inputs. The configuration derives the account id from the
+# caller's own credentials (`deploy/terraform/account.tf`), so almost nothing needs to be
+# configured -- but a backend block takes no expressions, so the state bucket's name
+# arrives through `-backend-config`. `.example` files beside these carry the shape.
+deploy/terraform/backend.hcl
+*.tfvars

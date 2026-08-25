@@ -87,15 +87,23 @@ data:
   # before `v1` and carries no `api-version` — that query parameter is an Azure-OpenAI
   # convention and does not appear on this route.
   #
+  # `map-foundry` in the host below is a PLACEHOLDER, not this deployment's resource.
+  # A Foundry resource name identifies one company's Azure account, so the committed
+  # value names none: `map-foundry.services.ai.azure.com` does not resolve at all (DNS
+  # NXDOMAIN, measured), which is exactly the property wanted — a deploy that forgot to
+  # configure the real one fails at DNS instead of reaching somebody else's endpoint.
+  # `deploy/platform.py` substitutes `$MAP_FOUNDRY_RESOURCE` in at apply time and
+  # refuses if it is unset. Set it to the resource name alone, not the whole host.
+  #
   # Both values on the Anthropic entry were wrong until 2026-08-23, and neither could
-  # fail anywhere: the host `map-foundry.services.ai.azure.com` does not resolve at all
-  # (DNS NXDOMAIN) and the model `claude-opus-5` is not the name this account deployed.
-  # The pair below is measured — one POST to `{base_url}/v1/messages` with `x-api-key`
-  # and `anthropic-version: 2023-06-01` returned HTTP 200. `model` here is the Foundry
-  # **deployment** name and not a model id, which is Foundry's own rule: "the deployment
-  # name you choose becomes the value you pass in the `model` parameter". The response
-  # comes back naming `claude-opus-4-6`, so the two are not interchangeable and this one
-  # is the one that goes on the request.
+  # fail anywhere: the host did not resolve and the model `claude-opus-5` is not the
+  # name this account deployed. The pair is measured — one POST to
+  # `{base_url}/v1/messages` with `x-api-key` and `anthropic-version: 2023-06-01`
+  # returned HTTP 200. `model` here is the Foundry **deployment** name and not a model
+  # id, which is Foundry's own rule: "the deployment name you choose becomes the value
+  # you pass in the `model` parameter". The response comes back naming
+  # `claude-opus-4-6`, so the two are not interchangeable and this one goes on the
+  # request.
   #
   # Nothing local can check either value. A hostname that does not resolve and a
   # deployment that does not exist both look like well-formed configuration, and the only
@@ -108,7 +116,7 @@ data:
         {
           "model": "gsds-claude-opus-4-6",
           "wire": "anthropic_messages",
-          "base_url": "https://alex-m8e2ebny-eastus2.services.ai.azure.com/anthropic",
+          "base_url": "https://map-foundry.services.ai.azure.com/anthropic",
           "auth_scheme": "api_key",
           "credential_name": "map/dev/providers/anthropic",
           "query_params": {}

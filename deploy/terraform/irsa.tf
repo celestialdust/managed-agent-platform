@@ -65,16 +65,20 @@ resource "aws_iam_role" "control_plane" {
 
 import {
   to = aws_iam_policy.control_plane
-  id = "arn:aws:iam::062677866851:policy/map-control-plane"
+  id = "arn:aws:iam::${local.account_id}:policy/map-control-plane"
 }
 resource "aws_iam_policy" "control_plane" {
-  name   = "map-control-plane"
-  policy = file("${path.module}/../iam/map-control-plane.json")
+  name = "map-control-plane"
+  policy = replace(
+    file("${path.module}/../iam/map-control-plane.json"),
+    local.account_placeholder,
+    local.account_id,
+  )
 }
 
 import {
   to = aws_iam_role_policy_attachment.control_plane
-  id = "map-control-plane/arn:aws:iam::062677866851:policy/map-control-plane"
+  id = "map-control-plane/arn:aws:iam::${local.account_id}:policy/map-control-plane"
 }
 resource "aws_iam_role_policy_attachment" "control_plane" {
   role       = aws_iam_role.control_plane.name
@@ -125,16 +129,20 @@ resource "aws_iam_role" "model_gateway" {
 
 import {
   to = aws_iam_policy.model_gateway
-  id = "arn:aws:iam::062677866851:policy/map-model-gateway"
+  id = "arn:aws:iam::${local.account_id}:policy/map-model-gateway"
 }
 resource "aws_iam_policy" "model_gateway" {
-  name   = "map-model-gateway"
-  policy = file("${path.module}/../iam/map-model-gateway.json")
+  name = "map-model-gateway"
+  policy = replace(
+    file("${path.module}/../iam/map-model-gateway.json"),
+    local.account_placeholder,
+    local.account_id,
+  )
 }
 
 import {
   to = aws_iam_role_policy_attachment.model_gateway
-  id = "map-model-gateway/arn:aws:iam::062677866851:policy/map-model-gateway"
+  id = "map-model-gateway/arn:aws:iam::${local.account_id}:policy/map-model-gateway"
 }
 resource "aws_iam_role_policy_attachment" "model_gateway" {
   role       = aws_iam_role.model_gateway.name
@@ -185,16 +193,20 @@ resource "aws_iam_role" "tool_gateway" {
 
 import {
   to = aws_iam_policy.tool_gateway
-  id = "arn:aws:iam::062677866851:policy/map-tool-gateway"
+  id = "arn:aws:iam::${local.account_id}:policy/map-tool-gateway"
 }
 resource "aws_iam_policy" "tool_gateway" {
-  name   = "map-tool-gateway"
-  policy = file("${path.module}/../iam/map-tool-gateway.json")
+  name = "map-tool-gateway"
+  policy = replace(
+    file("${path.module}/../iam/map-tool-gateway.json"),
+    local.account_placeholder,
+    local.account_id,
+  )
 }
 
 import {
   to = aws_iam_role_policy_attachment.tool_gateway
-  id = "map-tool-gateway/arn:aws:iam::062677866851:policy/map-tool-gateway"
+  id = "map-tool-gateway/arn:aws:iam::${local.account_id}:policy/map-tool-gateway"
 }
 resource "aws_iam_role_policy_attachment" "tool_gateway" {
   role       = aws_iam_role.tool_gateway.name
@@ -276,9 +288,13 @@ import {
   id = "map-cluster-autoscaler:map-cluster-autoscaler"
 }
 resource "aws_iam_role_policy" "cluster_autoscaler" {
-  name   = "map-cluster-autoscaler"
-  role   = aws_iam_role.cluster_autoscaler.name
-  policy = file("${path.module}/../iam/map-cluster-autoscaler.json")
+  name = "map-cluster-autoscaler"
+  role = aws_iam_role.cluster_autoscaler.name
+  policy = replace(
+    file("${path.module}/../iam/map-cluster-autoscaler.json"),
+    local.account_placeholder,
+    local.account_id,
+  )
 }
 
 import {

@@ -13,10 +13,10 @@
 # ... aws_s3_bucket.tfstate`, exit 1.
 import {
   to = aws_s3_bucket.tfstate
-  id = "map-dev-tfstate-062677866851-us-east-1"
+  id = "map-dev-tfstate-${local.account_id}-us-east-1"
 }
 resource "aws_s3_bucket" "tfstate" {
-  bucket = "map-dev-tfstate-062677866851-us-east-1"
+  bucket = "map-dev-tfstate-${local.account_id}-us-east-1"
   lifecycle {
     prevent_destroy = true
   }
@@ -34,7 +34,7 @@ resource "aws_s3_bucket" "tfstate" {
 # that resource exists, so destroying it changes nothing about the data.
 import {
   to = aws_s3_bucket_versioning.tfstate
-  id = "map-dev-tfstate-062677866851-us-east-1"
+  id = "map-dev-tfstate-${local.account_id}-us-east-1"
 }
 resource "aws_s3_bucket_versioning" "tfstate" {
   bucket = aws_s3_bucket.tfstate.id
@@ -48,7 +48,7 @@ resource "aws_s3_bucket_versioning" "tfstate" {
 
 import {
   to = aws_s3_bucket_public_access_block.tfstate
-  id = "map-dev-tfstate-062677866851-us-east-1"
+  id = "map-dev-tfstate-${local.account_id}-us-east-1"
 }
 resource "aws_s3_bucket_public_access_block" "tfstate" {
   bucket                  = aws_s3_bucket.tfstate.id
@@ -63,7 +63,7 @@ resource "aws_s3_bucket_public_access_block" "tfstate" {
 
 import {
   to = aws_s3_bucket_server_side_encryption_configuration.tfstate
-  id = "map-dev-tfstate-062677866851-us-east-1"
+  id = "map-dev-tfstate-${local.account_id}-us-east-1"
 }
 resource "aws_s3_bucket_server_side_encryption_configuration" "tfstate" {
   bucket = aws_s3_bucket.tfstate.id

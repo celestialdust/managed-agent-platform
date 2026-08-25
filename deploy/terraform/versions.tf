@@ -8,9 +8,23 @@
 # the account. Credentials come from the environment (`AWS_PROFILE`), as
 # `environment.md`'s AWS_PROFILE row says.
 #
-# The state bucket is NOT map-dev-062677866851-us-east-1-an. That bucket is the one
-# the Session VFS synchronises into a Session pod's filesystem, so state kept there
-# would be readable -- and writable -- by whatever the agent runs (ADR-021).
+# The state bucket is NOT the platform bucket `map-dev-<account>-<region>-an`. That is
+# the one the Session VFS synchronises into a Session pod's filesystem, so state kept
+# there would be readable -- and writable -- by whatever the agent runs (ADR-021).
+#
+# `bucket` is absent, which makes this a PARTIAL configuration: the name embeds the
+# account id, and a backend block is the one place in Terraform that can take no
+# expression at all. It is read before any provider is configured, so
+# `local.account_id` -- which every other file here uses -- does not exist yet. There is
+# no version of this that both names the bucket and keeps the account out of the
+# repository, so the name arrives at init time instead:
+#
+#     terraform init -backend-config=backend.hcl
+#
+# `backend.hcl` is gitignored; `backend.hcl.example` beside it carries the shape. Running
+# a bare `terraform init` against this asks for the bucket interactively rather than
+# guessing one, which is the failure mode to want -- a wrong guess would silently start a
+# second state file for an environment that already has one.
 #
 # `use_lockfile` rather than a DynamoDB table: S3-native locking, holding the lock
 # as an object beside the state. Two readings decided it. `aws dynamodb list-tables`
@@ -29,7 +43,6 @@ terraform {
   }
 
   backend "s3" {
-    bucket       = "map-dev-tfstate-062677866851-us-east-1"
     key          = "map-dev/terraform.tfstate"
     region       = "us-east-1"
     encrypt      = true

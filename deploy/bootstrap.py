@@ -38,12 +38,14 @@ resource, and therefore Terraform's. It deploys no workload.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 from typing import Final
 
 # Fixed by IAM rather than chosen here: the three roles this platform's pods assume
@@ -62,17 +64,51 @@ _INSTALLER: Final = Path("deploy/k8s/session-sandbox-seccomp-installer.yaml")
 _ROLLOUT_TIMEOUT: Final = "180s"
 
 
+def _platform() -> ModuleType:
+    """`deploy/platform.py`, loaded by path.
+
+    Imported for `ACCOUNT_PLACEHOLDER` and the two functions around it, so that the
+    placeholder every committed manifest carries has exactly one definition. `deploy/`
+    is not an importable package -- it holds manifests, and its Python files are
+    deployment entry points rather than part of the shipped wheel -- so there is no
+    `from platform import ...` to write, and a second copy of the constant here is the
+    thing worth this much ceremony to avoid: two copies would agree until one manifest
+    changed, and then the bootstrap and the deploy would substitute different values
+    into files that have to match.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "map_platform", Path(__file__).resolve().parent / "platform.py"
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - the file is beside us
+        raise RuntimeError("cannot load deploy/platform.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @dataclass(frozen=True, slots=True)
 class Step:
     """One change to the cluster, and the document to produce first if there is one.
 
     `generate` is `None` for a manifest that is already a file. It is a kubectl argv
     whose stdout becomes this step's stdin for the one object that is not a file.
+
+    `stdin` is the other way a document reaches kubectl: text this process produced. It
+    is how the identities manifest gets a real account id into its IRSA annotations, and
+    it is mutually exclusive with `generate` -- a step has one source, not two.
+
+    `source` is the file that text was read from. It is carried rather than inferred
+    because `argv` says `-f -` for such a step, and the check that every file this will
+    apply was verified to exist reads the file set off these steps: without this the
+    identities manifest would silently leave that set and stop being checked for.
     """
 
     describe: str
     argv: tuple[str, ...]
     generate: tuple[str, ...] | None = None
+    stdin: str | None = None
+    source: Path | None = None
 
 
 def required_inputs(root: Path) -> tuple[Path, ...]:
@@ -94,8 +130,13 @@ def missing_inputs(root: Path) -> tuple[Path, ...]:
     return tuple(path for path in required_inputs(root) if not path.is_file())
 
 
-def steps(root: Path) -> tuple[Step, ...]:
+def steps(root: Path, account_id: str) -> tuple[Step, ...]:
     """The four applies, in the order their dependencies impose.
+
+    `account_id` is passed in rather than read here, and that is not a style choice.
+    This function is called by the offline test suite, which has no AWS credentials and
+    must not need any; a `get-caller-identity` inside it would make every one of those
+    tests depend on the machine's profile. `main()` does the asking.
 
     The namespace and its ServiceAccounts come first because everything after them
     is namespaced, and they share one file so that kubectl's own document ordering
@@ -106,7 +147,15 @@ def steps(root: Path) -> tuple[Step, ...]:
     return (
         Step(
             describe=f"namespace {NAMESPACE} and the identities in it",
-            argv=("kubectl", "apply", "-f", str(root / _IDENTITIES)),
+            argv=("kubectl", "apply", "-f", "-"),
+            # From stdin rather than by path, because this file carries the account id
+            # in every ServiceAccount's `eks.amazonaws.com/role-arn`. Committed, it
+            # carries the placeholder; applied at the placeholder, each of those roles
+            # is in account 000000000000 and nothing that uses them can assume one.
+            stdin=_platform().with_account(
+                (root / _IDENTITIES).read_text(), account_id
+            ),
+            source=root / _IDENTITIES,
         ),
         Step(
             describe="the headless Service every Session pod is addressed through",
@@ -189,8 +238,11 @@ def main() -> int:
         print("nothing was applied", file=sys.stderr)
         return 1
 
-    for step in steps(root):
+    for step in steps(root, _platform().caller_account(root)):
         print(f"== {step.describe}")
+        if step.stdin is not None:
+            subprocess.run(step.argv, check=True, input=step.stdin, text=True)
+            continue
         if step.generate is None:
             subprocess.run(step.argv, check=True)
             continue

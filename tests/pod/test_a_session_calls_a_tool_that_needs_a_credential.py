@@ -62,11 +62,28 @@ _CONTROL_PLANE_PORT: Final = 8080
 
 _REGION: Final = "us-east-1"
 _REPOSITORY: Final = "map/session-shim"
-_TOOL_GATEWAY_ROLE: Final = "arn:aws:iam::062677866851:role/map-tool-gateway"
+_TOOL_GATEWAY_ROLE_NAME: Final = "map-tool-gateway"
 
 _MODEL: Final = "gsds-claude-opus-4-6"
 
 _SECRET_SUFFIXES: Final = ("compiled", "requirements", "shim-token")
+
+
+def _account() -> str:
+    """The account these credentials belong to, asked rather than written down.
+
+    This tier already talks to AWS, so asking costs one call and makes the case run in
+    whatever account it is pointed at. A literal here would have been a second answer,
+    free to disagree with the credentials in the environment -- and it would disagree
+    silently, by simulating a policy on a role in an account nobody is deploying to.
+    """
+    return subprocess.run(
+        ("aws", "sts", "get-caller-identity", "--query", "Account", "--output", "text"),
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
 
 _TAVILY: Final = "https://mcp.tavily.com/mcp/"
 _LIVE_TOOL: Final = "tavily_search"
@@ -449,17 +466,18 @@ def _may_read(name: str) -> str:
     matched nothing `vault_name` can build, and a test comparing two strings written by
     the same hand would have agreed with it.
     """
+    account = _account()
     done = subprocess.run(
         (
             "aws",
             "iam",
             "simulate-principal-policy",
             "--policy-source-arn",
-            _TOOL_GATEWAY_ROLE,
+            f"arn:aws:iam::{account}:role/{_TOOL_GATEWAY_ROLE_NAME}",
             "--action-names",
             "secretsmanager:GetSecretValue",
             "--resource-arns",
-            f"arn:aws:secretsmanager:{_REGION}:062677866851:secret:{name}-AbCdEf",
+            f"arn:aws:secretsmanager:{_REGION}:{account}:secret:{name}-AbCdEf",
             "--query",
             "EvaluationResults[0].EvalDecision",
             "--output",

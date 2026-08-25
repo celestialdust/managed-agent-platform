@@ -8,10 +8,10 @@
 # silent change is exactly the class of event this directory exists to catch.
 import {
   to = aws_s3_bucket.platform
-  id = "map-dev-062677866851-us-east-1-an"
+  id = "map-dev-${local.account_id}-us-east-1-an"
 }
 resource "aws_s3_bucket" "platform" {
-  bucket = "map-dev-062677866851-us-east-1-an"
+  bucket = "map-dev-${local.account_id}-us-east-1-an"
   lifecycle {
     prevent_destroy = true
   }
@@ -28,7 +28,7 @@ resource "aws_s3_bucket" "platform" {
 # S3 applies SSE-S3 whether or not it exists, so destroying it changes nothing.
 import {
   to = aws_s3_bucket_versioning.platform
-  id = "map-dev-062677866851-us-east-1-an"
+  id = "map-dev-${local.account_id}-us-east-1-an"
 }
 resource "aws_s3_bucket_versioning" "platform" {
   bucket = aws_s3_bucket.platform.id
@@ -42,7 +42,7 @@ resource "aws_s3_bucket_versioning" "platform" {
 
 import {
   to = aws_s3_bucket_public_access_block.platform
-  id = "map-dev-062677866851-us-east-1-an"
+  id = "map-dev-${local.account_id}-us-east-1-an"
 }
 resource "aws_s3_bucket_public_access_block" "platform" {
   bucket                  = aws_s3_bucket.platform.id
@@ -57,7 +57,7 @@ resource "aws_s3_bucket_public_access_block" "platform" {
 
 import {
   to = aws_s3_bucket_server_side_encryption_configuration.platform
-  id = "map-dev-062677866851-us-east-1-an"
+  id = "map-dev-${local.account_id}-us-east-1-an"
 }
 resource "aws_s3_bucket_server_side_encryption_configuration" "platform" {
   bucket = aws_s3_bucket.platform.id

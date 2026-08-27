@@ -827,20 +827,3 @@ its own definition, it is not a gate — it is an off switch with nobody holding
 project has paid for that once: a gate named nowhere else meant six verification rounds
 ran green without ever reaching the one check that could have answered the question they
 were asking.
-
-### Testing conventions
-
-- Tier 1 runs against a **real PostgreSQL**, not a fake, because every property claimed —
-  a primary key that refuses a duplicate, a check constraint that refuses sequence 0, an
-  advisory lock that serializes two writers — is a property of PostgreSQL and not of any
-  code we could stand in for it.
-- Tests assert **outcomes**, not mock calls.
-- A guard is only worth having if it has been **falsified**: change the code it protects
-  and watch it fail. A guard nobody has seen fail is a guard nobody knows works.
-
----
-
-Comments and docstrings in this tree occasionally cite `docs/lessons.md` and
-`docs/adr/NNN` — an internal defect record and decision log that is not published
-here. The code they annotate stands on its own; the citation is provenance, not a
-dependency.

@@ -71,9 +71,14 @@ from managed_agent.core.registration.scope_binding import (
 from managed_agent.core.session.event_append import append_in_order
 from managed_agent.core.session.session import SessionRecord
 from managed_agent.gateway.tool import error_map
+from managed_agent.gateway.tool.advertised_schema import without_bound_arguments
 from managed_agent.gateway.tool.credential_broker import ToolCredentialBroker
 from managed_agent.gateway.tool.evidence_capture import EvidenceCapture, advertisable
-from managed_agent.gateway.tool.scope_clamp import OutOfScope, narrow
+from managed_agent.gateway.tool.scope_clamp import (
+    ArgumentNotOffered,
+    OutOfScope,
+    narrow,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -701,8 +706,14 @@ def _record_offer_census(
             tenant_id,
         )
         return
+    # Compared on the advertised name, which is the only name both sides share: an
+    # offered tool carries the joined form (it is what the model is shown) while a
+    # registered one carries both. Comparing bare names here would read every tool as
+    # dropped and turn a healthy listing into an incident-shaped log line.
     kept = {tool.name for tool in offered}
-    dropped = sorted(tool.name for tool in registered if tool.name not in kept)
+    dropped = sorted(
+        tool.advertised_name for tool in registered if tool.advertised_name not in kept
+    )
     if not offered:
         _log.error(
             "offer census: tenant=%s registered=%d offered=0 -- every registered tool "
@@ -765,6 +776,7 @@ class McpProxy:
         self._evidence = evidence
         self._scopes = scopes
         self._scope: dict[str, str] | None = None
+        self._grant: frozenset[str] | None = None
         self._resource_owner: dict[str, ServerName] = {}
         self._template_owner: dict[str, ServerName] = {}
 
@@ -781,17 +793,52 @@ class McpProxy:
         only lists tools never needs it, and building the proxy is under a lock every
         other Session's first request queues behind.
         """
-        if self._scope is None:
-            record = await self._scopes.fetch(self._session_id, self._tenant_id)
-            self._scope = dict(record.scope)
+        await self._read_the_session_once()
+        assert self._scope is not None
         return self._scope
+
+    async def _session_grant(self) -> frozenset[str]:
+        """The advertised tool names this Session may reach, read from the same record.
+
+        Empty means *no tools*, not *all tools*. A Session created without naming any is
+        one nobody decided to give tools to, and reading that as full access would make
+        the safest-looking create call the widest one -- which is the shape a mistake
+        takes, not the shape a decision takes.
+        """
+        await self._read_the_session_once()
+        assert self._grant is not None
+        return self._grant
+
+    async def _read_the_session_once(self) -> None:
+        """Fetch the Session record and keep both fields it carries for this proxy.
+
+        One read for the Scope and the Grant together. They come off the same row, and
+        two reads would put a second database round trip on the first tool call to learn
+        something the first read already had in hand.
+
+        Cached without an expiry, which is safe here for a reason that is a property of
+        the record rather than a judgement about how fast it changes: `SessionRecord` is
+        written once at creation and no field of it is ever rewritten, so there is no
+        later value for either to be stale against. `UpdateSession` refuses every field
+        a caller could send, and neither of these is among them either way.
+        """
+        if self._scope is not None:
+            return
+        record = await self._scopes.fetch(self._session_id, self._tenant_id)
+        self._scope = dict(record.scope)
+        self._grant = record.grant
 
     async def _servers(self) -> dict[ServerName, ServerEndpoint]:
         registered = await self._registry.list_for_tenant(self._tenant_id)
         return {tool.server_name: tool.endpoint for tool in registered}
 
     async def list_tools(self) -> list[Tool]:
-        registered = await self._registry.list_for_tenant(self._tenant_id)
+        grant = await self._session_grant()
+        registered = [
+            tool
+            for tool in await self._registry.list_for_tenant(self._tenant_id)
+            if tool.advertised_name in grant
+        ]
         offered: list[Tool] = []
         reached = 0
         refusals: list[ErrorEnvelope] = []
@@ -829,9 +876,23 @@ class McpProxy:
                     )
                     continue
                 # The registry decides the name; the server decides the rest, except
-                # what this Gateway cannot honour -- see `advertisable`.
+                # what this Gateway cannot honour -- see `advertisable` -- and what it
+                # fills itself. A Scope-bound argument leaves the schema here, on the
+                # way out, because this is the last point that reaches the model and
+                # the upstream's own listing is what it is stripped from.
                 offered.append(
-                    advertisable(found).model_copy(update={"name": tool.name})
+                    advertisable(found).model_copy(
+                        update={
+                            # The advertised form, not the bare one: the runtime is
+                            # given a single namespace and two servers may each offer a
+                            # tool called `search`. The joined name is what the store
+                            # keeps unique per tenant and what `call_tool` resolves.
+                            "name": tool.advertised_name,
+                            "input_schema": without_bound_arguments(
+                                found.input_schema, tool.scope_bindings
+                            ),
+                        }
+                    )
                 )
         _record_offer_census(self._tenant_id, registered, offered)
         _raise_if_no_server_answered(reached, refusals)
@@ -845,7 +906,8 @@ class McpProxy:
         except UnknownTool:
             # A name nobody registered and a name this Session may not reach are one
             # answer on purpose: two answers would let a model map the tenant's whole
-            # tool inventory by calling names and reading which refusal came back.
+            # tool inventory by calling names and reading which refusal came back. The
+            # Grant check below returns this same refusal for that reason.
             return error_map.as_tool_result(
                 error_map.refusal(ErrorCode.TOOL_NOT_GRANTED, tool_name, uuid4().hex)
             )
@@ -857,10 +919,33 @@ class McpProxy:
             # whose Scope cannot be read has to reach the agent as a failed tool call,
             # and failing closed is the only safe direction -- an unreadable Scope
             # narrows nothing.
+            # Enforced here and not only in `list_tools`, because a listing filter is
+            # not a control: a model that saw this name in an earlier Session, or simply
+            # guessed it, never lists again before calling. Inside this `try` so that a
+            # Session whose record cannot be read fails closed through the handler
+            # below, rather than escaping as an unhandled store error.
+            if tool.advertised_name not in await self._session_grant():
+                return error_map.as_tool_result(
+                    error_map.refusal(
+                        ErrorCode.TOOL_NOT_GRANTED, tool_name, uuid4().hex
+                    )
+                )
             narrowed = narrow(tool, await self._session_scope(), arguments)
             if isinstance(narrowed, OutOfScope):
                 return error_map.as_tool_result(
-                    error_map.out_of_scope(narrowed.tool_name, narrowed.dimension)
+                    error_map.out_of_scope(
+                        narrowed.tool_name, narrowed.dimension, narrowed.cause
+                    )
+                )
+            if isinstance(narrowed, ArgumentNotOffered):
+                # The attempt is already in this process's log, with the value the
+                # caller supplied on it. Nothing of that reaches here: what the clamp
+                # hands back carries names only, so this refusal cannot echo either
+                # value even by accident.
+                return error_map.as_tool_result(
+                    error_map.argument_not_offered(
+                        narrowed.tool_name, narrowed.argument
+                    )
                 )
             session = await self._upstreams.session_for(tool.server_name, tool.endpoint)
             async with asyncio.timeout(GATEWAY_TOOL_TIMEOUT_S):

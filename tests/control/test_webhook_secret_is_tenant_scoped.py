@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from uuid import UUID, uuid4
 
@@ -33,7 +33,6 @@ from managed_agent.control.webhooks.dispatcher import (
 )
 from managed_agent.control.webhooks.registry import CallbackUrl, WebhookRecord
 from managed_agent.core.ids import Seq, SessionId, TenantId, new_session_id
-from managed_agent.core.session.session import SessionState
 from managed_agent.core.vault_names import scoped_vault_name
 from managed_agent.core.vocabulary import lifecycle
 from managed_agent.gateway.tool.credential_broker import VAULT_PREFIX
@@ -63,6 +62,7 @@ class Candidate:
     tenant_id: TenantId
     session_id: SessionId
     seq: Seq
+    type: str
 
 
 @dataclass
@@ -87,17 +87,17 @@ class Log:
         return held[:limit]
 
     async def lifecycle_events_between(
-        self, types: Sequence[str], from_ms: int, to_ms: int
+        self, types: Collection[str], from_ms: int, to_ms: int
     ) -> Sequence[Candidate]:
         return [
-            Candidate(self.owners[sid], sid, row.seq)
+            Candidate(self.owners[sid], sid, row.seq, row.type)
             for sid, rows in self.rows.items()
             for row in rows
             if row.type in types
         ]
 
 
-Claim = tuple[UUID, SessionId, str]
+Claim = tuple[UUID, SessionId, Seq]
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,7 +109,7 @@ class Pending:
     url: str
     secret_ref: str
     session_id: SessionId
-    state: SessionState
+    event_type: str
     seq: Seq
 
 
@@ -124,9 +124,13 @@ class Store:
     watermark: int = 0
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        return [h for h in self.hooks if h.tenant_id == tenant_id and state in h.states]
+        return [
+            h
+            for h in self.hooks
+            if h.tenant_id == tenant_id and event_type in h.event_types
+        ]
 
     async def scanned_through_ms(self) -> int:
         return self.watermark
@@ -138,11 +142,11 @@ class Store:
         self,
         webhook_id: UUID,
         session_id: SessionId,
-        state: SessionState,
+        event_type: str,
         seq: Seq,
         max_attempts: int,
     ) -> int | None:
-        key: Claim = (webhook_id, session_id, state.value)
+        key: Claim = (webhook_id, session_id, seq)
         if key in self.delivered or self.attempts.get(key, 0) >= max_attempts:
             return None
         self.attempts[key] = self.attempts.get(key, 0) + 1
@@ -153,15 +157,15 @@ class Store:
             hook.url,
             hook.secret_ref,
             session_id,
-            state,
+            event_type,
             seq,
         )
         return self.attempts[key]
 
     async def mark_delivered(
-        self, webhook_id: UUID, session_id: SessionId, state: SessionState, status: int
+        self, webhook_id: UUID, session_id: SessionId, seq: Seq, status: int
     ) -> None:
-        key: Claim = (webhook_id, session_id, state.value)
+        key: Claim = (webhook_id, session_id, seq)
         self.delivered[key] = status
         self.pending.pop(key, None)
 
@@ -223,7 +227,7 @@ def _hook(tenant: TenantId, secret_ref: str, url: str) -> WebhookRecord:
         id=uuid4(),
         tenant_id=tenant,
         url=CallbackUrl(url),
-        states=frozenset({SessionState.STOPPED}),
+        event_types=frozenset({lifecycle.SESSION_STOPPED}),
         secret_ref=secret_ref,
         created_at_ms=0,
     )
@@ -406,7 +410,7 @@ def test_the_retry_path_composes_under_the_tenant_too() -> None:
     session_id = log.stopped_session(tenant)
     store = Store(hooks=[_hook(tenant, "signing-key", "https://hooks.example.com/x")])
     hook = store.hooks[0]
-    key: Claim = (hook.id, session_id, SessionState.STOPPED.value)
+    key: Claim = (hook.id, session_id, Seq(2))
     store.attempts[key] = 1
     store.pending[key] = Pending(
         hook.id,
@@ -414,7 +418,7 @@ def test_the_retry_path_composes_under_the_tenant_too() -> None:
         hook.url,
         hook.secret_ref,
         session_id,
-        SessionState.STOPPED,
+        lifecycle.SESSION_STOPPED,
         Seq(2),
     )
     store.watermark = _A_MOMENT

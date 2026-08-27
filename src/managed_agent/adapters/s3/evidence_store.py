@@ -37,6 +37,7 @@ from managed_agent.core.vfs.evidence import (
     CaptureContext,
     EvidenceBlobs,
     EvidenceRef,
+    EvidenceStorageUnconfigured,
     ReturnInline,
     evidence_object_key,
     evidence_vfs_path,
@@ -55,10 +56,6 @@ _INSERT_INLINE = sa.text(
     " byte_length, threshold_bytes, passed_through_bytes, truncated_at_runtime_cap)"
     " VALUES (:sid, :call_id, :tool, :point, :len, :threshold, :through, false)"
 ).bindparams(sa.bindparam("sid", type_=sa.Uuid()))
-
-
-class EvidenceStorageUnconfigured(RuntimeError):
-    """No object bucket is named, so a payload has nowhere to be written."""
 
 
 class UnconfiguredEvidence:

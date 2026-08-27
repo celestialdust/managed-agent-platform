@@ -327,13 +327,30 @@ def test_the_produced_file_was_announced_in_the_event_log(shipped: _Shipped) -> 
 
 
 @requires_the_cluster
-def test_the_announcement_follows_the_turn_it_belongs_to(shipped: _Shipped) -> None:
-    """Ordered after `turn.completed`, which is the true causal order: ship-out runs at
-    completion. A tenant polling for the terminal event and then reading the rest of the
-    log finds the file id already there, rather than having to keep polling past a Turn
-    that already said it was done."""
+def test_the_announcement_comes_before_the_turn_it_belongs_to(
+    shipped: _Shipped,
+) -> None:
+    """Ordered BEFORE `turn.completed`, which reverses what this asserted until
+    2026-08-26.
+
+    The old order put the announcement after the terminal event, and the reason written
+    here for it -- that a tenant polling for the terminal event and then reading the
+    rest of the log finds the file id already there -- was the argument against it. A
+    tenant who polls to `turn.completed` and stops has, in that order, missed the
+    announcement, and there is nothing in the log telling them how much further to
+    read.
+
+    The order changed because `turn.completed` is now appended after the seam that
+    ships out, rather than as it comes off the pod's stream: the log must not record a
+    Turn as having reached its durability boundary before the write that makes that
+    true. The announcement is a product of that same seam, so it now lands first.
+
+    What the tenant gains is that the terminal event is finally terminal. Every
+    `_TERMINAL` set in this tree already treats `turn.completed` that way, and an
+    `output.produced` arriving after it was the one thing that made them wrong.
+    """
     types = [one["type"] for one in shipped.events]
-    assert types.index("output.produced") > types.index("turn.completed"), types
+    assert types.index("output.produced") < types.index("turn.completed"), types
 
 
 @requires_the_cluster

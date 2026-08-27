@@ -6,19 +6,29 @@
 # Every document carries its own namespace, so no `-n` is needed and applying this from
 # the wrong context cannot put the set somewhere else.
 #
-# THESE FILTER NOTHING UNTIL THE CNI IS ENFORCING, and that is the first thing to know
-# about this file rather than a footnote. This cluster runs the Amazon VPC CNI, whose
-# network-policy agent is deployed and switched off: the `aws-eks-nodeagent` container of
-# `kube-system/aws-node` runs with `--enable-network-policy=false` (measured). While that
-# is false the API server still accepts every object here, `kubectl get netpol` still
-# lists them, and not one packet is examined. `NETWORK_POLICY_ENFORCING_MODE=standard`
-# sits on the same DaemonSet and reads like enforcement being configured; it is the
-# setting that says what happens to a pod's traffic *while* its policies are being
-# programmed, and it is inert for the same reason everything else here is. The switch is
-# `enableNetworkPolicy` on the `vpc-cni` add-on -- `deploy/terraform/vpc_cni.tf` -- and
-# the check that this file is not decoration is
+# THESE FILTER NOTHING UNLESS THE CNI IS ENFORCING, and that is the first thing to know
+# about this file rather than a footnote. The API server accepts every object here
+# whether or not anything examines a packet, and `kubectl get netpol` lists them either
+# way, so the file's own contents can never tell you which state you are in. The switch
+# is `enableNetworkPolicy` on the `vpc-cni` add-on -- `deploy/terraform/vpc_cni.tf` --
+# and the check is
 # `tests/deploy/test_network_policies.py::test_the_cni_is_enforcing_network_policy`,
-# which fails while the flag is false.
+# which reads the `--enable-network-policy` flag off the `aws-eks-nodeagent` container
+# of `kube-system/aws-node`. On `map-dev` that flag reads `true` (measured 2026-08-26,
+# after `vpc_cni.tf` was applied); this header said `false` until that date, which was
+# true when it was written and had quietly stopped being true.
+#
+# `NETWORK_POLICY_ENFORCING_MODE=standard` sits on the same DaemonSet and reads like
+# enforcement being configured. It is not: it says what happens to a pod's traffic
+# *while* its policies are being programmed, not whether they are.
+#
+# The other half of "is this decoration" is whether the set is in the cluster at all.
+# It was in this repository and applied by nothing until 2026-08-26 -- so the CNI was
+# enforcing, the namespace held no policy, and every pod could reach every pod while
+# this file read exactly as it does now. `deploy/platform.py` applies it with the
+# control plane now, and
+# `test_the_manifest_set_is_deployable.py::test_every_manifest_in_this_tree_is_applied_by_something`
+# is what says something still will.
 #
 # WHAT ORDER TO PUT THESE IN, if the platform is serving. A pod that no policy selects is
 # unrestricted, and a pod that any policy selects is denied everything that policy does
@@ -189,11 +199,26 @@ spec:
     # pod), so it has no reason to reach the node's instance role and no way to fall back
     # to it.
     #
-    # Nothing here dials the public internet on any other port, and that is a property of
-    # what this process does rather than a preference: it holds no webhook client -- the
-    # dispatcher that would make one is constructed by tests and by nothing that runs --
-    # so the day one is wired, its first call fails against this rule rather than
-    # succeeding unnoticed.
+    # 443 AND NOTHING ELSE, and this process DOES dial the public internet. The comment
+    # that stood here said the opposite -- that no webhook client is constructed outside
+    # tests -- and it was false when it was written: `composition.py`'s production
+    # `build()` constructs a `WebhookDispatcher` over a real `httpx.AsyncClient` and runs
+    # a delivery sweep on a timer.
+    #
+    # So the consequence is live rather than hypothetical, and an operator has to know
+    # it: a tenant may register a callback URL on any port, and this rule delivers only
+    # the ones on 443. A webhook pointed at :8443, :8080 or anything else is dropped by
+    # the CNI -- the dispatcher sees a connect timeout, retries on its own schedule, and
+    # exhausts. Nothing in the delivery ledger says "a filter refused this", so it reads
+    # as a receiver that is down.
+    #
+    # Kept at 443 rather than widened, because the alternative is letting this pod open
+    # an arbitrary port to an arbitrary internet address on a URL a tenant chose, which
+    # is a server-side request forgery primitive with a delivery ledger attached. The
+    # narrow rule is the right default; what was wrong was the sentence claiming it cost
+    # nothing. If per-tenant ports are ever wanted, the place to decide it is the
+    # registration route, which can refuse a port this file does not admit -- a refusal
+    # a tenant can see, rather than a silence they cannot.
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0
@@ -389,17 +414,46 @@ spec:
 # A Session's pod: the one process in this cluster that runs a tenant's agent, and
 # therefore the one that runs model-authored code. Most of the value in this file is here.
 #
-# It may resolve names and call the two gateways. It may NOT reach the control plane, the
-# Kubernetes API, the database, another tenant's Session, the node's instance credentials,
-# or any address outside this cluster. Nothing it holds is a credential for any of those
-# -- it is given a Session-scoped bearer and nothing else -- and this is what stops it
-# from trying.
+# It may resolve names, call the two gateways, and open TCP 443 to the public internet. It
+# may NOT reach the control plane, the Kubernetes API, the database, another tenant's
+# Session, the node's instance credentials, or any port but 443 anywhere. Nothing it holds
+# is a credential for any of those -- it is given a Session-scoped bearer and nothing else
+# -- and this is what stops it from trying.
 #
-# Read the header's note on `ownerReferences` before trusting this document. It selects a
-# bare Pod, which is the shape Amazon's considerations for this feature decline to
-# guarantee enforcement for, so the arrows it forbids to the control plane and the two
-# gateways are also forbidden by those pods' own ingress rules. The two it forbids with
-# nobody backing it up are Session-to-Session and Session-to-internet.
+# THE PUBLIC-443 RULE IS NOT A LEAK IN THIS DOCUMENT; IT IS THE FEATURE.
+# `Environment.allowed_domains` is enforced by a proxy the runtime starts *inside this
+# pod*, which is why the case grading a refusal asserts on an HTTP **403**
+# (`tests/pod/test_a_granted_domain_is_reachable_and_others_are_not.py`). That proxy then
+# dials the granted host outbound on 443. So a rule denying egress here does not narrow
+# the allowlist -- it deletes it, and a tenant's agent sees a hang rather than a refusal.
+#
+# This file denied it from the moment it was first applied on 2026-08-26 until later that
+# same day, and NO TEST IN THIS TREE COULD HAVE SAID SO. The cases that measure what a
+# Session can reach build their pods in a namespace of their own (`map-67-targets`,
+# `map-68-confined`, one per file), and a NetworkPolicy is namespaced -- so this set
+# selects real Session pods in `map-dev` and never selects the pods that grade them. They
+# passed, and would have kept passing, with the feature off. The finding came from a bare
+# pod labelled `map.role: session-pod` created in `map-dev` by hand, which answered
+# `external443=REFUSED  controlplane=REFUSED  gateway=CONNECTED`. That probe is now
+# `test_a_session_pod_reaches_the_gateways_and_not_the_platform` in
+# `tests/deploy/test_network_policies.py`, so the next person is told by a test.
+#
+# WHAT THIS COSTS, stated rather than implied: a process in this pod that goes around the
+# in-pod proxy can open 443 to any public address, and nothing at the network layer stops
+# it. That is model-authored code with an egress channel. The honest reading is that the
+# domain allowlist has always been an in-pod control and this document never enforced it;
+# what this document does enforce is the infrastructure boundary -- IMDS, the database,
+# the control plane, the Kubernetes API, another tenant's Session, and every port but 443.
+#
+# ENFORCEMENT ON A BARE POD IS SETTLED, and it is settled by measurement rather than by
+# Amazon's wording. This document selects a Pod with no `ownerReferences`, which is the
+# shape their considerations for this feature decline to *guarantee* enforcement for --
+# so the header used to say the arrows it forbids to the control plane and the gateways
+# lean on those pods' own ingress rules, and that Session-to-Session and
+# Session-to-internet were forbidden with nobody backing them up. The probe above answers
+# it: a bare pod in this namespace was filtered, on egress, by this document. Declining to
+# guarantee is not the same as not doing it, and what is true on this cluster today is
+# that it does.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -461,6 +515,29 @@ spec:
             matchLabels: { map.component: model-gateway }
       ports:
         - { protocol: TCP, port: 8080 }
+    # The public internet on 443, which is what makes `allowed_domains` work at all. This
+    # document's header says why denying it deletes the feature rather than tightening it,
+    # and what admitting it costs; neither belongs in a rule comment, but neither should
+    # be discovered by someone reading only this far.
+    #
+    # The three exclusions are the ones the control plane's public rule carries, and they
+    # do more work here than they do there. The VPC carve-out keeps this rule from quietly
+    # re-granting the database, the control plane and every other Session's pod, all of
+    # which hold addresses in `172.31.0.0/16` -- without it, the two denials this document
+    # exists for would be undone by the rule three lines below them. The Service range
+    # keeps it from re-granting anything fronted by a ClusterIP. Link-local matters most:
+    # `169.254.169.254` is where the node's instance credentials answer, and a Session pod
+    # that reached them would hold the node's role instead of its own Session-scoped
+    # bearer -- which is the whole trust boundary, inverted, by one missing CIDR.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 172.31.0.0/16
+              - 10.100.0.0/16
+              - 169.254.0.0/16
+      ports:
+        - { protocol: TCP, port: 443 }
 ---
 # The floor. Applied last, and it is the only document here that says anything about a pod
 # nobody has written yet.

@@ -1,4 +1,7 @@
-"""POST /v1/mcp_servers — the only place an MCP server and its tools are accepted.
+"""POST and GET on /v1/mcp_servers — the tenant's MCP catalog, written and read.
+
+POST is the only place an MCP server and its tools are accepted. GET answers the
+question the tenant otherwise has no way to ask: which names may a Grant contain.
 
 The two refusals arrive by different paths on purpose. A Scope Binding no argument can
 express is refused while the body is being parsed, because the declaration carries
@@ -11,11 +14,12 @@ definition names a server by name and a Grant names a tool by name, so the names
 handles a caller uses afterwards, and the row ids stay internal (ADR-007).
 """
 
+from collections import defaultdict
 from collections.abc import Mapping
 from typing import Annotated, Final
 
 from fastapi import APIRouter, Depends, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from managed_agent.control.api.refusals import Refusal
 from managed_agent.control.api.request.dependencies import platform_from_request
@@ -96,4 +100,77 @@ async def register(
     return ServerRegistered(
         server_name=body.server_name,
         tools=tuple(tool.name for tool in body.tools),
+    )
+
+
+class ToolInCatalog(BaseModel):
+    """One tool, under both the names that matter when a Grant is written.
+
+    `name` is what the tenant called it when registering; `advertised_name` is what a
+    Grant has to say and what the model is shown. They differ by the server prefix, and
+    a caller cannot derive the second from the first without knowing how this platform
+    joins the two -- which is the whole reason this view carries both instead of one.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    name: str
+    advertised_name: str
+
+
+class ServerInCatalog(BaseModel):
+    """One registered server and the tools behind it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    server_name: str
+    tools: tuple[ToolInCatalog, ...]
+
+
+class Catalog(BaseModel):
+    """Every server a tenant holds. Empty when it has registered nothing."""
+
+    model_config = ConfigDict(frozen=True)
+
+    servers: tuple[ServerInCatalog, ...]
+
+
+@router.get("/mcp_servers", response_model=Catalog)
+async def catalog(
+    request: Request,
+    tenant_id: Annotated[TenantId, Depends(unauthenticated_tenant_from_header)],
+) -> Catalog:
+    """What this tenant may name in a Grant, grouped under the server offering it.
+
+    Scoped by `tool_registry.list_for_tenant(tenant_id)`, which takes the tenant into
+    the query rather than filtering rows after the fact, so another tenant's catalog is
+    never read and an empty answer never means "hidden". No limit is named because that
+    read declares none: the registry lists a tenant's own rows whole, and the count is
+    bounded by what that tenant registered.
+
+    Grouped rather than flat because the POST beside it registers one server at a time,
+    so a caller comparing what it registered against what it can now address is reading
+    the same shape twice. Servers come back in name order and tools in the order the
+    registry lists them, which is tool-name order -- a stable read, so a caller diffing
+    two responses sees only what really changed.
+
+    Carries neither the endpoint nor the scope bindings nor the remote name. A Grant is
+    written from the two names here and nothing else, and the endpoint holds a url and
+    a `credential_ref` -- a vault name that buys nothing alone, which is exactly what
+    makes handing it back easy to wave through. Fail-safe default: a read gives up what
+    its question needs, and this question does not need those.
+    """
+    tools = await platform_from_request(request).tool_registry.list_for_tenant(
+        tenant_id
+    )
+    behind: defaultdict[str, list[ToolInCatalog]] = defaultdict(list)
+    for tool in tools:
+        behind[tool.server_name].append(
+            ToolInCatalog(name=tool.name, advertised_name=tool.advertised_name)
+        )
+    return Catalog(
+        servers=tuple(
+            ServerInCatalog(server_name=name, tools=tuple(behind[name]))
+            for name in sorted(behind)
+        )
     )

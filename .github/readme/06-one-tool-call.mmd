@@ -1,9 +1,9 @@
 flowchart LR
     M["`**the model asks**
 name + arguments`"] --> TG["`**Tool Gateway**
-against the token's tenant
-not per-Session yet`"]
-    TG -->|"unknown OR forbidden"| NG["`**TOOL_NOT_GRANTED**
+resolved against
+this Session's Grant`"]
+    TG -->|"unknown OR not granted"| NG["`**TOOL_NOT_GRANTED**
 one answer for both`"]
     TG -->|"`a bound dimension
 the Scope lacks`"| OS2["`**TOOL_OUT_OF_SCOPE**`"]

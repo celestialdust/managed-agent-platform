@@ -1,4 +1,4 @@
-"""The init container that puts a Session's Rollout back, as the pod declares it.
+"""The init container that prepares a Session's runtime home, as the pod declares it.
 
 Tier 1 (local, no infrastructure). Everything here reads `deploy/k8s/session-pod.yaml`
 and the artifacts it has to agree with -- the image's venv path, the module the command
@@ -12,12 +12,17 @@ that matters for that: a manifest naming a module the image does not carry is a 
 whose init container exits `No module named ...` for every tenant, and nothing else in
 this suite would notice.
 
-The separation checks are the other half, and they are why this is a container rather
-than three more lines in the one before it. A reader of the manifest can see that the
-container writing the workspace holds no mount of the runtime's home, and that the
-container writing the runtime's home holds no mount of the workspace. That property is
-worth having as something anybody can check by reading, and it stops being checkable the
-moment one container does both jobs.
+The mount checks are the other half, and what they can say has narrowed. One init
+container now does both jobs -- the shell that builds the runtime's home and the
+sandbox targets, then the Python that puts the Rollout back under it -- so the mount set
+is the union of what the two of them held separately, and what is still checkable by
+reading is that the union grew by nothing else and still carries no second credential.
+
+What stopped being checkable is the property two containers made visible: that the half
+reaching the network held no handle on the tenant's durable tree. It was traded for one
+fewer serial container start per placement. That is recorded here, in the file whose
+assertion used to hold it, because a property that is gone reads exactly like a property
+nobody thought of unless somebody says which it was.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from typing import Any, Final
 
 import yaml
 
-from managed_agent.control.pod_config.compiler import CODEX_HOME, WORKSPACE_ROOT
+from managed_agent.control.pod_config.compiler import CODEX_HOME
 from managed_agent.session_shim.seed_rollout import (
     _SEED_BUDGET_BYTES,
     RESUMING_ENV,
@@ -39,11 +44,24 @@ _MANIFEST: Final[Path] = _DEPLOY / "k8s" / "session-pod.yaml"
 _DOCKERFILE: Final[Path] = _DEPLOY / "docker" / "session.Dockerfile"
 _POD: Final[dict[str, Any]] = yaml.safe_load(_MANIFEST.read_text())
 
-SEED_ROLLOUT: Final = "seed-rollout"
-RESTORE_LANE: Final = "restore-working-lane"
-SEED_HOME: Final = "seed-runtime-home"
+SEED: Final = "seed-runtime-home"
+"""The one init container, named for the job that governs the other.
+
+Both halves write the runtime's home: the shell creates it and copies `config.toml` in,
+the Python writes the Rollout under the same root. `seed-rollout` named only the second
+and conditional half, so the surviving name is the one that describes the container.
+"""
+
 HOME_VOLUME: Final = "codex-home"
 WORKSPACE_VOLUME: Final = "workspace"
+CONTROL_VOLUME: Final = "control"
+COMPILED_VOLUME: Final = "compiled"
+SESSION_SUBTREE: Final = "MAP_TENANT_ID/MAP_SESSION_ID"
+"""The un-substituted `subPath` prefix `pod_runner` fills in per Session.
+
+Restated rather than imported so that a manifest and an adapter agreeing with each
+other by both being wrong still fails here.
+"""
 
 MEBIBYTE: Final = 1024 * 1024
 
@@ -76,28 +94,90 @@ def _mounts(container: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {mount["name"]: mount for mount in container.get("volumeMounts", ())}
 
 
+def _shell_body() -> str:
+    """The one `/bin/sh -c` string the merged init container runs.
+
+    Read out of `args` rather than `command`, which carries the interpreter and its
+    flag. Asserted to be a single element because a second one would be `$0` and the
+    positional parameters, which is a shape this manifest does not use and which would
+    make the index arithmetic below read the wrong string.
+    """
+    container = _named(SEED)
+    assert container["command"] == ["/bin/sh", "-c"]
+    args = list(container["args"])
+    assert len(args) == 1, args
+    return str(args[0])
+
+
+def _python_invocation() -> list[str]:
+    """The `exec <interpreter> -m <module>` line, split, read out of the body itself.
+
+    Parsed rather than restated. The interpreter and the module used to be elements of a
+    `command` list, where every test below could read them off the manifest; the merge
+    put them inside a shell string, and a test that answered from its own constant
+    instead would pass against a manifest naming a module the image does not carry --
+    which is the one failure this file exists to catch.
+    """
+    lines = [
+        line.strip()
+        for line in _shell_body().splitlines()
+        if line.strip().startswith("exec ")
+    ]
+    assert len(lines) == 1, f"expected one exec line in the shell body, found {lines}"
+    return lines[0].split()
+
+
 # --------------------------------------------------------------------------------------
 # Where it runs in the sequence
 # --------------------------------------------------------------------------------------
 
 
-def test_the_seed_runs_after_both_containers_that_come_before_it() -> None:
-    """By name and in order, because init containers run in sequence and this is last.
+def test_the_pod_declares_exactly_one_init_container() -> None:
+    """By name rather than by count, because a count cannot say which one survived.
 
-    After `seed-runtime-home`, which creates the runtime home this writes into -- a
-    write into a directory that does not exist yet is the whole failure. And after
-    `restore-working-lane`, because a workspace restore that is going to refuse should
-    refuse before a second volume has been written: a refusal stops every container
-    behind it, so the likelier and cheaper failure goes first.
-
-    A count would say none of that. Three containers in the wrong order is three
-    containers.
+    The two that were here ran in sequence, and the sequence cost a container start and
+    teardown on the critical path of every placement. They are one container now; the
+    ordering they encoded is inside its body and is asserted below.
     """
-    assert [c["name"] for c in _init_containers()] == [
-        SEED_HOME,
-        RESTORE_LANE,
-        SEED_ROLLOUT,
-    ]
+    assert [c["name"] for c in _init_containers()] == [SEED]
+
+
+def test_the_shell_half_runs_first_and_the_python_half_last() -> None:
+    """The ordering two init containers used to give for free, now a property of a body.
+
+    The shell creates `CODEX_HOME` and copies `config.toml` into it; the Python writes
+    the Rollout under that same root. A write into a directory that does not exist yet
+    is the whole failure, so the direction is asserted rather than assumed -- and it is
+    asserted by POSITION, because a body where the two are interleaved would satisfy a
+    mere containment check.
+    """
+    body = _shell_body()
+    home = body.index("mkdir -p /var/lib/map/codex")
+    python = body.index(" ".join(_python_invocation()))
+    assert home < python, "the Python half runs before the root it writes into exists"
+    assert body.rstrip().endswith(" ".join(_python_invocation())), (
+        "a command after the Python half would run whether or not the seed refused, "
+        "and its status -- not the seed's -- would be the container's"
+    )
+
+
+def test_either_half_failing_takes_the_pod_down() -> None:
+    """Two containers failed independently; one container has to be made to.
+
+    `set -eu` is what stops the shell from running on past a failed `mkdir` into a
+    Python half with nothing under it, and `exec` is what makes the Python process the
+    container itself -- so its non-zero status is the container's status rather than
+    something a shell could swallow on the way out.
+    """
+    body = _shell_body()
+    assert body.lstrip().startswith("set -eu"), (
+        "without `set -eu` a failed mkdir or cp leaves the Python half running against "
+        "a home that was never built, and the container still exits 0"
+    )
+    assert _python_invocation()[0] == "exec", (
+        "without `exec` the Python half is a child of the shell, and what the "
+        "container exits with is the shell's last status rather than the seed's"
+    )
 
 
 def test_the_seed_is_an_init_container_and_not_a_regular_one() -> None:
@@ -107,7 +187,7 @@ def test_the_seed_is_an_init_container_and_not_a_regular_one() -> None:
     container in `spec.containers` races the shim's lifespan, and the race it loses is
     the one where the Session silently starts fresh.
     """
-    assert SEED_ROLLOUT not in {c["name"] for c in _POD["spec"]["containers"]}
+    assert SEED not in {c["name"] for c in _POD["spec"]["containers"]}
 
 
 # --------------------------------------------------------------------------------------
@@ -122,27 +202,26 @@ def test_the_seed_mounts_the_runtime_home_it_writes_and_the_token_document() -> 
     read-only, because the Gateway's URL and this Session's token are read out of that
     document and nothing here writes it.
     """
-    mounts = _mounts(_named(SEED_ROLLOUT))
+    mounts = _mounts(_named(SEED))
     assert mounts[HOME_VOLUME]["mountPath"] == CODEX_HOME
     assert mounts[HOME_VOLUME].get("readOnly") is not True
-    assert mounts["compiled"]["readOnly"] is True
+    assert mounts[COMPILED_VOLUME]["readOnly"] is True
 
 
-def test_neither_restoring_container_can_write_the_other_ones_tree() -> None:
-    """The reason this is a sibling and not three more lines in the container above it.
+def test_the_workspace_handle_it_holds_reaches_one_Session_subtree_and_no_other() -> (
+    None
+):
+    """What is left of the absence this file used to assert, and why it is not nothing.
 
-    Stated as a pair of absences rather than as a list of mounts, because that is the
-    property: the container that writes the workspace holds no handle on the runtime's
-    record, and the container that writes the record holds no handle on the workspace.
-    One container doing both jobs would hold both, and no reading of the manifest could
-    tell you otherwise.
+    While the Rollout had a container of its own it mounted no workspace at all. Merging
+    the two gave the half that reaches the network a read-write handle on the durable
+    copy of a tenant's tree, and the only thing standing between that handle and every
+    other tenant's tree is this `subPath`. So the prefix is asserted rather than the
+    mount's presence: a mount of this volume whose `subPath` does not open at a Session
+    is the volume ROOT, which `pod_runner._fill_sub_paths` refuses for the same reason.
     """
-    seeding = _mounts(_named(SEED_ROLLOUT))
-    restoring = _mounts(_named(RESTORE_LANE))
-
-    assert WORKSPACE_VOLUME not in seeding
-    assert HOME_VOLUME not in restoring
-    assert restoring[WORKSPACE_VOLUME]["mountPath"] == WORKSPACE_ROOT
+    mount = _mounts(_named(SEED))[WORKSPACE_VOLUME]
+    assert str(mount["subPath"]).startswith(SESSION_SUBTREE)
 
 
 def test_the_seed_holds_no_shim_token_and_no_extra_volume() -> None:
@@ -151,8 +230,18 @@ def test_the_seed_holds_no_shim_token_and_no_extra_volume() -> None:
     The shim's bearer is mounted into the shim and no other container. This one reads a
     different token out of a document it already has, so a mount of `shim-token` here
     would be a second credential in a pod whose whole design is to hold none.
+
+    The set is the union of what the two containers held before they were merged, and it
+    is asserted CLOSED: a merge is the moment a mount arrives because it was convenient
+    rather than because something needed it, and a closed set is what makes that arrival
+    fail rather than pass.
     """
-    assert set(_mounts(_named(SEED_ROLLOUT))) == {HOME_VOLUME, "compiled"}
+    assert set(_mounts(_named(SEED))) == {
+        HOME_VOLUME,
+        COMPILED_VOLUME,
+        CONTROL_VOLUME,
+        WORKSPACE_VOLUME,
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -168,10 +257,13 @@ def test_the_command_names_a_module_the_image_can_actually_run() -> None:
     show it. Imported here rather than string-matched, so a module renamed in the
     package fails this rather than passing a spelling check against itself.
     """
-    command = _named(SEED_ROLLOUT)["command"]
-    assert command[1] == "-m"
-    module = importlib.import_module(command[2])
+    invocation = _python_invocation()
+    assert invocation[2] == "-m", invocation
+    module = importlib.import_module(invocation[3])
     assert callable(module.main)
+    assert len(invocation) == 4, (
+        f"the seed is run with arguments nothing reads: {invocation}"
+    )
 
 
 def test_the_interpreter_is_the_one_the_image_installs_the_wheel_into() -> None:
@@ -181,7 +273,7 @@ def test_the_interpreter_is_the_one_the_image_installs_the_wheel_into() -> None:
     naming a binary that is not there, and the error names the path rather than the
     move.
     """
-    interpreter = _named(SEED_ROLLOUT)["command"][0]
+    interpreter = _python_invocation()[1]
     assert interpreter.endswith("/bin/python")
     assert interpreter.rsplit("/bin/python", 1)[0] in _DOCKERFILE.read_text()
 
@@ -195,14 +287,57 @@ def test_a_refusal_reaches_the_pod_status_and_not_only_the_container_log() -> No
     deliberately nothing, because the reason is on stderr. This policy is what promotes
     the log into that field.
     """
-    assert _named(SEED_ROLLOUT)["terminationMessagePolicy"] == "FallbackToLogsOnError"
+    assert _named(SEED)["terminationMessagePolicy"] == "FallbackToLogsOnError"
+
+
+def test_a_status_carrying_both_halves_still_says_which_of_them_refused() -> None:
+    """One container, one termination message -- so the halves have to name themselves.
+
+    While there were two containers `_why_it_will_not_start` named the failing one and
+    that was the whole answer. There is one now, and its message is the tail of a log
+    both halves write, so a bare `mkdir: ...` or a bare non-zero from `test` would say
+    which command failed and not which job. Each half prefixes its own refusals instead.
+
+    The Python half's prefix is `_to_stderr`'s and is asserted where that lives; this is
+    the shell half, whose every refusal goes through one function so there is one place
+    for the prefix to be.
+    """
+    body = _shell_body()
+    assert f"{SEED}: " in body, (
+        "the shell half writes refusals that do not name the job that refused"
+    )
+
+
+def test_the_shell_half_cannot_put_a_compiled_document_into_the_pod_status() -> None:
+    """New risk from the merge, and the reason the policy above is now worth re-reading.
+
+    `FallbackToLogsOnError` promotes this container's log tail into pod status, and pod
+    status reaches a tenant through the error their placement fails with. The shell half
+    did not carry that policy before the merge and now it does, while holding a mount of
+    `compiled` -- the document that carries this Session's bearer token.
+
+    So the body may move that document and may not READ it: `cp` copies bytes without
+    printing them, and the readers below print what they are given. `set -x` is in the
+    list because it needs no reader at all -- it would trace every expansion into the
+    same stream.
+    """
+    commands = "\n".join(
+        line for line in _shell_body().splitlines() if not line.strip().startswith("#")
+    )
+    forbidden = ("cat ", "head ", "tail ", "od ", "xxd ", "strings ", "set -x")
+    found = sorted(word for word in forbidden if word in commands)
+    assert not found, (
+        f"the shell half runs {found}, and its output now reaches pod status: a line "
+        "of /etc/map/compiled/config.toml there is this Session's token in an error "
+        "handed to whoever asked for the pod"
+    )
 
 
 def test_it_runs_under_the_same_floor_as_every_other_container_here() -> None:
     """Container-level and never inherited: an init container that omits the block runs
     with the runtime's default capability set in its bounding set while its siblings run
     with none."""
-    security = _named(SEED_ROLLOUT)["securityContext"]
+    security = _named(SEED)["securityContext"]
     assert security["allowPrivilegeEscalation"] is False
     assert security["readOnlyRootFilesystem"] is True
     assert security["capabilities"]["drop"] == ["ALL"]
@@ -217,7 +352,7 @@ def test_the_resume_variable_is_declared_so_the_adapter_can_fill_it() -> None:
     cannot be placed at all, because the substitution that would have filled this is the
     one whose absence the adapter refuses.
     """
-    declared = {e["name"]: e["value"] for e in _named(SEED_ROLLOUT)["env"]}
+    declared = {e["name"]: e["value"] for e in _named(SEED)["env"]}
     assert declared == {RESUMING_ENV: "false"}
 
 

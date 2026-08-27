@@ -32,15 +32,15 @@ that was never checked, because there is no way to spell one.
 import ipaddress
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Final, NewType, Protocol
+from typing import Annotated, Final, NewType, Protocol
 from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from managed_agent.core.ids import TenantId
-from managed_agent.core.session.session import SessionState
 from managed_agent.core.vault_names import MAX_REF_LEN, VaultRefInvalid, parse_vault_ref
+from managed_agent.core.vocabulary import WEBHOOK_ELIGIBLE
 
 CallbackUrl = NewType("CallbackUrl", str)
 """An https destination that named no blocked address literal when it was parsed."""
@@ -54,11 +54,26 @@ covering the two spellings that are conventions rather than addresses.
 
 
 class WebhookInvalid(Exception):
-    """The registration names a destination this platform will not call."""
+    """The registration names something this platform will not accept."""
 
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class EventTypeInvalid(WebhookInvalid):
+    """One requested type this platform will not deliver, carried as a value.
+
+    A subclass rather than another reason string, so a caller can put the offending name
+    into a refusal's `detail` under its own key without recovering it from a sentence --
+    which is free text a reader may reword, and would take the detail with it.
+    """
+
+    def __init__(self, event_type: str) -> None:
+        super().__init__(
+            f"{event_type} is not an event type a webhook may subscribe to"
+        )
+        self.event_type = event_type
 
 
 def parse_callback_url(raw: str) -> CallbackUrl:
@@ -117,6 +132,45 @@ def parse_secret_ref(raw: str) -> str:
         ) from None
 
 
+MAX_EVENT_TYPE_LEN: Final = 128
+"""How long one requested type name may be.
+
+Here because the field it bounds used to be an enum, which bounded itself. A set of free
+strings does not, and every refusal on this route echoes the offending value back -- so
+without a cap a tenant could choose how many bytes their own refusal costs to build and
+to log. 128 is far above the longest name this vocabulary has any use for; it is a
+ceiling on an abuse, not a budget anybody is meant to spend.
+"""
+
+
+def parse_event_types(raw: frozenset[str]) -> frozenset[str]:
+    """Return the set unchanged, or raise `EventTypeInvalid` naming one type refused.
+
+    Eligibility is read off the vocabulary registry rather than listed here, so a family
+    that becomes deliverable needs no edit on this side and a type that never was cannot
+    be admitted by a list that fell behind.
+
+    Both kinds of bad type are one refusal. A published type that is not deliverable
+    (`turn.message_delta` arrives once per token) and a name that is not a type at all
+    are different mistakes, but the tenant's next move is the same in both cases --
+    write a different type -- and one answer is what keeps the refusal from reporting
+    which spellings the platform recognises.
+
+    One name and not all of them, so the refusal is bounded by `MAX_EVENT_TYPE_LEN`
+    rather than by how many types the request happened to carry. It is the lowest in
+    sort order, so a request refused twice is refused the same way twice.
+
+    Returns `frozenset[str]` rather than a type of its own. A NewType here would claim
+    the value is safe to hand to the delivery path, and what makes a delivery safe is
+    the tail reading only eligible types -- not this parse, which only stops a
+    registration nobody could ever fire.
+    """
+    refused = sorted(name for name in raw if name not in WEBHOOK_ELIGIBLE)
+    if refused:
+        raise EventTypeInvalid(refused[0])
+    return raw
+
+
 class RegisterWebhook(BaseModel):
     """What a tenant sends. The url and the reference are still raw here.
 
@@ -129,7 +183,9 @@ class RegisterWebhook(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     url: str = Field(min_length=1, max_length=2048)
-    states: frozenset[SessionState] = Field(min_length=1)
+    event_types: frozenset[Annotated[str, Field(max_length=MAX_EVENT_TYPE_LEN)]] = (
+        Field(min_length=1)
+    )
     secret_ref: str = Field(min_length=1, max_length=256)
 
 
@@ -146,7 +202,7 @@ class WebhookRecord:
     id: UUID
     tenant_id: TenantId
     url: CallbackUrl
-    states: frozenset[SessionState]
+    event_types: frozenset[str]
     secret_ref: str
     created_at_ms: int
 
@@ -162,17 +218,17 @@ class WebhookView(BaseModel):
 
     id: UUID
     url: str
-    states: tuple[SessionState, ...]
+    event_types: tuple[str, ...]
     secret_ref: str
     created_at_ms: int
 
     @classmethod
     def of(cls, record: WebhookRecord) -> "WebhookView":
-        """States come back sorted, so two reads of one registration are identical."""
+        """Types come back sorted, so two reads of one registration are identical."""
         return cls(
             id=record.id,
             url=record.url,
-            states=tuple(sorted(record.states)),
+            event_types=tuple(sorted(record.event_types)),
             secret_ref=record.secret_ref,
             created_at_ms=record.created_at_ms,
         )
@@ -191,7 +247,7 @@ class WebhookStore(Protocol):
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         """Write one registration and return it as stored, with the id it was given."""
@@ -211,7 +267,7 @@ class WebhookStore(Protocol):
         ...
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        """This tenant's registrations naming this state. Empty is the common case."""
+        """This tenant's registrations naming this type. Empty is the common case."""
         ...

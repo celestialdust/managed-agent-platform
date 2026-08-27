@@ -37,8 +37,8 @@ from tool_gateway_harness import (
     stdio_endpoint,
 )
 
-from managed_agent.adapters.s3.session_vfs import UnconfiguredSessionVfs
 from managed_agent.core.ids import Seq, SessionId, TenantId
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.scope_binding import (
     ParameterType,
     RegisteredTool,
@@ -126,6 +126,7 @@ class RecordingRegistry:
 def _stdio_tool(name: str = "echo_credential") -> RegisteredTool:
     return RegisteredTool(
         name=name,
+        advertised_name=advertised_name_for("conformance_stdio", name),
         remote_name="echo_credential",
         parameters={"query": ParameterType.STRING},
         scope_bindings=(ScopeBinding(dimension="account", argument="query"),),
@@ -138,6 +139,7 @@ def _schema_tool(name: str = "acme__big_report") -> RegisteredTool:
     """A registration for the upstream whose tool declares an output schema."""
     return RegisteredTool(
         name=name,
+        advertised_name=advertised_name_for("schema_stdio", name),
         remote_name=SCHEMA_TOOL_NAME,
         parameters={"query": ParameterType.STRING},
         scope_bindings=(ScopeBinding(dimension="account", argument="query"),),
@@ -174,7 +176,9 @@ def harness(
     log = SilentLog()
     recorder = recorder or CountingEvidence()
     sessions = GatewaySessions(
-        scopes=FixedScope(),
+        # Granted every tool the registry holds: no case in this module is about the
+        # Grant, and a proxy built without one is offered nothing.
+        scopes=FixedScope(*(tool.advertised_name for tool in registry.tools)),
         registry=registry,
         broker=broker(vault),
         append=log,
@@ -196,9 +200,7 @@ async def _client(
     built: Harness, token: str | None
 ) -> AsyncIterator[httpx2.AsyncClient]:
     """An HTTP client onto the served app, with the lifespan actually running."""
-    app = create_gateway_app(
-        built.sessions, KEY, UnconfiguredSessionVfs(), _NoRollouts()
-    )
+    app = create_gateway_app(built.sessions, KEY, _NoRollouts())
     headers = {} if token is None else {SESSION_TOKEN_HEADER.decode(): token}
     async with (
         app.router.lifespan_context(app),
@@ -316,7 +318,9 @@ async def test_the_tenant_a_handler_reads_is_the_one_out_of_that_callers_token()
     async with _mcp(built, valid_for(uuid4(), tenant_id)) as session:
         listed = await session.list_tools()
 
-    assert [tool.name for tool in listed.tools] == ["echo_credential"]
+    assert [tool.name for tool in listed.tools] == [
+        advertised_name_for("conformance_stdio", "echo_credential")
+    ]
     assert set(built.registry.asked_by) == {TenantId(tenant_id)}
 
 
@@ -608,9 +612,7 @@ async def test_the_health_path_answers_without_a_token() -> None:
 
 def test_the_app_serves_exactly_one_mcp_path() -> None:
     """A second MCP surface would be a second way in, past a different check."""
-    app = create_gateway_app(
-        harness().sessions, KEY, UnconfiguredSessionVfs(), _NoRollouts()
-    )
+    app = create_gateway_app(harness().sessions, KEY, _NoRollouts())
 
     mcp_routes = [
         route for route in app.routes if getattr(route, "path", None) == MCP_PATH

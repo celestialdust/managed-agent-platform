@@ -32,14 +32,18 @@ from managed_agent.control.pod_config.compiler import (
     _render_requirements,
     session_profile,
 )
+from managed_agent.core.pod.permission_profile import is_strictly_under
 from managed_agent.core.pod.workspace_contract import (
     INPUT_DIR_NAME,
     OUTPUT_DIR_NAME,
     PACKAGE_DIR,
     PIP_WRAPPER,
+    SCRATCH_LIMIT_MEBIBYTES,
+    SCRATCH_ROOT,
     workspace_contract,
 )
 from managed_agent.core.toml_text import toml_string
+from managed_agent.core.vfs.session_vfs import ARTIFACTS, SealedLane
 from managed_agent.session_shim.serve import WORKSPACE_FILES
 
 _ROOT: Final = Path(__file__).resolve().parents[2]
@@ -48,13 +52,42 @@ _POD: Final[dict[str, Any]] = yaml.safe_load(
     (_ROOT / "deploy" / "k8s" / "session-pod.yaml").read_text()
 )
 
-_PACKAGE_PATH: Final = f"{WORKSPACE_ROOT}/{PACKAGE_DIR}"
-
 
 def _runtime_env() -> dict[str, str]:
     found = [c for c in _POD["spec"]["containers"] if c["name"] == "agent-runtime"]
     assert found, "the pod has no agent-runtime container"
     return {entry["name"]: str(entry["value"]) for entry in found[0].get("env", [])}
+
+
+def _image_env() -> dict[str, str]:
+    """Every `ENV NAME=value` the image declares, as the pod's processes see it.
+
+    Read as text rather than from a built image, for the reason the module docstring
+    gives: the Dockerfile is not Python and cannot be imported. One name per line is
+    the form this file writes them in, so a multi-variable `ENV` would be missed --
+    which is why `test_every_cache_the_image_redirects_lands_on_pod_local_scratch`
+    asserts the set it found is the whole set rather than merely non-empty.
+    """
+    found: dict[str, str] = {}
+    for line in _DOCKERFILE.splitlines():
+        match = re.fullmatch(r"ENV\s+([A-Za-z_][A-Za-z0-9_]*)=(\S+)", line.strip())
+        if match:
+            found[match.group(1)] = match.group(2)
+    return found
+
+
+def _scratch_volume_name() -> str:
+    """The volume behind the scratch mount, found through the mount rather than by name.
+
+    Looked up this way so that renaming the volume and leaving the mount, or the
+    reverse, fails against a mount nothing backs instead of passing against a volume
+    nothing uses.
+    """
+    for container in _POD["spec"]["containers"]:
+        for mount in container.get("volumeMounts", []):
+            if mount["mountPath"] == SCRATCH_ROOT:
+                return str(mount["name"])
+    raise AssertionError(f"no container mounts {SCRATCH_ROOT}")
 
 
 # --------------------------------------------------------------------------------------
@@ -135,16 +168,23 @@ def test_the_contract_names_no_tenant_and_no_turn() -> None:
 def test_the_contract_names_the_input_directory_that_is_actually_mounted() -> None:
     """The manifest mounts the workspace volume with `subPath` for the shim's write
     mount, so the directory that exists is the manifest's decision. A contract naming a
-    different one sends the model to look somewhere empty."""
+    different one sends the model to look somewhere empty.
+
+    Matched on the LAST segment of the subPath rather than on the whole of it: the rest
+    is this Session's subtree of a volume shared by every Session on the cluster
+    (ADR-035), filled in per Session by the pod runner, and no concern of the contract
+    the model reads. What the model is told is a directory name, and this is the mount
+    that decides which name exists.
+    """
     mounts = [
         mount
         for container in _POD["spec"]["containers"]
         if container["name"] == "session-shim"
         for mount in container.get("volumeMounts", [])
-        if mount.get("subPath") == INPUT_DIR_NAME
+        if str(mount.get("subPath", "")).rsplit("/", 1)[-1] == INPUT_DIR_NAME
     ]
 
-    assert mounts, f"no session-shim mount uses subPath {INPUT_DIR_NAME!r}"
+    assert mounts, f"no session-shim mount ends its subPath at {INPUT_DIR_NAME!r}"
     assert INPUT_DIR_NAME in workspace_contract()
     assert WORKSPACE_FILES.name == INPUT_DIR_NAME
 
@@ -172,6 +212,25 @@ def test_the_contract_tells_the_model_where_deliverables_go() -> None:
 # --------------------------------------------------------------------------------------
 
 
+def test_the_contract_tells_the_model_a_produced_path_is_written_once() -> None:
+    """The clause and the thing that enforces it, compared across two modules.
+
+    A tenant asking for four rounds of edits on one document is the ordinary case, and
+    the agent's ordinary answer is to rewrite the same path. The `artifacts` lane is
+    sealed, so the second write is refused -- and until this clause existed the agent
+    had no way to know that before it happened. `SealedLane` asserted beside it because
+    the clause is only true while the lane stays sealed: a later reader who made the
+    lane mutable would leave the model told to invent version names for no reason.
+    """
+    text = workspace_contract()
+
+    assert "Each path there is written once" in text
+    assert "a new path" in text
+    assert isinstance(ARTIFACTS, SealedLane), (
+        "the contract promises a produced path ships once; nothing enforces it"
+    )
+
+
 def test_the_wrapper_the_contract_names_is_the_one_the_image_installs() -> None:
     """A command name in the contract that the image does not provide is `command not
     found` inside a Turn, on the one instruction the platform itself authored."""
@@ -189,23 +248,38 @@ def test_the_wrapper_installs_where_the_manifest_says_imports_come_from() -> Non
     disagree, `map-pip requests` succeeds, prints nothing alarming, and the next line of
     Python cannot import it -- a Turn that installed a package and cannot use it, with
     every command reporting success.
+
+    This is the case that catches a half-done move of the directory itself, which is
+    why both halves are compared against the constant and not against each other. The
+    directory moved off the workspace and onto pod-local scratch, and it had to move in
+    three files at once -- this constant, the wrapper's `--target`, and the manifest's
+    PYTHONPATH. Moving two of the three leaves a Session installing packages onto a
+    network mount that nothing imports from, or importing from a directory nothing
+    installs into; neither says a word at the time.
     """
-    assert _PACKAGE_PATH in _DOCKERFILE, (
-        f"the wrapper does not install to {_PACKAGE_PATH}"
-    )
-    assert _runtime_env().get("PYTHONPATH") == _PACKAGE_PATH
+    assert PACKAGE_DIR in _DOCKERFILE, f"the wrapper does not install to {PACKAGE_DIR}"
+    assert _runtime_env().get("PYTHONPATH") == PACKAGE_DIR
 
 
-def test_the_install_directory_can_never_be_shipped_to_a_tenant() -> None:
-    """A dependency tree is not a document.
+def test_the_install_directory_is_outside_the_tree_ship_out_walks() -> None:
+    """A dependency tree is not a document, and it is now out of reach rather than
+    filtered.
 
-    `_is_a_bare_leaf` in `shim/serve.py` rejects a leading dot in both directions of
-    this pod's file traffic, so a dotted directory is excluded from ship-out by a rule
-    that already existed. Asserted here because the exclusion IS the reason for the
-    dot: a later reader tidying `.map` to `map` starts returning site-packages.
+    It used to sit at `<workspace>/.map/lib` and be excluded by the leading dot, which
+    `_is_a_bare_leaf` in `shim/serve.py` rejects in both directions of this pod's file
+    traffic. On scratch there is nothing to exclude: ship-out walks the workspace, and
+    this path is not under it, so no filter has to hold for a site-packages tree to
+    stay out of a tenant's deliverables.
+
+    Asserted as the containment fact rather than as the old leading dot, because a
+    later reader moving it back under the workspace would restore a filter dependency
+    this no longer has -- and would put every run-time install back on the network
+    mount, which is what ADR-037 moved it off.
     """
-    assert PACKAGE_DIR.startswith("."), (
-        "the package directory must be dotted or ship-out will return it"
+    assert is_strictly_under(PACKAGE_DIR, SCRATCH_ROOT)
+    assert not is_strictly_under(PACKAGE_DIR, WORKSPACE_ROOT), (
+        "the package directory is back inside the workspace, so every run-time install "
+        "crosses the network again and ship-out has to filter it out by name"
     )
 
 
@@ -219,3 +293,109 @@ def test_the_image_installs_a_pip_for_the_wrapper_to_run() -> None:
     sync = _DOCKERFILE.index("uv sync")
     install = _DOCKERFILE.index("uv pip install")
     assert install > sync, "pip is installed before the sync that would prune it"
+
+
+# --------------------------------------------------------------------------------------
+# The clause about where a large intermediate goes
+# --------------------------------------------------------------------------------------
+
+
+def test_every_cache_the_image_redirects_lands_on_pod_local_scratch() -> None:
+    """The half of ADR-037 that needs no compliance from the agent, checked whole.
+
+    A build tool picks its own output path and no instruction to the model reaches it,
+    so these variables are the only lever over `cargo build`, `npm install` and the
+    package caches. Each one pointing at scratch is what keeps those writes off the
+    network mount; one of them left out is a gigabyte of build output crossing NFS on
+    a Turn nobody will connect back to this file.
+
+    Asserted as an exact set, not as a subset, for the failure in the other direction:
+    a variable added here pointing at a path the sandbox cannot write turns a tool that
+    worked into one that fails, which is worse than not redirecting it at all. So a new
+    redirect has to be added to this list deliberately, and it has to name scratch.
+
+    `TMPDIR` is deliberately absent and its absence is a separate case --
+    `test_no_container_redirects_the_system_temporary_directory` in
+    `tests/control/test_compiled_config_floors.py` is what refuses it, in the image as
+    well as in the manifest.
+    """
+    redirected = {
+        name: value
+        for name, value in _image_env().items()
+        if value.startswith("/session/")
+    }
+
+    assert set(redirected) == {
+        "CARGO_TARGET_DIR",
+        "npm_config_cache",
+        "PIP_CACHE_DIR",
+        "UV_CACHE_DIR",
+        "GOCACHE",
+    }
+    for name, value in redirected.items():
+        assert is_strictly_under(value, SCRATCH_ROOT), f"{name} is not on scratch"
+
+
+def test_the_scratch_those_defaults_name_is_mounted_where_the_agent_runs() -> None:
+    """An environment default is a promise about a path, and this is the mount that
+    makes the path exist.
+
+    Without it every variable above names a directory on a read-only root: `npm
+    install` fails at its cache before it fetches anything, and the failure names a
+    path no skill's own text mentions. That is strictly worse than leaving the default
+    alone, which is why the mount and the variables are graded together.
+
+    On `agent-runtime` alone, and asserted as an exact set. It is the only container
+    that runs a confined command, and an `emptyDir` carries no sticky bit -- a second
+    mounting container is a second process able to unlink the first's files.
+    """
+    mounting = {
+        container["name"]
+        for container in _POD["spec"]["containers"] + _POD["spec"]["initContainers"]
+        for mount in container.get("volumeMounts", [])
+        if mount["mountPath"] == SCRATCH_ROOT
+    }
+
+    assert mounting == {"agent-runtime"}
+
+
+def test_the_scratch_the_contract_names_is_one_the_profile_lets_the_agent_write() -> (
+    None
+):
+    """**The clause and the kernel, compared.**
+
+    This is the case the whole scratch change turns on. The permission profile extends
+    `:read-only`, so a path is writable only where a rule says so -- and a contract
+    sending the model to a directory no rule covers, with build tools already pointed
+    there by the image, produces a Turn where every tool fails on a path the platform
+    itself chose. The model would have no way to tell that from its own mistake.
+    """
+    writable = session_profile().writable()
+
+    assert SCRATCH_ROOT in writable, (
+        "the contract names scratch and the profile does not make it writable"
+    )
+    assert f"{SCRATCH_ROOT}/" in workspace_contract()
+
+
+def test_the_contract_tells_the_model_the_bound_the_kubelet_will_enforce() -> None:
+    """**The one clause here whose cost is the Session rather than the deliverable.**
+
+    Every other promise in this contract degrades: an agent that ignores `out/` gets
+    its file shipped with scratch beside it. This one does not. Enforcement is
+    kubelet's periodic `du` with no filesystem-quota feature gate, so a write past the
+    limit does not return ENOSPC -- the pod is EVICTED, and `restartPolicy: Never`
+    means the Session ends there, mid-Turn, with whatever it had done.
+
+    So the number the model is told has to be the number the manifest declares. Told a
+    larger one it unpacks a dataset that kills its own Session; told none at all it has
+    no basis to decide not to.
+    """
+    volume = next(
+        volume
+        for volume in _POD["spec"]["volumes"]
+        if volume["name"] == _scratch_volume_name()
+    )
+
+    assert volume["emptyDir"]["sizeLimit"] == f"{SCRATCH_LIMIT_MEBIBYTES}Mi"
+    assert f"{SCRATCH_LIMIT_MEBIBYTES} MB" in workspace_contract()

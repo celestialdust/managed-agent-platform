@@ -1,20 +1,24 @@
 """MAP-A110: three calls take an engineer from nothing to an answer.
 
 Tier 1 (testcontainers, real PostgreSQL 17). The real app, the real adapters, one real
-database, and one scripted Agent Runtime.
+database, and one scripted Session-shim.
 
 What is real here and what is not is worth being exact about, because the scenario is a
 promise about the whole path. Real: the definition registry, the Session registry, the
-Event Log and its sequence, every route, the admission decision, the pod lookup, and the
-loop that turns runtime notifications into published events. Not real: the transport
-into the Session's pod. Nothing in this tree can open the Agent Runtime's unix socket
-inside another pod, so the channel is scripted -- and the scripted frames are written in
-the runtime's own shape, taken from the protocol source under `.reference/codex`, since
-a fake shaped to match the code certifies the code against itself.
+Event Log and its sequence, every route, the admission decision, the pod lookup, the
+dispatch the serving process is actually built with (`HttpPodDispatch`), and the loop
+that reads the pod's stream and appends what it carried. Scripted: the HTTP responses of
+the Session-shim, one layer below. The dispatch's `transport` is pointed at a handler
+that answers the shim's Turn route with the newline-delimited lines a shim streams, in
+the shape `session_shim/serve.py` publishes -- and that shape is closed at both ends, so
+a fake that drifted from the wire fails to parse here rather than passing.
 
-What that leaves unproven is named rather than implied: that a real pod answers these
-frames. Everything between the engineer's three calls and the events in the log is
-exercised.
+What that leaves unproven is named rather than implied: that a shim inside a real pod
+produces those bytes, having driven a real Agent Runtime over a unix socket to get them.
+The first half of that is graded against the real shim app in `tests/session_shim/
+test_shim_serves_a_turn.py`; the second is graded against a real pod on a real cluster
+by the live tier under `tests/pod/`. Everything between the engineer's three calls and
+the events in the log is exercised here.
 
 The scenario's Given has grown one item since it was signed. A Session now names a
 registered sandbox shape (`environment_id`), so a shape is registered here in setup
@@ -25,9 +29,10 @@ asserts exactly that by counting only what the engineer's own client sent.
 
 from __future__ import annotations
 
+import asyncio
+import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
-from typing import Any
 from uuid import UUID, uuid4
 
 import httpx
@@ -38,16 +43,28 @@ from managed_agent.composition import Platform, build
 from managed_agent.control.api.app import create_app
 from managed_agent.control.api.request.tenancy import TENANT_HEADER
 from managed_agent.control.pod_config.compiler import CompiledConfig
-from managed_agent.control.session.placement import Placement, PodBinding, PodPhase
-from managed_agent.control.session.turn_dispatch import PodRuntime, PodTurnDispatch
+from managed_agent.control.session.placement import Placement, PodPhase
 from managed_agent.core.ids import FIRST_SEQ, Seq, SessionId, TurnId
-from managed_agent.core.pod.repertoire import TurnStartRequest
 from managed_agent.core.vocabulary import turn
+from managed_agent.session_shim.pod_channel import HttpPodDispatch
 
-_ANSWER = "cohort size was reported in four of the seven papers"
+_PIECES = ("cohort size was reported ", "in four ", "of the seven papers")
+_ANSWER = "".join(_PIECES)
 _SHA = "0" * 39 + "a"
 _IMAGE = "registry.map.internal/session@sha256:" + "a" * 64
-_THREAD = "thread-inside-the-pod"
+_NAMESPACE = "map-sessions"
+_TOKEN_KEY = b"the key this deployment signs shim tokens with"
+_THREAD = "9f2a6c1e-0f4d-5b3a-8c17-2d5e7f10ab34"
+"""The thread id the shim attributes every event to, and it is the *platform's* own.
+
+A uuid rather than a readable name, because a uuid is the only shape this field ever
+carries on the wire: a shim publishes a `uuid5` it derived from the Agent Runtime's own
+thread string and never that string itself, which is how ADR-007 gets attribution and
+MAP-A10's no-runtime-identifier rule at the same time. Nothing here checks the
+derivation -- it happens in the pod, and the guard on it is
+`test_no_appended_payload_carries_a_runtime_identifier` in
+`tests/session_shim/test_turn_runner.py`.
+"""
 
 
 class RunningPods:
@@ -65,57 +82,79 @@ class RunningPods:
         return PodPhase.RUNNING
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("submitting a Turn tried to remove a pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
 
-class ScriptedRuntime:
-    """One Agent Runtime, answering one Turn in three deltas.
+class NeverPlaces:
+    """The `SessionPods` seam, refusing every call.
 
-    The frames are the runtime's, not this test's invention: `turn/started` and
-    `turn/completed` carry `{threadId, turn}` with the status on `turn`, and an agent
-    message delta carries its text at the top of the params beside three identifiers
-    that must not cross into a published event.
+    A Turn places its own pod only when the cluster reports ABSENT or GONE, and the
+    cluster above reports RUNNING for every pod. Refusing rather than recording makes
+    that a property this file asserts instead of one it merely happens to have: the
+    scenario is about three calls reaching an answer, and a placement quietly happening
+    underneath would mean the scripted shim was answering for a pod nobody in this file
+    decided existed. What a first Turn does about each phase is graded on its own in
+    `tests/control/test_a_first_turn_places_the_session_pod.py`.
+    """
+
+    async def ensure_for(self, session_id: SessionId) -> None:
+        raise AssertionError("submitting a Turn tried to place a pod")
+
+
+class ScriptedShim:
+    """The Session-shim's side of the Turn route: one Turn answered in three deltas.
+
+    The lines are the shim's own shape rather than this test's invention --
+    `session_shim/serve.py` publishes `TurnEventLine` and `TurnCompletedLine`, both
+    closed to unknown fields and to event types outside the four a Turn produces, and
+    the control plane validates every line against them. So a fake that drifted from
+    the wire fails to parse rather than passing.
+
+    The Turn id is read back out of the request rather than written as a literal beside
+    it. The platform mints that id at admission and a shim echoes it into every payload
+    it publishes; a literal here would let the two silently agree with each other and
+    disagree with the platform, which is the one thing the case below cannot check for
+    itself when it asserts the answer is filed under the Turn the caller was handed.
+
+    The completion line is separate from the `turn.completed` event, and both are sent.
+    They are different facts to the control plane: the event is what a tenant reads, and
+    the line is what tells the dispatch the Turn *ended* rather than the stream stopping
+    -- and only the second runs the ship-out seam.
     """
 
     def __init__(self) -> None:
-        self.started: list[TurnStartRequest] = []
+        self.turns: list[dict[str, object]] = []
 
-    async def start_turn(self, request: TurnStartRequest) -> str:
-        self.started.append(request)
-        return "runtime-turn-1"
+    @property
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self._answer)
 
-    async def notifications(self) -> AsyncIterator[dict[str, Any]]:
-        yield {
-            "method": "turn/started",
-            "params": {"threadId": _THREAD, "turn": {"id": "runtime-turn-1"}},
-        }
-        for piece in ("cohort size was reported ", "in four ", "of the seven papers"):
-            yield {
-                "method": "item/agentMessage/delta",
-                "params": {
-                    "threadId": _THREAD,
-                    "turnId": "runtime-turn-1",
-                    "itemId": "item-1",
-                    "delta": piece,
-                },
+    def _answer(self, request: httpx.Request) -> httpx.Response:
+        asked = json.loads(request.read())
+        self.turns.append(asked)
+        return httpx.Response(200, content=self._stream(str(asked["turn_id"])))
+
+    @staticmethod
+    def _stream(turn_id: str) -> bytes:
+        def event(type_: str, **fields: object) -> dict[str, object]:
+            return {
+                "kind": "event",
+                "type": type_,
+                "payload": {"turn_id": turn_id, "thread_id": _THREAD, **fields},
             }
-        yield {
-            "method": "turn/completed",
-            "params": {
-                "threadId": _THREAD,
-                "turn": {"id": "runtime-turn-1", "status": "completed"},
-            },
-        }
 
-
-class ScriptedChannel:
-    """Stands in for the transport into the pod, which does not exist."""
-
-    def __init__(self, runtime: ScriptedRuntime) -> None:
-        self.runtime = runtime
-
-    async def open(self, binding: PodBinding) -> PodRuntime:
-        return PodRuntime(connection=self.runtime, thread_id=_THREAD)
+        lines: list[dict[str, object]] = [event(turn.TURN_STARTED)]
+        lines += [event(turn.TURN_MESSAGE_DELTA, text=piece) for piece in _PIECES]
+        lines.append(event(turn.TURN_COMPLETED, text=_ANSWER))
+        lines.append({"kind": "completed"})
+        return "".join(json.dumps(line) + "\n" for line in lines).encode()
 
 
 class NothingToShip:
@@ -141,27 +180,37 @@ class CountingTransport(httpx.ASGITransport):
 
 
 @pytest.fixture
-async def wired(database_url: str) -> AsyncIterator[tuple[Platform, ScriptedRuntime]]:
-    """The real platform with the one seam that has no implementation scripted.
+async def wired(database_url: str) -> AsyncIterator[tuple[Platform, ScriptedShim]]:
+    """The real platform, with the pod's own HTTP responses scripted one layer down.
+
+    `build` already wired a dispatch, and it is replaced rather than reached into
+    because the process that runs this test is handed no `PodRunner` and so gets
+    `NoPodTransport` -- which refuses every Turn. What goes in its place is the same
+    `HttpPodDispatch` a placing deployment is built with, differing from it in the one
+    argument that exists to be different: `transport`, which points the Turn's HTTP
+    call at the scripted shim above instead of at a pod's DNS name.
 
     The engine is disposed here rather than left to garbage collection: it owns a pool
     of 50 connections against one `max_connections`, and a leaked one fails a later
     test rather than this one.
     """
     platform, engine = build(database_url)
-    runtime = ScriptedRuntime()
+    shim = ScriptedShim()
     try:
         yield (
             replace(
                 platform,
-                turn_dispatch=PodTurnDispatch(
-                    Placement(RunningPods()),
-                    ScriptedChannel(runtime),
-                    platform.event_log_append,
-                    NothingToShip(),
+                turn_dispatch=HttpPodDispatch(
+                    placement=Placement(RunningPods()),
+                    pods=NeverPlaces(),
+                    log=platform.event_log_append,
+                    on_completed=NothingToShip(),
+                    namespace=_NAMESPACE,
+                    token_key=_TOKEN_KEY,
+                    transport=shim.transport,
                 ),
             ),
-            runtime,
+            shim,
         )
     finally:
         await engine.dispose()
@@ -181,7 +230,7 @@ def _create_body(definition_id: str, environment_id: str) -> dict[str, object]:
     return {
         "definition_id": definition_id,
         "environment_id": environment_id,
-        "grant": ["fs.read"],
+        "grant": [],
         "scope": {"repository": "acme/widgets"},
         "budget_minor_units": 500,
         "budget_currency": "USD",
@@ -190,10 +239,10 @@ def _create_body(definition_id: str, environment_id: str) -> dict[str, object]:
 
 
 async def test_registering_opening_and_sending_reaches_a_domain_answer(
-    wired: tuple[Platform, ScriptedRuntime],
+    wired: tuple[Platform, ScriptedShim],
 ) -> None:
     """MAP-A110, end to end, with the engineer's calls counted rather than trusted."""
-    platform, runtime = wired
+    platform, shim = wired
     app = create_app(platform)
     tenant = str(uuid4())
     headers = {TENANT_HEADER: tenant}
@@ -240,6 +289,13 @@ async def test_registering_opening_and_sending_reaches_a_domain_answer(
 
         reached_in = list(transport.calls)
 
+        # The 202 above means the Turn was accepted, not that it finished -- it runs on
+        # a task the request never awaited. So the answer is waited for here, which is
+        # what a tenant does too: they hold the event stream open. Awaiting the tasks
+        # directly rather than polling because this test drives the app on its own
+        # event loop, so the Turn is running on the same loop as this line.
+        await asyncio.gather(*platform.background_turns.in_flight)
+
         # Reading the answer back is an observation, not a step towards it. Counted
         # after the fact so the three calls above stand on their own.
         page = await engineer.get(f"/v1/sessions/{session_id}/events?from_seq=1")
@@ -272,56 +328,17 @@ async def test_registering_opening_and_sending_reaches_a_domain_answer(
     assert completed["payload"]["turn_id"] == turn_id, (
         "the answer is filed under a different Turn than the one the caller was given"
     )
-    assert runtime.started[0].input[0].text == (
-        "How many papers reported a cohort size?"
+    assert shim.turns[0]["prompt"] == "How many papers reported a cohort size?", (
+        "the engineer's own words did not reach the pod the Turn was carried to"
+    )
+    assert shim.turns[0]["turn_id"] == turn_id, (
+        "the pod was asked to run a Turn under an id other than the one the caller was "
+        "given, so nothing the pod streams back can be filed against their submission"
     )
 
 
-async def test_the_engineer_reads_no_runtime_identifier_anywhere(
-    wired: tuple[Platform, ScriptedRuntime],
-) -> None:
-    """MAP-A10 over the one path that touches the runtime.
-
-    Every frame the runtime sent carried its thread id, its own turn id and an item id.
-    None of the three may appear in anything the tenant can read -- and this is the
-    only test in the suite where a real Turn's events have been through the mapping
-    with real runtime identifiers present to leak.
-    """
-    platform, _ = wired
-    app = create_app(platform)
-    headers = {TENANT_HEADER: str(uuid4())}
-
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app),
-        base_url="http://platform",
-        headers=headers,
-    ) as caller:
-        registered = await caller.post(
-            "/v1/environments",
-            json={"name": "slr-sandbox", "runtime_image": _IMAGE, "denied_paths": []},
-        )
-        environment_id = str(registered.json()["id"])
-        defined = await caller.post("/v1/agents", json=_definition_body())
-        created = await caller.post(
-            "/v1/sessions",
-            json=_create_body(defined.json()["id"], environment_id),
-        )
-        session_id = created.json()["id"]
-        await caller.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"prompt": "How many papers reported a cohort size?"},
-            headers={"Idempotency-Key": "engineer-first-turn"},
-        )
-        page = await caller.get(f"/v1/sessions/{session_id}/events?from_seq=1")
-
-    body = page.text
-    assert _THREAD not in body
-    assert "runtime-turn-1" not in body
-    assert "item-1" not in body
-
-
 async def test_a_retried_submission_does_not_run_the_turn_a_second_time(
-    wired: tuple[Platform, ScriptedRuntime],
+    wired: tuple[Platform, ScriptedShim],
 ) -> None:
     """MAP-A9's idempotency half, over the real sequence rather than a fake one.
 
@@ -357,6 +374,12 @@ async def test_a_retried_submission_does_not_run_the_turn_a_second_time(
     assert first.status_code == 202
     assert second.status_code == 200, second.text
     assert second.json() == first.json()
+
+    # Both submissions are answered before the Turn runs, so "the retry ran nothing" is
+    # a claim about tasks that are still in flight at this line. Awaited, not slept on:
+    # exactly one Turn must reach completion, and a count taken early would read zero
+    # for the right answer and one for the wrong one at the wrong moment.
+    await asyncio.gather(*platform.background_turns.in_flight)
 
     written = await platform.event_log_range.read(
         SessionId(UUID(str(created.json()["id"]))), FIRST_SEQ, Seq(100), limit=100

@@ -7,6 +7,7 @@ is misconfigured. These tests run ruff against a module written to break the rul
 against one allowed to bend it, so the ban is graded in both directions.
 """
 
+import ast
 import subprocess
 import sys
 import tomllib
@@ -31,9 +32,21 @@ def _ruff(*args: str) -> subprocess.CompletedProcess[str]:
     exactly the environment whose result cannot be trusted. `subprocess.run` raises
     FileNotFoundError on its own, loudly, which is the behaviour wanted. The dev extra
     declares ruff, so a machine without it has a broken checkout, not a special case.
+
+    `--no-cache` is applied here rather than at the call sites, for the same reason the
+    paragraph above gives. Ruff keys its cache on file metadata, so a checkout whose
+    `.ruff_cache` was written under other conditions -- a worktree, a rebase, an
+    interrupted run -- hands back a stale pass for a file that breaks a rule right now.
+    That happened: this file's whole-tree check reported green on a tree where
+    `ruff check --no-cache` found an unsorted import block, in a file byte-identical to
+    the one a second checkout failed on. A guard that can return a false green is worse
+    than no guard, because the green is what stops anybody looking. It goes on the
+    helper so a call site added later cannot forget it, and after the subcommand
+    because ruff rejects it before one.
     """
+    subcommand, *rest = args
     return subprocess.run(
-        ["ruff", *args],
+        ["ruff", subcommand, "--no-cache", *rest],
         capture_output=True,
         text=True,
         cwd=_ROOT,
@@ -86,7 +99,25 @@ def test_ruff_permits_the_adapter_package_to_name_infrastructure() -> None:
 
 
 def test_ruff_passes_over_the_whole_tree() -> None:
+    """Every file ruff can see is clean, decided fresh -- see `_ruff` on the cache."""
     result = _ruff("check", ".")
+    assert result.returncode == 0, result.stdout or result.stderr
+
+
+def test_the_whole_tree_is_formatted_as_ruff_would_format_it() -> None:
+    """`ruff format` is a separate command from `ruff check`, and nothing ran it.
+
+    The lint gate beside this one passes over an unformatted file, because formatting is
+    not a lint rule -- so three files were committed in a shape `ruff format` would
+    rewrite, and the drift surfaced only when somebody happened to run the formatter
+    against the whole tree instead of the paths they had edited. That is the failure
+    this closes: the gate now grades the same tree the formatter does, rather than
+    whichever paths a developer thought to name.
+
+    `--check` rather than `--diff`, because the assertion needs the file names and not
+    the rewrite; `result.stdout` carries them.
+    """
+    result = _ruff("format", "--check", ".")
     assert result.returncode == 0, result.stdout or result.stderr
 
 
@@ -263,3 +294,85 @@ def test_the_lockfile_is_in_step_with_the_manifest() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stdout or result.stderr
+
+
+_KEY_MATERIAL_NAMES = (
+    "ca.key",
+    "ca.crt",
+    "tls.key",
+    "server.pem",
+    "client.p12",
+    "bundle.pfx",
+)
+
+
+def test_no_private_key_can_be_committed_from_the_repository_root() -> None:
+    """Every shape of key material this repo produces is ignored, and none is tracked.
+
+    The internal CA's private key is minted by a command that writes it to the
+    repository root, which puts it one `git add -A` away from history -- and a private
+    key that reaches history is a key that must be rotated, not one that can be
+    removed, because every clone already has it. The `.gitignore` entries are the
+    guard; this is what stops them being deleted by somebody who cannot see what they
+    were for.
+
+    Asked of `git check-ignore` rather than by reading the file, so the assertion is
+    about the decision git actually makes -- a later negation (`!ca.crt`) further down
+    the file would pass a text search and fail here, which is the right way round.
+
+    The second half is the other direction and is not redundant: an ignore rule that
+    happened to cover a file already tracked would silently do nothing, because git
+    ignores nothing it is already following.
+    """
+    for name in _KEY_MATERIAL_NAMES:
+        decided = subprocess.run(
+            ["git", "check-ignore", "-q", name],
+            cwd=_ROOT,
+            check=False,
+        )
+        assert decided.returncode == 0, f"{name} at the repository root is not ignored"
+
+    tracked = subprocess.run(
+        ["git", "ls-files"],
+        capture_output=True,
+        text=True,
+        cwd=_ROOT,
+        check=True,
+    ).stdout.splitlines()
+    suffixes = {".key", ".pem", ".crt", ".p12", ".pfx"}
+    carrying = [path for path in tracked if Path(path).suffix in suffixes]
+    assert carrying == [], f"key material is tracked: {carrying}"
+
+
+def test_every_live_case_that_places_a_pod_signs_it_with_the_clusters_ca() -> None:
+    """No live case builds a pod runner without handing it an internal CA.
+
+    `KubernetesPodRunner.from_manifest_file` defaults `internal_ca` to `None`, which is
+    correct for the platform -- a deployment with no CA material places pods that serve
+    plain HTTP. It is wrong for a case running against a cluster that *does* hold CA
+    material: the pod comes up on plain HTTP while the dial, reading the deployed
+    Secret, speaks TLS at it. The handshake dies as `record layer failure`, which names
+    neither the placement nor the dial and points at neither file.
+
+    Read out of the syntax rather than by running anything, because the failure only
+    reproduces against a live cluster holding a CA -- which is exactly the environment
+    an offline suite does not have.
+    """
+    live_tier = _ROOT / "tests" / "pod"
+    placements = 0
+    for module in sorted(live_tier.glob("*.py")):
+        for node in ast.walk(ast.parse(module.read_text())):
+            if not isinstance(node, ast.Call):
+                continue
+            called = node.func
+            if not isinstance(called, ast.Attribute):
+                continue
+            if called.attr != "from_manifest_file":
+                continue
+            placements += 1
+            named = {keyword.arg for keyword in node.keywords}
+            assert "internal_ca" in named, (
+                f"{module.name} builds a pod runner without `internal_ca`, so the pod "
+                "it places serves plain HTTP while `shim_dial` speaks TLS at it"
+            )
+    assert placements, "no live case places a pod any more; delete this guard"

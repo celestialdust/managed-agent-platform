@@ -23,33 +23,33 @@ reach a Session (ADR-003).
 """
 
 from enum import StrEnum
-from typing import Annotated, Final, Literal, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-MAX_QUALIFIED_TOOL_NAME_BYTES: Final[int] = 128
-"""The Agent Runtime's own ceiling on the qualified name it shows a model."""
-
-QUALIFICATION_RESERVE_BYTES: Final[int] = 32
-"""Held back from that ceiling for the `mcp__<server>__` prefix it prepends."""
-
-MAX_TOOL_NAME_BYTES: Final[int] = (
-    MAX_QUALIFIED_TOOL_NAME_BYTES - QUALIFICATION_RESERVE_BYTES
+from managed_agent.core.registration.advertised_name import pair_fits_the_budget
+from managed_agent.core.registration.tool_names import (
+    MAX_QUALIFIED_TOOL_NAME_BYTES,
+    MAX_TOOL_NAME_BYTES,
+    QUALIFICATION_RESERVE_BYTES,
+    ServerName,
+    ToolName,
+    qualification_fits,
 )
 
-_TOOL_NAME_PATTERN: Final[str] = rf"^[a-z][a-z0-9_]{{0,{MAX_TOOL_NAME_BYTES - 1}}}$"
-
-ToolName = Annotated[str, Field(pattern=_TOOL_NAME_PATTERN)]
-"""The name a Grant names and the Tool Gateway advertises.
-
-Lowercase only, though the sanitizer would preserve uppercase: it keeps `Search` and
-`search` apart as two names, so allowing both would let a Grant written against one
-silently miss the other. The character class is ASCII, so the pattern's length limit and
-the byte limit are the same number and neither needs encoding to check.
-"""
-
-ServerName = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_-]{0,62}$")]
-"""The name an agent definition names a server by. Unique within one tenant."""
+__all__ = [
+    "MAX_QUALIFIED_TOOL_NAME_BYTES",
+    "MAX_TOOL_NAME_BYTES",
+    "QUALIFICATION_RESERVE_BYTES",
+    "ServerName",
+    "ToolName",
+    "qualification_fits",
+]
+"""Re-exported from `tool_names`, which holds them so that `advertised_name` can reach
+them without importing this module -- this one imports that one. The names stay
+importable from here because every caller in the tree already reaches them here, and a
+move that renamed the import path would be a change to files that are not otherwise
+part of this one."""
 
 HeaderName = Annotated[str, Field(pattern=r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$")]
 """The name of the request header a credential is attached under.
@@ -64,18 +64,6 @@ refuses an illegal header name at serialization and httpx surfaces that as a tra
 error -- so what the asymmetry cost was not an injection but a registration that can
 never work, failing on every tool call instead of once at the moment it was written.
 """
-
-
-def qualification_fits(runtime_facing_server_name: str) -> bool:
-    """Whether `mcp__<name>__` fits the reserve held back above.
-
-    The Agent Runtime is configured with exactly one MCP server, the Tool Gateway, and
-    whatever name the compiled configuration gives it is what consumes this reserve.
-    Stating the arithmetic as a function means the compiler checks it against the same
-    number the names were bounded by, rather than carrying a copy of that number.
-    """
-    qualified = f"mcp__{runtime_facing_server_name}__"
-    return len(qualified.encode()) <= QUALIFICATION_RESERVE_BYTES
 
 
 class StdioServer(BaseModel):
@@ -267,17 +255,60 @@ class ServerRegistration(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _every_tool_can_be_advertised_under_this_server_name(self) -> Self:
+        """Refuse a tool whose name, joined to this server's, outruns the byte budget.
+
+        Checked on the pair and not on either name alone, which is the whole reason it
+        is a validator rather than a longer pattern. The two names are bounded
+        separately at 63 and 96 bytes, and the budget is 96 for the join -- so bounding
+        them independently would mean numbers that add up in the worst case, and the
+        worst case is a 63-byte server name leaving 31 bytes for every tool behind it.
+        Checking the sum costs a long server name nothing but shorter tool names.
+
+        Here rather than in the Gateway because this is the last point at which anybody
+        can act on it. A registration that got past this would sit in the store as a
+        tool the Gateway can never advertise -- present in a listing, absent from the
+        model, with no error anywhere naming why.
+        """
+        too_long = sorted(
+            tool.name
+            for tool in self.tools
+            if not pair_fits_the_budget(self.server_name, tool.name)
+        )
+        if too_long:
+            raise ValueError(
+                f"these tool names do not fit the {MAX_TOOL_NAME_BYTES}-byte budget "
+                f"once joined to the server name {self.server_name!r}: "
+                f"{', '.join(too_long)}"
+            )
+        return self
+
 
 class RegisteredTool(BaseModel):
     """What the registry hands back: one tool, with the server it lives behind.
 
     Parsed on the way out of the store as well as on the way in, so a row written under
     an older shape reaches the Tool Gateway as a checked value or not at all.
+
+    Three names, and they are three because three different parties choose them.
+    `remote_name` is the server's own; `name` is the tenant's, unique only within that
+    server; `advertised_name` is what the model is shown, unique across the tenant, and
+    equals `advertised_name_for(server_name, name)` -- stored rather than recomputed
+    here so the store's uniqueness index is over the same bytes the Gateway resolves
+    against, with no chance of the two disagreeing.
+
+    Typed `str` rather than `AdvertisedToolName` for one reason worth stating: the
+    pattern bounds the *joined* length, and a row whose two halves were legal when it
+    was written must still be readable if that bound ever tightens. A read that refused
+    it would take the tool away from a tenant who could not have known; registration is
+    where the bound is enforced, and that is where it can still be acted on.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     name: ToolName
+    advertised_name: str
     remote_name: str
     parameters: dict[ParameterName, ParameterType]
     scope_bindings: tuple[ScopeBinding, ...]

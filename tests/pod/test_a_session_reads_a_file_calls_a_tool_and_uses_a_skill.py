@@ -62,6 +62,7 @@ from cluster_access import NAMESPACE, forwarded, kubectl
 from managed_agent.control.api.request.tenancy import TENANT_HEADER
 from managed_agent.control.session.placement import pod_name_for
 from managed_agent.core.ids import SessionId
+from managed_agent.core.registration.advertised_name import advertised_name_for
 
 _GATE: Final = "MAP_CLUSTER_TESTS"
 _CONTROL_PLANE: Final = "deploy/control-plane"
@@ -221,17 +222,21 @@ def _skill_md(nonce: str) -> str:
     )
 
 
-def _prompt(name: str) -> str:
+def _prompt(name: str, tool: str) -> str:
     """Three numbered demands, one per leg, each asking for something quotable.
 
     Numbered and explicit because a vague prompt makes a failed leg ambiguous: an agent
     that was never told to call the tool has not shown the tool is unreachable.
+
+    `tool` is passed in rather than spelled here, because what the model is shown is the
+    server and the tool joined -- the bare registered name reaches it as nothing, and
+    the agent reports a tool that is not available rather than a tool that failed.
     """
     return (
         "Three things, in order, and report each one.\n"
         f"1. List the directory ./files/ and read {name}. Quote the reference code it "
         "contains, exactly as written.\n"
-        f"2. Call the {_TOOL} tool with the question 'What transport does the Python "
+        f"2. Call the {tool} tool with the question 'What transport does the Python "
         "SDK use for streamable HTTP?' and quote one sentence of its answer.\n"
         "3. Follow your brief-summary skill to summarise the document you read.\n"
     )
@@ -282,11 +287,14 @@ def _created(answered: httpx.Response) -> dict[str, Any]:
     return body
 
 
-def _register(base: str, tenant_id: str, image: str, run: str) -> tuple[SessionId, str]:
+def _register(
+    base: str, tenant_id: str, image: str, run: str
+) -> tuple[SessionId, str, str]:
     """Upload the file and the skill, register the server, and create the Session.
 
-    Returns the Session's id and the file's name as the workspace will hold it, because
-    the prompt has to name that file and this is the one place that knows it.
+    Returns the Session's id, the file's name as the workspace will hold it, and the
+    name the model will see for the tool -- all three because the prompt has to name
+    them and this is the one place that knows any of them.
 
     Everything goes through the REST API and nothing touches the database or the
     cluster.
@@ -325,6 +333,7 @@ def _register(base: str, tenant_id: str, image: str, run: str) -> tuple[SessionI
         )
         assert registered.status_code in (200, 201), registered.text
         server_name = registered.json().get("server_name", f"deepwiki-{run.lower()}")
+        advertised = advertised_name_for(server_name, _TOOL)
 
         environment = _created(
             caller.post(
@@ -357,7 +366,7 @@ def _register(base: str, tenant_id: str, image: str, run: str) -> tuple[SessionI
                     "definition_id": definition["id"],
                     "environment_id": environment["id"],
                     "file_ids": [file_id],
-                    "grant": [_TOOL],
+                    "grant": [advertised],
                     "scope": {"repo": _REPO_IN_SCOPE},
                     "budget_minor_units": 500_000,
                     "budget_currency": "USD",
@@ -365,7 +374,7 @@ def _register(base: str, tenant_id: str, image: str, run: str) -> tuple[SessionI
                 },
             )
         )
-        return SessionId(UUID(session["id"])), name
+        return SessionId(UUID(session["id"])), name, advertised
 
 
 def _submit(base: str, tenant_id: str, session_id: SessionId, prompt: str) -> None:
@@ -438,9 +447,9 @@ def run() -> Iterator[_Run]:
     tenant_id = str(uuid4())
     image = _session_image()
     with forwarded(_CONTROL_PLANE, _CONTROL_PLANE_PORT) as base:
-        session_id, name = _register(base, tenant_id, image, doc_nonce)
+        session_id, name, tool = _register(base, tenant_id, image, doc_nonce)
         try:
-            _submit(base, tenant_id, session_id, _prompt(name))
+            _submit(base, tenant_id, session_id, _prompt(name, tool))
             events = _await_terminal(base, tenant_id, session_id)
             yield _Run(
                 session_id=session_id,

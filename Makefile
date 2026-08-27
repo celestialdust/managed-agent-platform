@@ -77,8 +77,17 @@ test: ## The offline suite -- needs a Docker daemon, no cluster, no AWS
 
 # Not part of `check`, and it must not become part of it: this tier places real pods in
 # a real cluster and costs minutes and money. `make gates` lists what else it turns on.
+#
+# MAP_NAMESPACE is set here, and it must never be `map-dev`. The live tier creates the
+# namespace it is given and DELETES IT WHOLE in teardown, which is right for a scratch
+# namespace and would take the control plane, both gateways, the signing Secret and the
+# workspace claim with it in the platform's own. Set here rather than inherited from the
+# operator's shell, where it is almost certainly already `map-dev` because that is what
+# every other target in this file wants. The guard that refuses the platform's namespace
+# is in tests/adapters/test_pod_runner.py; this line is what keeps the guard from firing
+# on an honest run.
 test-live: ## The tier that talks to the live cluster (needs AWS credentials)
-	MAP_CLUSTER_TESTS=1 $(PYTEST)
+	MAP_CLUSTER_TESTS=1 MAP_NAMESPACE=map-live-tests $(PYTEST)
 
 check: lint format-check types residue test ## Every gate, in the order CI runs them
 	@echo "all gates passed"
@@ -124,12 +133,35 @@ deploy-tool-gateway: ## Roll the Tool Gateway
 deploy-model-gateway: ## Roll the Model Gateway
 	uv run python deploy/platform.py model-gateway
 
-# The order is not arbitrary and is not modelled anywhere else. The image has to be in
-# the registry before a manifest can name its digest. `bootstrap` creates the namespace
-# and the identities the workloads run as. The control plane carries the schema
-# migration Job, and the Tool Gateway reads tables that Job creates -- so it goes
-# second. The Model Gateway depends on neither and goes last.
-deploy: image bootstrap deploy-control-plane deploy-tool-gateway deploy-model-gateway ## Everything, in order: image, cluster objects, three workloads
+# Everything `deploy` needs that it can check before spending anything, checked here so
+# that it does. This is not `preflight`: that one asks whether the platform is already
+# up -- it requires namespace map-dev, which `deploy` creates in `bootstrap` -- so a
+# first deploy of a fresh cluster cannot depend on it.
+#
+# One entry today, and it earned the target on 2026-08-26. `MAP_FOUNDRY_RESOURCE` is
+# read at the LAST step of the chain and is knowable at the first, so an unset one built
+# the platform image, pushed it to three repositories, and rolled the control plane and
+# the Tool Gateway before refusing -- leaving two workloads on the new image and one on
+# the old, which is the state a deploy exists to avoid. The refusal itself is right and
+# lives in `deploy/platform.py`: a Foundry resource names one company's Azure account,
+# so it cannot be defaulted or derived, and a wrong one sends a tenant's prompts to
+# somebody else's endpoint. Only its timing was wrong.
+deploy-inputs: ## Check what a deploy needs before it spends anything
+	@test -n "$(MAP_FOUNDRY_RESOURCE)" || { \
+	  echo "MAP_FOUNDRY_RESOURCE is unset, and the Model Gateway's routing table needs" >&2; \
+	  echo "it -- so this deploy would refuse at its last step, after the image was" >&2; \
+	  echo "built and pushed and two workloads had already rolled. Set it to the Azure" >&2; \
+	  echo "Foundry resource name alone, not the whole host. See deploy/platform.py's" >&2; \
+	  echo "with_foundry for why it has no default." >&2; \
+	  exit 1; }
+	@echo "deploy inputs ok"
+
+# The order is not arbitrary and is not modelled anywhere else. Inputs are checked before
+# anything is spent. The image has to be in the registry before a manifest can name its
+# digest. `bootstrap` creates the namespace and the identities the workloads run as. The
+# control plane carries the schema migration Job, and the Tool Gateway reads tables that
+# Job creates -- so it goes second. The Model Gateway depends on neither and goes last.
+deploy: deploy-inputs image bootstrap deploy-control-plane deploy-tool-gateway deploy-model-gateway ## Everything, in order: image, cluster objects, three workloads
 	@echo "the platform is serving; run 'make test-live' to exercise it"
 
 # ------------------------------------------------------------------ infrastructure

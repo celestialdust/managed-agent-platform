@@ -369,7 +369,14 @@ class _AbsentPod:
         raise AssertionError("a test in this file located a pod")
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("a test in this file removed a pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
 
 def test_the_scan_finds_at_least_one_manifest_wiring_the_placer() -> None:

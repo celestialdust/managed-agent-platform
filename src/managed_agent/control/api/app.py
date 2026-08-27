@@ -32,9 +32,11 @@ from managed_agent.control.api.routes import (
     skills,
     skills_eval,
     stream,
+    tool_results,
     turns,
     vaults,
     webhooks,
+    workspace,
 )
 
 
@@ -81,6 +83,15 @@ def create_app(platform: Platform) -> FastAPI:
     app.include_router(session_list.router, prefix="/v1")
     app.include_router(resources.router, prefix="/v1")
     app.include_router(artifacts.router, prefix="/v1")
+    # Beside `artifacts` because the two answer questions a reader will mistake
+    # for each other, and the mistake is cheapest to correct here. `artifacts`
+    # answers what the agent DECLARED as output: sealed, digestible, enumerated
+    # by the Event Log, and still true when a tenant re-checks it next year.
+    # This answers what is on disk RIGHT NOW: mutable, live, promising nothing
+    # beyond the moment it was read. Neither can be derived from the other, and
+    # a route that tried to serve both would have to weaken the first one's
+    # promise to do it. ADR-038.
+    app.include_router(workspace.router, prefix="/v1")
     app.include_router(events.router, prefix="/v1")
     app.include_router(files.router, prefix="/v1")
     app.include_router(skills.router, prefix="/v1")
@@ -88,6 +99,7 @@ def create_app(platform: Platform) -> FastAPI:
     app.include_router(stream.router, prefix="/v1")
     app.include_router(webhooks.router, prefix="/v1")
     app.include_router(turns.router, prefix="/v1")
+    app.include_router(tool_results.router, prefix="/v1")
     app.include_router(audit.router, prefix="/v1")
     # Beside `audit` because it shares that surface's two dependencies: a
     # reviewer principal read from a presented token, then authorized from the

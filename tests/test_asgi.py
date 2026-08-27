@@ -14,6 +14,7 @@ afterwards.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from uuid import uuid4
 
@@ -140,6 +141,54 @@ class _Spy:
     async def dispose(self) -> None:
         self._calls.append("dispose")
         await self._engine.dispose()
+
+
+async def test_shutdown_stops_the_turns_still_running_in_this_process(
+    monkeypatch: pytest.MonkeyPatch, database_url: str
+) -> None:
+    """The lifespan cancels in-flight Turns *and* waits for each one to stop.
+
+    A Turn no longer ends inside the request that submitted it, so at shutdown there
+    can be tasks mid-Turn that nothing else is holding. Cancelling without awaiting
+    would let the process exit with one of them still pending, which asyncio reports as
+    "Task was destroyed but it is pending" -- so this asserts the task is *done* on the
+    way out, not merely that `cancel` was called.
+
+    Asserted here rather than only on `BackgroundTurns` itself, because a unit test of
+    that class passes whether or not `asgi.py` ever calls it: an installed hook and an
+    invoked one are indistinguishable from outside unless something drives the lifespan.
+    """
+    held: list[Any] = []
+
+    def _capturing_build(
+        url: str | None = None, pod_runner: PodRunner | None = None
+    ) -> tuple[Any, Any]:
+        platform, engine = build(database_url, pod_runner=pod_runner)
+        held.append(platform)
+        return platform, engine
+
+    monkeypatch.setattr(asgi, "build", _capturing_build)
+    _the_sweep_interval(monkeypatch)
+    app = asgi.build_app()
+    (platform,) = held
+
+    async def a_turn_that_never_ends() -> None:
+        await asyncio.sleep(3600)
+
+    async with asgi_shutdown(app):
+        platform.background_turns.start(
+            a_turn_that_never_ends(), name="map-turn-under-test"
+        )
+        (running,) = platform.background_turns.in_flight
+        assert not running.done(), "the Turn stopped while the app was still serving"
+
+    assert running.done(), (
+        "shutdown returned with a Turn's task still pending. `asgi.py` must both "
+        "cancel and await it -- a cancel only requests the stop, and a process that "
+        "exits without waiting leaves the Turn half-done."
+    )
+    assert running.cancelled()
+    assert platform.background_turns.in_flight == ()
 
 
 class asgi_shutdown:  # noqa: N801 -- reads as a context manager at the call site

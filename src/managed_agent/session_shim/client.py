@@ -33,6 +33,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 from websockets.asyncio.client import ClientConnection, unix_connect
+from websockets.exceptions import ConnectionClosed
 
 from managed_agent.control.pod_config.compiler import CONTROL_SOCKET
 from managed_agent.core.pod.repertoire import (
@@ -309,6 +310,15 @@ class RuntimeConnection:
         The connection is passed in rather than read off the instance so this task
         cannot observe a half-built state: it is created after the socket is open and
         it holds the socket it was created for.
+
+        **The socket ending is this task's ordinary terminal condition, not an error.**
+        It used to escape, and nobody awaits this task except `close`, so the only
+        place it could surface was there -- inside the shim's lifespan shutdown, which
+        then failed with `Application shutdown failed. Exiting.` and tore the process
+        down hard. That cut the response stream the control plane was still reading and
+        reported a Turn that had done its work as `runtime_lost`. Callers waiting on a
+        call are not left in the dark by swallowing it: the `finally` below is what
+        tells them, and it says the same thing either way.
         """
         try:
             async for frame in conn:
@@ -343,5 +353,7 @@ class RuntimeConnection:
                             method, int(error.get("code", 0)), str(error.get("message"))
                         )
                     )
+        except ConnectionClosed:
+            return
         finally:
             self._fail_pending("the control socket closed under an in-flight call")

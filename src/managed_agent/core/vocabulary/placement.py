@@ -7,13 +7,16 @@ aggregate at `GET /v1/capacity` answers it for an operator; these two answer it 
 the one Session whose latency somebody is actually experiencing, on the stream that
 Session's tenant already reads, with no operator credential involved.
 
-**Its own family rather than `lifecycle`, and the reason is mechanical.** Two things
-key off that family string. `webhook_dispatcher.LIFECYCLE_TYPES` is every published
-name whose family is `lifecycle`, so a type declared there is delivered to every
-tenant's registered callback -- and placing is a stream signal, not something to post
-to somebody's endpoint. And every lifecycle-family type is required to have a row in
-`projection._TRANSITIONS`, which placing must not have: a Session waiting for a pod is
-still `RUNNING`, so a transition for it would move a state that did not move.
+**Its own family rather than `lifecycle`, and the reason is mechanical.** Every
+lifecycle-family type is required to have a row in `projection._TRANSITIONS`, which
+placing must not have: a Session waiting for a pod is still `RUNNING`, so a transition
+for it would move a state that did not move. Its own family also keeps it away from the
+mistake next door -- the lifecycle types are the four a tenant may point a callback at,
+and a placement type declared among them invites being marked deliverable, which would
+post one callback per pod start to every registered endpoint.
+
+That marking, not the family, is what the webhook tail now reads: `declare(...,
+webhook=True)` is the gate, and this family declares nothing with it.
 
 Published, which is what makes either fact reach a tenant at all. The package's
 registry discovers the modules in this directory at import and keys the published set

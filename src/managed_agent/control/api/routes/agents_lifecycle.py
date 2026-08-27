@@ -195,8 +195,18 @@ class AgentUpdate(AgentDefinition):
         fields, and a stored body carrying a stray `version` key would be refused by
         every later read of it. The failure would surface as an agent that cannot be
         read back, far from the update that wrote it.
+
+        Iterating the model rather than dumping it, because `model_dump()` serialises
+        and `skills` is a `frozenset[SkillAttachment]`: dumping turns each attachment
+        into a `dict` and then tries to rebuild the set from them, which raises
+        `TypeError: unhashable type: 'dict'`. An update attaching no skill dumps an
+        empty set and never hashes anything, so the bug is invisible until a caller
+        attaches one. Iteration yields the field values as they are -- the attachments
+        stay models, and `model_validate` passes them straight through.
         """
-        return AgentDefinition.model_validate(self.model_dump(exclude={"version"}))
+        return AgentDefinition.model_validate(
+            {name: value for name, value in self if name != "version"}
+        )
 
 
 def _as_agent(record: AgentRecord, archived_at: datetime | None) -> Agent:
@@ -206,13 +216,22 @@ def _as_agent(record: AgentRecord, archived_at: datetime | None) -> Agent:
     route knows a newer answer than its own pre-read did: it has just written the
     retirement, or absorbed a repeat and been handed the original timestamp. Every other
     caller passes the record's own value.
+
+    `dict(record.definition)` and not `model_dump()`, for the reason spelled out in
+    `AgentUpdate.as_definition`: dumping a `frozenset[SkillAttachment]` rebuilds the set
+    out of dicts and raises `TypeError: unhashable type: 'dict'`. Both read routes go
+    through here, so that raised a 500 for every definition attaching a skill -- and the
+    listing failed whole rather than per row, leaving a tenant holding one such agent
+    unable to read any of them. Iteration hands over the field values untouched, and
+    `Agent` declares the same fields it inherits from `AgentDefinition`, so they
+    validate as themselves.
     """
     return Agent(
         id=record.definition_id,
         version=record.version,
         created_at=record.created_at,
         archived_at=archived_at,
-        **record.definition.model_dump(),
+        **dict(record.definition),
     )
 
 

@@ -1,28 +1,34 @@
-"""A file attached to a Session that is already running, and the agent reads it.
+"""A file attached to a Session between two Turns, and the next Turn's agent reads it.
 
 Skipped unless MAP_CLUSTER_TESTS=1. SKIPPED MEANS NOTHING RAN -- no pod was placed, no
 model was called, and nothing here is evidence of anything on that run.
 
-`POST /v1/sessions/{id}/resources` has a branch no offline test can reach. A Session
-that has completed a Turn holds a pod, so the route pushes the bytes down the
-authenticated hop before it appends anything -- and `build` wires the real placement
-object only where a pod runner is configured, which an offline test never has. Every
-offline case is therefore the no-pod branch or the refusal that proves the push is
-attempted first. This is the case where a file actually arrives.
+`POST /v1/sessions/{id}/resources` appends `session.file_attached` and pushes no bytes
+anywhere. What delivers them is the next Turn's placement, which folds every such event
+out of the Session's log and writes the whole set into the workspace after the pod is
+ready and before the agent is given an instruction. A pod is leased for exactly one Turn
+and given back when that Turn ends, so a Session sitting between Turns owns no pod for
+anything to push into and that fold is the only delivery path there is (ADR-041).
 
-**The witness is the agent, because nothing else can be.** The pod has no exec and no
-attach -- there are zero call sites for either in `src/` -- and its own listing route
-serves the output directory rather than the input one. So the only reader of `./files/`
-outside the container is the model inside it, and the proof that bytes arrived is a
-token the model could not have produced any other way: the nonce is generated here, is
-in the file's *contents* and not its name, and the file itself is uploaded after the
-first Turn has already ended.
+Offline tests can see the append and every refusal, because each of those is decided by
+folding the log. What they cannot see is bytes arriving in a workspace: `build` wires a
+real placement object only where a pod runner is configured, which an offline test never
+has. This is the case where a file actually arrives.
 
-One Session, two Turns, module-scoped so the pair runs once. Turn one exists to produce
-the pod and the `turn.completed` the route branches on; it also reads the file the
-Session was created with, so a failure in the second Turn cannot be blamed on file
-delivery in general. Turn two reads only the file that arrived while the pod was
-running.
+**The witness is the agent, and it is chosen rather than forced.** The bytes are
+reachable another way -- the browse route reads the control plane's own read-only mount
+of the same volume -- but a listing would show that they landed, and what a tenant
+attaches a file for is that the agent can open it. So the proof is a token the model
+could not have produced any other way: the nonce is generated here, is in the file's
+*contents* and not its name, and the file itself is uploaded after the first Turn has
+already ended.
+
+One Session, two Turns, module-scoped so the pair runs once. Turn one exists to put a
+completed Turn behind the attach; it also reads the file the Session was created with,
+so a failure in the second Turn cannot be blamed on file delivery in general. The attach
+is then made with the cluster confirmed holding no pod for this Session at all, which is
+what leaves the second Turn's placement as the only thing that could have written those
+bytes.
 
 NO KEY OR TOKEN VALUE IS PRINTED OR ASSERTED ON.
 """
@@ -59,6 +65,7 @@ TENANT_HEADER: Final = "X-Tenant-Id"
 
 _TURN_DEADLINE_S: Final = 600
 _SUBMIT_TIMEOUT_S: Final = 900
+_POD_GONE_DEADLINE_S: Final = 180
 _SECRET_SUFFIXES: Final = ("compiled", "requirements", "shim-token")
 
 requires_the_cluster = pytest.mark.skipif(
@@ -221,25 +228,36 @@ def _highest_seq(events: list[dict[str, Any]]) -> int:
     return max(int(one["seq"]) for one in events)
 
 
-def _pod_uid(session_id: SessionId) -> str:
-    """The cluster's own identity for this Session's pod, or "" if there is none.
+def _the_pod_after_the_first_turn(session_id: SessionId) -> str:
+    """What the cluster says about this Session's pod once its Turn has ended.
 
-    A uid rather than a name, because the name is derived from the Session id and so is
-    identical across a delete and a re-place -- which is the one thing this has to be
-    able to tell apart. A uid is minted per object and never reused.
+    Returns the last listing seen -- empty once the pod is gone -- rather than
+    asserting, so the case that grades it can say in its own name what an empty string
+    is worth here: the attach that follows is evidence about the placement path only if
+    nothing was standing to receive a push at the moment it was made.
 
-    Empty string for an absent pod rather than a raise: `jsonpath` on a missing object
-    exits non-zero, and this is asked twice around a step whose failure should be
-    reported by the assertion that reads it rather than by the read.
+    Waited on rather than read once, and the window it absorbs is real rather than a
+    tolerance. The lease is released after the Turn's completion has been appended, and
+    deletion is asynchronous on top of that, so for the pod's grace period the object is
+    still listed, stamped for deletion, and its container may still be running. A read
+    taken the instant the log closes the Turn would see the pod that just finished and
+    say nothing about the moment the file was attached.
+
+    An empty listing rather than a phase or a uid. `kubectl get` prints nothing at all
+    for an object that is gone, while a pod still terminating is still listed under its
+    own name, so the empty string is the only reading that excludes both.
     """
-    return kubectl(
-        "get",
-        "pod",
-        pod_name_for(session_id),
-        "-o",
-        "jsonpath={.metadata.uid}",
-        check=False,
-    ).strip()
+    name = pod_name_for(session_id)
+    listed = f"{name}: never read"
+    deadline = time.monotonic() + _POD_GONE_DEADLINE_S
+    while time.monotonic() < deadline:
+        listed = kubectl(
+            "get", "pod", name, "--ignore-not-found", "-o", "name", check=False
+        ).strip()
+        if not listed:
+            break
+        time.sleep(2)
+    return listed
 
 
 def _clean_up(session_id: SessionId) -> None:
@@ -263,8 +281,7 @@ class _Run:
     attach_response: httpx.Response
     first_turn_said: str
     second_turn_said: str
-    pod_before_attach: str
-    pod_after_second_turn: str
+    pod_at_the_attach: str
     definition_id: str
     environment_id: str
     listed: list[dict[str, Any]]
@@ -272,12 +289,14 @@ class _Run:
 
 @pytest.fixture(scope="module")
 def run() -> Iterator[_Run]:
-    """One Session, two Turns, one attach between them. Module-scoped.
+    """One Session, two Turns, one attach in the gap between them. Module-scoped.
 
-    The order is the whole fixture. The file attached in the middle is *uploaded* in the
-    middle too, after the first Turn has already ended -- so its bytes did not exist
-    when the pod was created and cannot have arrived with it, and the only path they
-    could have taken is the hop the attach route pushes down.
+    The order is the whole fixture, and it closes off every delivery path but one. The
+    file attached in the middle is *uploaded* in the middle too, after the first Turn
+    has already ended, so its bytes did not exist when the first pod was created and
+    cannot have arrived with it. The attach is then made only once the cluster lists no
+    pod for this Session at all, so nothing was standing to receive a push even if the
+    route still made one. What is left is the second Turn's placement.
 
     The teardown deletes the pod and its Secrets whatever happened, including a failure
     during submission. A run that died there still created a Session the control plane
@@ -336,20 +355,28 @@ def run() -> Iterator[_Run]:
             first_said = _said_since(after_one, after_seq=0)
             boundary = _highest_seq(after_one)
 
-            # Read before the attach and again at the end. A pod deleted and
-            # re-placed between the two Turns would be built from the log, which folds
-            # the attach -- so the file would arrive by a path this file is not testing
-            # and every assertion below would still pass.
-            pod_before = _pod_uid(session_id)
+            # Waited for rather than read, and the attach is made on the far side of
+            # it. A pod still standing here would be one the attach could conceivably
+            # have been delivered into, which is the one explanation of the second
+            # Turn's answer that nothing else below excludes.
+            pod_at_the_attach = _the_pod_after_the_first_turn(session_id)
 
-            # Uploaded only now, so the bytes did not exist when the pod was created
-            # and cannot have arrived with it.
+            # Uploaded only now, so the bytes did not exist when the first pod was
+            # created and cannot have arrived with it.
             second = _upload(base, tenant_id, "appendix.md", attached_nonce)
             with _client(base, tenant_id) as caller:
                 attach = caller.post(
                     f"/v1/sessions/{session_id}/resources",
                     json={"file_id": second["id"], "type": "file"},
                 )
+            # A second client, and the reason is how this fixture fails rather than how
+            # it passes. The attach is deliberately not asserted here -- the case below
+            # grades it -- so a refused attach has to survive as far as that case. On
+            # one client it did not: the control plane closes the keep-alive connection
+            # after an error response, and the next request on the reused one raises a
+            # protocol error out of the fixture, which pytest reports as eight setup
+            # errors naming this line instead of one failure naming the refusal.
+            with _client(base, tenant_id) as caller:
                 shown = caller.get(f"/v1/sessions/{session_id}/resources")
             assert shown.status_code == 200, shown.text
 
@@ -366,8 +393,7 @@ def run() -> Iterator[_Run]:
                 attach_response=attach,
                 first_turn_said=first_said,
                 second_turn_said=_said_since(after_two, after_seq=boundary),
-                pod_before_attach=pod_before,
-                pod_after_second_turn=_pod_uid(session_id),
+                pod_at_the_attach=pod_at_the_attach,
                 definition_id=str(definition["id"]),
                 environment_id=str(environment["id"]),
                 listed=shown.json()["data"],
@@ -377,13 +403,19 @@ def run() -> Iterator[_Run]:
 
 
 @requires_the_cluster
-def test_the_attach_was_accepted_against_a_session_holding_a_pod(run: _Run) -> None:
+def test_the_attach_between_turns_was_accepted(run: _Run) -> None:
     """201, and the resource it answers with is the file that was named.
 
-    A 201 alone would be satisfied by a route that appended nothing and pushed nothing,
-    which is why the two assertions below it exist -- but this one has to come first,
-    because a non-201 here makes every later failure in this file a consequence rather
-    than a finding."""
+    This is the line the old shape failed at, and it is worth stating why rather than
+    only that it did: the route branched on the Session having completed a Turn, read
+    that as "there is a pod standing to push into", and so refused with a 502 every
+    attach to a Session that had ever run -- which is the ordinary case rather than an
+    edge, since a Session between Turns owns no pod at all.
+
+    A 201 alone would be satisfied by a route that appended nothing, which is why the
+    two assertions below it exist -- but this one has to come first regardless, because
+    a non-201 here makes every later failure in this file a consequence rather than a
+    finding."""
     assert run.attach_response.status_code == 201, run.attach_response.text
     assert run.attach_response.json()["id"] == run.attached["id"]
     assert run.attach_response.json()["filename"] == "appendix.md"
@@ -393,43 +425,56 @@ def test_the_attach_was_accepted_against_a_session_holding_a_pod(run: _Run) -> N
 def test_the_first_turn_read_the_file_the_session_was_created_with(run: _Run) -> None:
     """The control: file delivery at creation works on this deployment.
 
-    Without it, a missing token in the second Turn is ambiguous between "the attach
-    route did not deliver" and "this pod cannot read ./files/ at all". This is the
-    second reading ruled out, on the same pod, in the same run."""
+    Without it, a missing token in the second Turn is ambiguous between "the attach did
+    not reach the workspace" and "nothing this Session places can read ./files/ at all".
+    This is the second reading ruled out, in the same run.
+
+    The two Turns run on two different pods, so what this rules out is a property of the
+    Session's compiled shape and this deployment's image rather than of one container.
+    That is the useful reading of it: both pods are placed from the same shape, read
+    back out of the same creation event, which is what makes the first Turn's success
+    say anything about the second at all."""
     assert run.created_nonce in run.first_turn_said, run.first_turn_said
 
 
 @requires_the_cluster
-def test_the_agent_read_the_file_that_arrived_while_the_pod_was_running(
+def test_the_next_turns_agent_read_the_file_attached_between_turns(
     run: _Run,
 ) -> None:
-    """The finding: a file that arrived after the pod was running was read.
+    """The finding: a file attached with no pod running was read by the Turn after it.
 
-    This is the branch no offline test reaches. The token is in a file uploaded after
-    the first Turn closed, so nothing about the pod's creation could have carried it,
-    and the agent has no network path to the object store -- the pod holds no cloud
-    identity (ADR-004). The only way this string reaches the model is the control plane
-    pushing the bytes down the shim hop when the attach was accepted."""
+    This is the delivery no offline test reaches. Three things are true at once and the
+    fixture arranges each, which is what leaves one explanation standing. The bytes were
+    uploaded after the first Turn closed, so no pod that existed before the attach could
+    have carried them. The cluster listed no pod for this Session when the attach was
+    made, so nothing was standing to be pushed into. And the agent has no network path
+    to the object store of its own -- the pod holds no cloud identity (ADR-004) -- so it
+    cannot have fetched them. What is left is the second Turn's placement writing the
+    file set it folded out of the Session's log."""
     assert run.attached_nonce in run.second_turn_said, run.second_turn_said
 
 
 @requires_the_cluster
-def test_one_pod_served_both_turns_so_the_file_arrived_by_the_push(run: _Run) -> None:
-    """The same pod object, before the attach and after the second Turn.
+def test_no_pod_was_standing_when_the_file_was_attached(run: _Run) -> None:
+    """The premise the finding above rests on, measured rather than assumed.
 
-    This is what makes the test above a finding rather than a coincidence. A pod deleted
-    and re-placed between the two Turns would be built from `_creation_facts`, which
-    folds `session.file_attached` -- so the file would reach the workspace by the
-    placement path, the agent would quote the nonce, and nothing would have exercised
-    the push at all. The two readings being equal rules that out.
+    A pod is leased for one Turn and given back when that Turn ends, so the pod that
+    carried the first Turn is gone before the attach is made -- the fixture waits for
+    that rather than manufacturing it with a delete, and this is where the waiting is
+    graded. Asserted by name because of how it fails: a lease that stopped releasing
+    would leave a pod standing across the attach, and "the file went into a workspace
+    something was already running in" becomes an explanation for the case above that
+    nothing else here excludes.
 
-    A uid and not a name: the name is derived from the Session id, so it survives a
-    delete and a re-place unchanged and would compare equal across exactly the event
-    this exists to detect. Non-empty is asserted too, because two absent pods also
-    compare equal.
+    An empty listing and not a phase. `kubectl get` prints nothing at all for an object
+    that is gone, while a pod still terminating is still listed, so the empty string is
+    the only reading that excludes both.
     """
-    assert run.pod_before_attach, "no pod existed after the first Turn closed"
-    assert run.pod_after_second_turn == run.pod_before_attach
+    assert run.pod_at_the_attach == "", (
+        f"the first Turn ended and the cluster still listed {run.pod_at_the_attach} "
+        f"{_POD_GONE_DEADLINE_S}s later, so the file was attached to a Session that "
+        "still had a pod standing and the case above proves less than it says"
+    )
 
 
 @requires_the_cluster
@@ -522,7 +567,7 @@ def test_the_deployed_listing_pages_backward(run: _Run) -> None:
         # A second Session, created and never run. A collection of one has no page to
         # walk back to, and a case that skipped there would leave the field untested on
         # every deployment -- which is what happened until this create was added.
-        # Placement is a first-Turn step, so a bare create costs no pod.
+        # Placement happens at a Turn, so a Session created and never run costs no pod.
         _created(
             caller.post(
                 "/v1/sessions",

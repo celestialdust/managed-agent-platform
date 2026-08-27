@@ -164,9 +164,10 @@ def test_every_service_account_a_manifest_names_is_created_by_bootstrap() -> Non
 
 
 def test_bootstrap_checks_for_every_file_it_will_apply() -> None:
-    """Fail-closed, and it is not hypothetical: two of the four inputs are landing on
-    another branch. A bootstrap that applied what it found and skipped what it did not
-    would leave a cluster with a DaemonSet and no profile for it to install."""
+    """Fail-closed, and it is not hypothetical: two of these inputs landed on another
+    branch than the code that applies them. A bootstrap that applied what it found and
+    skipped what it did not would leave a cluster with a DaemonSet and no profile for it
+    to install."""
     module = _bootstrap()
     required = set(module.required_inputs(_ROOT))
     built = module.steps(_ROOT, _AN_ACCOUNT)
@@ -231,10 +232,16 @@ def test_bootstrap_applies_no_manifest_that_belongs_to_a_workload() -> None:
 
 
 def test_every_namespaced_step_names_the_same_namespace() -> None:
-    """Two of the three manifests bootstrap applies are owned by other slices and
-    carry no namespace of their own, so theirs can only arrive on the command line. A
-    step that forgot it would land in `default`, where the headless Service publishes
-    addresses for pods in a namespace nothing dials."""
+    """Some of the manifests bootstrap applies are owned by other slices and carry no
+    namespace of their own, so theirs can only arrive on the command line. A step that
+    forgot it would land in `default`, where the headless Service publishes addresses
+    for pods in a namespace nothing dials.
+
+    Only steps that pass `-n` are graded, which is why this does not catch a manifest
+    that should have carried one and did not: a step with no `-n` is either applying a
+    cluster-scoped object or a document that names its own namespace, and this case
+    cannot tell those from a mistake. What it does hold is that no step names a
+    DIFFERENT namespace, which is the failure that has actually happened."""
     module = _bootstrap()
     namespace = _of_kind("Namespace")[0]["metadata"]["name"]
     for step in module.steps(_ROOT, _AN_ACCOUNT):
@@ -264,4 +271,42 @@ def test_a_daemonset_ready_on_every_node_it_selected_is_not_a_shortfall() -> Non
     assert (
         module.rollout_shortfall({"desiredNumberScheduled": 2, "numberReady": 2})
         is None
+    )
+
+
+def test_the_claim_every_session_pod_mounts_is_one_bootstrap_creates() -> None:
+    """**A pod cannot mount a claim that does not exist, and nothing retries it.**
+
+    `session-pod.yaml` names its workspace volume by claim, and a pod referring to an
+    absent PersistentVolumeClaim is refused at admission --
+    `persistentvolumeclaim "session-workspaces" not found` -- so a cluster bootstrapped
+    without it places no Session for any tenant. Unlike the ConfigMap above, kubelet
+    does not retry into it: the pod never schedules at all.
+
+    Asserted as an agreement between three files that cannot import each other: the pod
+    template names a claim, `session-vfs.yaml` declares one, and `bootstrap.py` decides
+    what is applied. Any two of those three can be edited into agreement while the third
+    silently stops matching, which is the failure this case exists to catch.
+    """
+    module = _bootstrap()
+    pod = yaml.safe_load((_K8S / "session-pod.yaml").read_text())
+    mounted = {
+        volume["persistentVolumeClaim"]["claimName"]
+        for volume in pod["spec"]["volumes"]
+        if "persistentVolumeClaim" in volume
+    }
+    assert mounted, "the pod template mounts no claim; this case grades nothing"
+
+    declared = {
+        document["metadata"]["name"]
+        for path in module.required_inputs(_ROOT)
+        if path.suffix == ".yaml"
+        for document in yaml.safe_load_all(path.read_text())
+        if isinstance(document, dict)
+        and document.get("kind") == "PersistentVolumeClaim"
+    }
+
+    assert mounted <= declared, (
+        f"{sorted(mounted - declared)} is mounted by session-pod.yaml and is not"
+        " declared in any manifest bootstrap applies"
     )

@@ -70,7 +70,7 @@ from managed_agent.core.registration.scope_binding import (
     RegisteredTool,
     ServerRegistration,
 )
-from managed_agent.core.session.session import SessionRecord, SessionState
+from managed_agent.core.session.session import SessionRecord
 from managed_agent.core.vocabulary import lifecycle
 
 _SHA = "0" * 39 + "a"
@@ -477,7 +477,7 @@ async def test_register_then_create_resolves_the_pinned_revision_end_to_end(
         # tenant is refused rather than served.
         read = await client.get(f"/v1/sessions/{session_id}", headers=tenant)
         assert read.status_code == 200, read.text
-        assert read.json()["state"] == "running"
+        assert read.json()["state"] == "idle"
 
         # A second registration of a *different* definition must not move what this
         # Session pinned -- the whole reason the revision is written down.
@@ -809,7 +809,7 @@ class UnusedWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         raise AssertionError("a test in this file registered a webhook")
@@ -821,9 +821,9 @@ class UnusedWebhooks:
         raise AssertionError("a test in this file deleted a webhook")
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        raise AssertionError("a test in this file asked what watches a state")
+        raise AssertionError("a test in this file asked what watches a type")
 
 
 FIXTURE_IMAGE = "registry.map.internal/session@sha256:" + "a" * 64

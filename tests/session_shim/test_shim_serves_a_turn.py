@@ -45,9 +45,16 @@ from fastapi import FastAPI
 from pydantic import TypeAdapter, ValidationError
 from websockets.asyncio.server import unix_serve
 
+from managed_agent.control.files.output_shipout import (
+    OutputNotRevisable,
+    OutputsNotShippable,
+)
 from managed_agent.control.pod_config.compiler import CompiledConfig
 from managed_agent.control.session.placement import Placement, PodPhase
-from managed_agent.control.session.turn_dispatch import TurnUndeliverable
+from managed_agent.control.session.turn_dispatch import (
+    TurnOutputNotRevisable,
+    TurnUndeliverable,
+)
 from managed_agent.core.ids import Seq, SessionId, TurnId, new_session_id, new_turn_id
 from managed_agent.core.session.projection import project
 from managed_agent.core.session.session import SessionState
@@ -122,11 +129,20 @@ class InMemoryLog:
 
 
 class FixedPhase:
-    """A cluster that reports one phase for every pod and starts nothing."""
+    """A cluster that reports one phase for every pod and starts nothing.
+
+    `remove` records rather than refusing, which it used to do. Under ADR-041 a pod is
+    leased for one Turn, so a dispatch that did NOT remove one would be the defect --
+    the refusal was written when a pod outlived its Turn and it now asserts the
+    opposite of the contract. The names are kept so a case that wants to grade the
+    release can, and `phase` is deliberately left alone by it: every case here fixes
+    the phase it wants and none is about what the cluster looks like afterwards.
+    """
 
     def __init__(self, phase: PodPhase = PodPhase.RUNNING) -> None:
         self.phase = phase
         self.asked: list[str] = []
+        self.removed: list[str] = []
 
     async def ensure(self, pod_name: str, compiled: CompiledConfig) -> PodPhase:
         raise AssertionError("dispatching a Turn tried to start a pod")
@@ -136,7 +152,7 @@ class FixedPhase:
         return self.phase
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("dispatching a Turn tried to remove a pod")
+        self.removed.append(pod_name)
 
 
 class Notified:
@@ -145,6 +161,18 @@ class Notified:
 
     async def turn_completed(self, session_id: SessionId, turn_id: TurnId) -> None:
         self.told.append((session_id, turn_id))
+
+
+class SeamThatRaises:
+    """A completion seam that took the Turn and then failed to make it durable."""
+
+    def __init__(self, failure: Exception) -> None:
+        self._failure = failure
+        self.told: list[tuple[SessionId, TurnId]] = []
+
+    async def turn_completed(self, session_id: SessionId, turn_id: TurnId) -> None:
+        self.told.append((session_id, turn_id))
+        raise self._failure
 
 
 class ShimThatStreams(httpx.AsyncBaseTransport):
@@ -222,7 +250,7 @@ class NeverPlaces:
 def _dispatch_over(
     transport: httpx.AsyncBaseTransport,
     log: InMemoryLog,
-    notified: Notified,
+    notified: Notified | SeamThatRaises,
     phase: PodPhase = PodPhase.RUNNING,
 ) -> HttpPodDispatch:
     return HttpPodDispatch(
@@ -1092,3 +1120,57 @@ def test_the_append_retry_has_one_definition_the_control_plane_uses() -> None:
             f"{caller} appends to the Event Log and does not call `append_in_order`, "
             "so it either lost the retry or grew a second copy under another name"
         )
+
+
+async def test_a_ship_out_that_met_a_delivered_path_keeps_its_own_type() -> None:
+    """The one completion-seam failure that does not become `TurnUndeliverable`.
+
+    Everything this method awaits after the stream is collapsed into one type, and the
+    reason is in `_record`'s docstring: the route catches exactly one thing, so an
+    exception it does not know reaches the tenant as a bare 500 with no published code
+    and no `turn.failed`. That collapse is right for every failure whose next move is
+    the same, and wrong for the one whose next move differs -- an artifact path the
+    agent rewrote is the tenant's to change, and 502 tells them to retry instead.
+
+    So the translation is by type and not by message. Matching on the text would make
+    the tenant's status depend on a string an operator is free to reword.
+    """
+    session_id, turn_id = new_session_id(), new_turn_id()
+    log = InMemoryLog()
+    collided = SeamThatRaises(
+        OutputNotRevisable("report.md", "already delivered under that path")
+    )
+
+    with pytest.raises(TurnOutputNotRevisable) as refused:
+        await _dispatch_over(
+            ShimThatStreams(
+                [_event(turn.TURN_COMPLETED, turn_id=str(turn_id)), _COMPLETED_LINE]
+            ),
+            log,
+            collided,
+        ).dispatch(session_id, turn_id, _PROMPT)
+
+    assert refused.value.path == "report.md"
+    assert collided.told == [(session_id, turn_id)]
+
+
+async def test_every_other_way_ship_out_fails_still_becomes_undeliverable() -> None:
+    """The other half, so the translation above cannot be a blanket re-raise.
+
+    A length that did not match, a name the pod promised not to send, a store that
+    refused the write: all of them are `OutputsNotShippable` too, none of them is
+    something a tenant can act on, and all of them must keep arriving at the route as
+    the one type it catches.
+    """
+    session_id, turn_id = new_session_id(), new_turn_id()
+    log = InMemoryLog()
+    truncated = SeamThatRaises(OutputsNotShippable("served fewer bytes than it listed"))
+
+    with pytest.raises(TurnUndeliverable):
+        await _dispatch_over(
+            ShimThatStreams(
+                [_event(turn.TURN_COMPLETED, turn_id=str(turn_id)), _COMPLETED_LINE]
+            ),
+            log,
+            truncated,
+        ).dispatch(session_id, turn_id, _PROMPT)

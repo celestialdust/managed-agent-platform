@@ -32,12 +32,18 @@ attach did not see that file, and the log says when.
 
 The three earlier arguments against accepting an attach are recorded as wrong in
 `gap.md` D1, measured rather than reasoned away. The load-bearing one was that an
-accepted file could not be delivered: the *call site* that pushes files into a pod is
-creation-only, but the *transport* is not -- `PodFilePlacement.place_file` PUTs to a
-running pod's file route and needs nothing but a running pod. So delivery here has two
-cases and no new machinery. A Session whose first Turn has not completed has no pod yet
-and the placement path reads this event when it places one; a Session past that point
-has a pod, and the bytes go down the same authenticated hop a moment later.
+accepted file could not be delivered, and what answers it is that the placement path
+reads this event: `FirstTurnPlacement` folds every `session.file_attached` row into the
+file set it pushes into a pod it has just made ready, so appending here IS delivering,
+one Turn later.
+
+**This route pushed bytes itself as well, and no longer does.** It branched on whether
+the Session had completed a Turn, because that used to mean it had a pod standing --
+and under ADR-041 a pod lives exactly as long as the Turn it carries, so a Session
+between Turns has none. The branch refused every attach to a Session that had ever run.
+The remaining path is not a fallback: it is the one that was always going to deliver,
+and it now runs for every Session rather than only for one attached to before its first
+Turn.
 
 `mount_path` is refused rather than accepted and ignored. Upstream defaults it to
 `/mnt/session/uploads/<file_id>` and this platform writes to
@@ -66,7 +72,6 @@ from managed_agent.control.api.routes.files import (
 )
 from managed_agent.control.files.attachments import (
     WORKSPACE_FILE_BUDGET_BYTES,
-    FilesNotPlaceable,
 )
 from managed_agent.control.files.store import (
     FileId,
@@ -74,7 +79,7 @@ from managed_agent.control.files.store import (
     UploadedFileNotFound,
     UploadStorageUnconfigured,
 )
-from managed_agent.control.session.lifecycle import open_turn, whole_log
+from managed_agent.control.session.lifecycle import whole_log
 from managed_agent.core.errors import STATUS_FOR, ErrorCode, PublicErrorEnvelope
 from managed_agent.core.ids import SessionId, TenantId
 from managed_agent.core.pod.workspace_contract import INPUT_DIR_NAME
@@ -84,7 +89,8 @@ from managed_agent.core.ports import (
 )
 from managed_agent.core.session.projection import project
 from managed_agent.core.session.session import SessionState
-from managed_agent.core.vocabulary import lifecycle, resource, turn
+from managed_agent.core.session.turns import open_turn
+from managed_agent.core.vocabulary import lifecycle, resource
 
 router = APIRouter(
     tags=["resources"],
@@ -374,28 +380,25 @@ async def attach_resource(
 ) -> AttachedResourceView | JSONResponse:
     """Attach one more file to a Session, and record that it now holds it.
 
-    **The bytes go down before the event goes in, and that order is deliberate.** The
-    append is the commit: after it, the list route says this Session holds the file and
-    the placement path will deliver it. If the push fails first, nothing was appended
-    and the caller has a refusal it can retry. The other order leaves a Session whose
-    record names a file its pod does not have, and nothing would ever push it again --
-    placement runs once per Session. The residue of the order chosen is a file in a
-    workspace the log does not name, which no prompt points at and a retry overwrites
-    with identical bytes.
+    **The append is the whole operation, and it is the delivery.** Nothing is pushed
+    into a pod from here, because under ADR-041 a Session between Turns owns no pod to
+    push into. What carries the bytes is the next Turn's placement:
+    `FirstTurnPlacement._creation_facts` folds every `session.file_attached` row into
+    the file set handed to `place_for`, and that fold now runs at every Turn rather than
+    once per Session. So the file is in the workspace before the agent is given an
+    instruction, which is the property that ever mattered -- what changed is which side
+    of the boundary does the writing.
 
-    **Delivery has two cases and the branch mirrors the placement path's own.** A
-    Session that has completed no Turn has no pod; `FirstTurnPlacement` places one and
-    reads this event when it does, so pushing here would be a push to nothing. A Session
-    past that point has a pod and the file goes down now. The predicate is
-    `turn.completed` because that is exactly what the placement path branches on --
-    deriving it another way here would be a second answer to "will placement run again"
-    and free to disagree.
+    This route did push, and the branch that did it read `turn.completed` as "this
+    Session has a pod standing". That was true while a pod outlived the Turn that placed
+    it. Afterwards it refused every attach to a Session that had ever run, which is the
+    common case rather than an edge.
 
-    **Refused unless the Session would accept a Turn.** A stopped Session accepts no
-    event at all; a suspended one accepts no Turn either, so no future Turn will ever
-    read the file. Both are 409 naming the state rather than a 201 for a document
-    nothing will open. This is where the reaped-Session refusal lives and it needs no
-    case of its own -- reaping suspends.
+    **Refused only for a Session that has stopped.** That is the one state where no
+    future Turn will ever read the file, so it is the one that earns a 409 naming the
+    state rather than a 201 for a document nothing will open. A Session at rest between
+    Turns is deliberately *not* refused: its next Turn places a pod and that placement
+    is what reads this event.
 
     **Refused while a Turn is in flight.** The runtime already holds its prompt, so a
     file landing mid-Turn may or may not be read and no record afterwards could say
@@ -461,10 +464,18 @@ async def attach_resource(
     # `project` cannot raise here: `_held_file_ids` returned a tuple, which means it met
     # the creation event, which is the one thing `project` refuses a log for.
     state, _ = project(events)
-    if state is not SessionState.RUNNING:
+    # `is STOPPED` and not `not state.accepts_a_turn()`, and the difference is the whole
+    # correctness of this pair of refusals. A Session running a Turn does not accept a
+    # second one, so the looser test would catch it here and answer "will run no further
+    # Turn" -- false about the Session most certainly about to read a file, and pointing
+    # the caller at archiving when the remedy is the interrupt named below. What this
+    # refusal is for is a Session that has genuinely ended, and only a stop ends one: a
+    # Session at rest is one whose next Turn brings a pod back and reads the workspace
+    # this file would be in.
+    if state is SessionState.STOPPED:
         return refuse(
             ErrorCode.SESSION_NOT_ACCEPTING_TURNS,
-            f"session {session_id} is {state.value} and will run no further Turn, so a "
+            f"session {session_id} is stopped and will run no further Turn, so a "
             "file attached now would never be read",
             session_id=str(session_id),
             state=state.value,
@@ -532,18 +543,21 @@ async def attach_resource(
             session_id=str(session_id),
             file_id=str(body.file_id),
         )
-    if any(event.type == turn.TURN_COMPLETED for event in events):
-        try:
-            await platform.session_attachments.place_for(
-                session_id, tenant_id, (body.file_id,), ledger
-            )
-        except FilesNotPlaceable as undelivered:
-            return refuse(
-                ErrorCode.TURN_UNDELIVERABLE,
-                f"this session's pod would not take the file: {undelivered}",
-                session_id=str(session_id),
-                file_id=str(body.file_id),
-            )
+    # No push from here, and nothing branches on whether a Turn has completed. Under
+    # ADR-041 a Session between Turns owns no pod at all, so the branch that used to
+    # deliver the bytes immediately had nothing to deliver them to: it read
+    # `turn.completed` as "this Session has a pod", which was true while a pod outlived
+    # the Turn that placed it and is false now. Measured on `map-dev` as a refusal from
+    # the transport -- "session ... has no running pod to place 'appendix.md' into" --
+    # on every attach to a Session that had ever run.
+    #
+    # The append below is the whole operation, and it is sufficient rather than merely
+    # what is left: `FirstTurnPlacement._creation_facts` folds every
+    # `session.file_attached` event into the file set it hands to `place_for`, and under
+    # the lease that fold runs at every Turn rather than once per Session. So the file
+    # is delivered by the next Turn's placement, which is the same path that has always
+    # delivered a file attached before a Session's first Turn -- the case this route's
+    # own docstring already described. What changed is that it is now the only case.
     await platform.event_log_append.append(
         session_id,
         resource.SESSION_FILE_ATTACHED,

@@ -17,10 +17,12 @@ it needs. A model cannot explore its way to a promise nobody has made.
 **This is a contract and not a prompt, which is why it lives in `core/`.** Every clause
 below is something another part of this tree enforces: `shim/serve.py` ships what is in
 `OUTPUT_DIR_NAME`, `deploy/k8s/session-pod.yaml` mounts inputs at `INPUT_DIR_NAME` and
-puts `PACKAGE_DIR` on `PYTHONPATH`, and `deploy/docker/session.Dockerfile` installs
-`PIP_WRAPPER`. A sentence here that no other file honours is worse than no sentence: the
-model would follow it, write its document somewhere nothing collects, and the Turn would
-end looking like the model's failure.
+puts `PACKAGE_DIR` on `PYTHONPATH`, `deploy/docker/session.Dockerfile` installs
+`PIP_WRAPPER`, and the permission profile in `control/pod_config/compiler.py` is what
+makes `SCRATCH_ROOT` writable at all -- the clause about it would otherwise send the
+model to a directory the kernel refuses. A sentence here that no other file honours is
+worse than no sentence: the model would follow it, write its document somewhere nothing
+collects, and the Turn would end looking like the model's failure.
 
 **It reaches the model in the same field as the tenant's own instructions, and that
 is a compromise rather than a design.** The right channel exists: the runtime has an
@@ -111,7 +113,7 @@ def is_a_produced_path(relative: str) -> bool:
     leading separator are already refused, and so is a *leading* dot -- the grammar
     requires the first character to be alphanumeric, so `.codex/state` never reaches
     here at all. But a dot may appear inside a path, so `src/.cache/x` and
-    `out/.map/lib/x` both parse. A dotted segment anywhere is runtime
+    `out/.venv/lib/x` both parse. A dotted segment anywhere is runtime
     scratch or an installed dependency tree rather than a document, so every segment is
     checked and not just the first -- a rule applied only to the first segment is one an
     agent escapes by writing a single directory deep.
@@ -123,93 +125,62 @@ def is_a_produced_path(relative: str) -> bool:
     return not any(segment.startswith(".") for segment in relative.split("/"))
 
 
-NOT_SYNCED: Final = (INPUT_DIR_NAME, OUTPUT_DIR_NAME, ".map/lib")
-"""The directories the working-lane sync leaves alone, as one closed list.
+SCRATCH_ROOT: Final = "/session/scratch"
+"""The pod's own disk, writable by a confined command and gone when the pod is.
 
-Three, and the list is closed rather than a rule with exceptions, because each is
-excluded for its own reason and none of the three reasons generalises:
+An absolute path and not a workspace-relative name, because it is deliberately not in
+the workspace: the workspace is a network mount now, and a write there is a round trip
+(ADR-035, ADR-036). Everything a Turn produces on the way to a deliverable -- a build
+tree, a package cache, an unpacked archive -- has no reason to make that trip, and the
+whole of ADR-037 is putting those writes here instead.
 
-- `files/` is the tenant's own uploads, mounted in by the platform. Syncing it back
-  would store a second copy of bytes the platform already holds under a key it already
-  knows, and restoring it would fight the mount.
-- `out/` is shipped to the `artifacts` lane by `control/files/output_shipout.py`. In
-  both lanes it would be one document with two durable homes and two answers to "what
-  did this Session make".
-- `.map/lib` is an installed dependency tree, rebuildable by definition. It is also the
-  one entry here that can be large, and the one whose bytes carry no work.
-
-Written as literal path prefixes and not derived from `PACKAGE_DIR`: the constant below
-is where a package *lands*, and this is what the sync *skips*. They are the same string
-today and are not the same fact, so a future move of the package directory should have
-to change both lines on purpose. The test beside `is_a_synced_path` asserts they agree,
-so a move that changed one and not the other is caught rather than silently shipping a
-dependency tree to the object store.
+Three separate things have to agree for this path to be real, which is why the name
+lives in `core/` beside the clause that promises it rather than in any one of them.
+`deploy/k8s/session-pod.yaml` declares the volume and mounts it into the container that
+runs confined commands; `control/pod_config/compiler.py` puts a write rule over it in
+the permission profile, without which the profile's `:read-only` parent leaves it
+unwritable; and `deploy/docker/session.Dockerfile` aims the build tools' caches at it.
+Two of the three is worse than none of them: the tools would be pointed at a path that
+exists and refuses every write, so a Turn fails on a directory the platform itself
+chose rather than falling back to one that works.
 """
 
+SCRATCH_LIMIT_MEBIBYTES: Final = 512
+"""How much that directory holds: the manifest's `sizeLimit`, and what the model reads.
 
-def is_a_synced_path(relative: str) -> bool:
-    """Whether a file at this workspace-relative path belongs in the `working` lane.
+The model is told, and that is unusual here -- every other clause below degrades when
+it is ignored, and this one does not. Enforcement on these nodes is kubelet's periodic
+`du` with no filesystem-quota feature gate, so a write past this does not return
+ENOSPC: the pod is EVICTED, and `restartPolicy: Never` ends the Session mid-Turn. An
+agent that has not been told the number has no basis for deciding not to unpack a 2 GB
+dataset here.
 
-    **The complement of `is_a_produced_path`, not a copy of it.** Both parse the path
-    against the lane grammar, because both compose an object key from it and a path that
-    composes to no key is refused the same way either way. They differ in what they then
-    exclude, and the difference is the point: a produced file is a deliverable and must
-    not be scratch, while a working file IS the scratch -- it is the agent's tree as it
-    stood, and the reason to keep it is that the agent will want it back.
+Rendered to the model as plain "MB" against a value in mebibytes, which under-reads the
+real bound by about five percent. That is the safe direction for a number whose whole
+purpose is stopping somebody just short of an eviction, and a clause explaining the
+difference between MB and MiB would cost more of the model's attention than five
+percent is worth.
+"""
 
-    So a dotted segment below the first is allowed here and refused there:
-    `src/.cache/x` is the agent's own tree and is kept, while the produced walk refuses
-    a dotted segment at any depth so an installed dependency can never be mistaken for a
-    document. What is excluded here instead is `NOT_SYNCED` above, by prefix, at the
-    root only -- a directory named `out` one level down is the agent's own and is
-    synced, because the platform's promise about `out/` is about the root and nowhere
-    else.
+PACKAGE_DIR: Final = f"{SCRATCH_ROOT}/lib"
+"""Where a package the agent installs at run time lands.
 
-    **A path whose FIRST character is a dot is refused, and that is the lane grammar's
-    rule rather than this one's.** `parse_relative_path` requires an alphanumeric first
-    character so a path cannot address its lane's own prefix, so `.gitignore` composes
-    to no key and is left behind here. What that costs is the agent's ordinary root
-    dotfiles -- `.gitignore`, `.env`, `.python-version`, `.pytest_cache`, `.venv` -- and
-    not the agent's runtime state, none of which was ever this walk's to carry: `.git`,
-    `.agents` and `.codex` are held read-only inside every writable root by the runtime
-    itself (`control/catalog/environments.RUNTIME_PROTECTED_NAMES`), the conversation
-    and tool state lives under `CODEX_HOME` on a volume outside the workspace and ships
-    out by a route of its own, and `.map/lib` is excluded above on purpose as
-    rebuildable. It costs nothing today because nothing restores this lane into a pod
-    yet (see the module docstring of `control/files/workspace_sync.py`), and it must be
-    settled before something does.
-    Widening the grammar is not the fix available: a leading dot is what `.` and `..`
-    are spelled with, and one lane cannot relax a parser two lanes share.
+On scratch rather than in the workspace, and that is a move rather than a first choice.
+It sat at `<workspace>/.map/lib` while the workspace was pod-local, under a dotted
+directory so `is_a_produced_path` above could never mistake a dependency tree for a
+document. Once the workspace became a network mount, leaving it there would have put
+every run-time `pip install` across NFS -- new latency bought for bytes that are
+rebuildable by definition and that nothing was keeping anyway.
 
-    One predicate with two callers, for the reason `is_a_produced_path` gives: the shim
-    filters its listing by it and the control plane re-parses every path that arrives by
-    it, and a path one end offers and the other refuses fails a Turn that did nothing
-    wrong.
-    """
-    try:
-        parse_relative_path(relative)
-    except VfsPathInvalid:
-        return False
-    return not any(
-        relative == skipped or relative.startswith(f"{skipped}/")
-        for skipped in NOT_SYNCED
-    )
+The dot went with the move because it no longer buys anything: ship-out walks the
+workspace, and this is not under it, so a site-packages tree stays out of a tenant's
+deliverables by not being in the tree that gets scanned rather than by a filter that
+has to keep holding.
 
-
-PACKAGE_DIR: Final = ".map/lib"
-"""Where a package the agent installs at run time lands, relative to the workspace.
-
-Under a dotted directory deliberately: `is_a_produced_path` above rejects a dotted
-segment at any depth, so an installed dependency tree can never be mistaken for a
-document and shipped to the tenant -- not even once the walk became recursive, which is
-when a rule that only looked at the first segment would have started letting it
-through.
-
-Inside the workspace because there is nowhere else. Measured inside the sandbox on a
-live pod: `/opt/map/venv` is a read-only filesystem, `/tmp` is read-only too -- the
-profile extends `:read-only` and the container's `/tmp` mount exists for the bubblewrap
-helper OUTSIDE the sandbox -- and `dnf` wants a root the agent does not have. The one
-writable path a confined command has is the workspace.
+Absolute, because the two places that must agree with it are not workspace-relative
+either: the `--target` in the image's `map-pip` wrapper, and `PYTHONPATH` in the pod
+manifest. `tests/deploy/test_the_image_honours_the_workspace_contract.py` compares all
+three, and a move that reached two of them installs packages nothing can import.
 """
 
 PIP_WRAPPER: Final = "map-pip"
@@ -250,10 +221,21 @@ def workspace_contract() -> str:
             "  Create that directory if it does not exist. Only files there are",
             "  returned to the user, so working files and scripts you wrote along",
             "  the way should stay outside it.",
+            "  Each path there is written once. To revise something you already",
+            "  produced, write the new version under a new path -- rewriting the",
+            "  old one is refused. Keep a draft outside this directory and copy",
+            "  it in when it is final.",
+            "- Large intermediate files -- build output, caches, an unpacked",
+            f"  archive -- belong in {SCRATCH_ROOT}/ . That is this machine's own",
+            "  disk, while your working directory is on network storage, so",
+            "  writing them there is faster. It holds"
+            f" {SCRATCH_LIMIT_MEBIBYTES} MB and going past that",
+            "  ends the session; nothing in it is returned to the user, and none",
+            "  of it survives the session.",
             f"- To install a Python package, run: {PIP_WRAPPER} <package>",
             "  It installs where this session can import from. Plain `pip install`",
-            "  will not work here: this filesystem is read-only except for your",
-            "  working directory.",
+            "  will not work here: everything outside your working directory and",
+            f"  {SCRATCH_ROOT}/ is read-only.",
             "- Network access is off unless it was granted for this session. If a",
             "  download is refused, say so rather than working around it.",
         )

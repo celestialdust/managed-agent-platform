@@ -12,7 +12,7 @@ and not of the row.
 """
 
 import asyncio
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Collection, Sequence
 from dataclasses import dataclass
 
 import sqlalchemy as sa
@@ -94,7 +94,7 @@ _BATCH = 500
 # cap share timestamps with the rows inside it.
 _LIFECYCLE_BETWEEN = (
     sa.text(
-        "SELECT s.tenant_id, e.session_id, e.seq"
+        "SELECT s.tenant_id, e.session_id, e.seq, e.type"
         " FROM event_log e JOIN session s ON s.id = e.session_id"
         " WHERE e.type = ANY(:types)"
         " AND e.appended_at >  to_timestamp(:from_ms / 1000.0)"
@@ -102,7 +102,53 @@ _LIFECYCLE_BETWEEN = (
         " ORDER BY e.appended_at, e.session_id, e.seq"
     )
     .bindparams(sa.bindparam("types", type_=sa.ARRAY(sa.Text())))
-    .columns(tenant_id=sa.Uuid(), session_id=sa.Uuid(), seq=sa.BigInteger())
+    .columns(
+        tenant_id=sa.Uuid(), session_id=sa.Uuid(), seq=sa.BigInteger(), type=sa.Text()
+    )
+)
+
+
+# What the abandoned-Turn sweep needs of one Session, in two reads that do not grow
+# with how long its Turns have run.
+#
+# The sweep asks three questions of an open Turn -- did its pod ever answer, what its
+# newest progress report said, and where in the log that report sits. It used to reach
+# them by paging the Session's whole log, which made judging a Turn cost a row for every
+# token-level delta that Turn had ever emitted. Measured on Postgres 17: 40 Sessions of
+# 3,000 events cost one sweep 782.6 ms over 120,000 rows, against 233.6 ms over 24,000
+# for the same Sessions at 600 events -- linear in log size, on a pass that runs every
+# 30 seconds while every live Turn appends a report every 30 seconds.
+#
+# Both statements filter on `session_id` with an equality and order by `seq`, so each
+# walks the (session_id, seq) primary key rather than sorting anything.
+_BOUNDARIES_OF = (
+    sa.text(
+        "SELECT seq, type, payload FROM event_log"
+        " WHERE session_id = :sid AND type = ANY(:types)"
+        " ORDER BY seq"
+    )
+    .bindparams(
+        sa.bindparam("sid", type_=sa.Uuid()),
+        sa.bindparam("types", type_=sa.ARRAY(sa.Text())),
+    )
+    .columns(seq=sa.BigInteger(), type=sa.Text(), payload=sa.JSON())
+)
+
+# Deliberately without a LIMIT, and the asymmetry with the read below is the point. This
+# one is bounded by how many Turns a Session has ever run, which is small and grows only
+# when a tenant submits; the other would be bounded by how much those Turns said, which
+# is what the sweep must stop paying for. Capping this one would instead risk truncating
+# the boundary set that `open_turn` folds, and a fold missing its own submission answers
+# "nothing is open" -- the one wrong answer that leaves a wedged Session unswept.
+_LATEST_PROGRESS_OF = (
+    sa.text(
+        "SELECT seq, type, payload FROM event_log"
+        " WHERE session_id = :sid AND type = :type"
+        " AND payload ->> 'turn_id' = :turn"
+        " ORDER BY seq DESC LIMIT 1"
+    )
+    .bindparams(sa.bindparam("sid", type_=sa.Uuid()))
+    .columns(seq=sa.BigInteger(), type=sa.Text(), payload=sa.JSON())
 )
 
 
@@ -118,16 +164,23 @@ class Row:
 class LifecycleRow:
     """One lifecycle event the cross-Session tail found, with the Session's owner.
 
-    Deliberately not a `Row`: it carries no type and no payload, because the caller does
-    not read either -- it folds the Session's own log to learn what state the event
-    arrived at, and a payload here would be a second thing to keep in step. The
-    tenant is present and is the reason this row type exists at all, since `Row`
-    has nowhere to put one.
+    Deliberately not a `Row`: it carries no payload, because the caller does not read
+    one -- a callback carries a sequence rather than content, so a payload here would be
+    a second thing to keep in step with the log a receiver reads anyway. The tenant is
+    present and is the reason this row type exists at all, since `Row` has nowhere to
+    put one.
+
+    The type is present because it is what the caller matches registrations against, and
+    it is the event's own rather than anything derived: reconstructing it -- from the
+    Session's state, say -- would be a second answer to a question the row already
+    holds, free to disagree with it on the one surface where disagreeing means a
+    callback naming something that did not happen.
     """
 
     tenant_id: TenantId
     session_id: SessionId
     seq: Seq
+    type: str
 
 
 class PostgresEventLogRange:
@@ -168,6 +221,50 @@ class PostgresEventLogRange:
             result = await conn.execute(
                 _READ,
                 {"sid": session_id, "start": start, "end": end, "limit": limit},
+            )
+            return [
+                Row(session_id, Seq(row.seq), row.type, dict(row.payload))
+                for row in result
+            ]
+
+    async def turn_boundaries_of(
+        self, session_id: SessionId, types: Collection[str]
+    ) -> Sequence[Row]:
+        """This Session's events of these types, in sequence order.
+
+        The sweep's substitute for reading the whole log. It hands back only the events
+        that open, start and close a Turn, which is exactly what `open_turn` and
+        `started` fold -- both ignore every other type, so restricting the read changes
+        neither answer while removing the running commentary between them.
+        """
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                _BOUNDARIES_OF, {"sid": session_id, "types": list(types)}
+            )
+            return [
+                Row(session_id, Seq(row.seq), row.type, dict(row.payload))
+                for row in result
+            ]
+
+    async def latest_progress_of(
+        self, session_id: SessionId, type_: str, turn_id: str
+    ) -> Sequence[Row]:
+        """This Turn's newest event of this type, as a sequence of nought or one.
+
+        A sequence rather than a row-or-None so that the two pure readers above it --
+        `latest_idle_ms` and `latest_report_seq` -- keep taking the log slice they
+        already take. Handed one row they return that row's reading; handed none they
+        return None, which is what "this Turn has never reported" has always meant to
+        them. Neither needs to learn a second calling convention to become cheap.
+
+        Matched on the payload's `turn_id` in SQL for the same reason those two match on
+        it in Python: a Session's log holds every Turn it has ever run, and a previous
+        Turn's last report can sit arbitrarily close to the end of the log.
+        """
+        async with self._engine.connect() as conn:
+            result = await conn.execute(
+                _LATEST_PROGRESS_OF,
+                {"sid": session_id, "type": type_, "turn": turn_id},
             )
             return [
                 Row(session_id, Seq(row.seq), row.type, dict(row.payload))
@@ -236,7 +333,7 @@ class PostgresEventLogRange:
             return Seq(floor)
 
     async def lifecycle_events_between(
-        self, types: Sequence[str], from_ms: int, to_ms: int
+        self, types: Collection[str], from_ms: int, to_ms: int
     ) -> Sequence[LifecycleRow]:
         """Events of these types appended after `from_ms` and at or before `to_ms`.
 
@@ -246,9 +343,13 @@ class PostgresEventLogRange:
         watermark that only moves forward depends on.
 
         Every event across every Session comes back, each paired with the tenant that
-        owns its Session. There is no cap: the caller narrows by choosing the
-        window, and a row cap here would return a prefix of one instant's events
-        with no way to say where it stopped.
+        owns its Session and carrying its own type. There is no cap: the caller narrows
+        by choosing the window, and a row cap here would return a prefix of one
+        instant's events with no way to say where it stopped.
+
+        `types` is a `Collection` rather than a `Sequence` because order is not read --
+        it becomes an array bound to `= ANY(...)`. A caller holding a set can pass it
+        without inventing one.
         """
         async with self._engine.connect() as conn:
             result = await conn.execute(
@@ -260,6 +361,7 @@ class PostgresEventLogRange:
                     tenant_id=TenantId(row.tenant_id),
                     session_id=SessionId(row.session_id),
                     seq=Seq(int(row.seq)),
+                    type=str(row.type),
                 )
                 for row in result
             ]

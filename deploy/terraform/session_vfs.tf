@@ -83,7 +83,7 @@ locals {
   # variable's `default`: Terraform requires a default to be a constant, so a reference has
   # to live in a local and the default has to be null.
   node_subnet_ids = coalesce(
-    var.node_subnet_ids, tolist(aws_eks_node_group.map_dev_nodes.subnet_ids)
+    var.node_subnet_ids, tolist(aws_eks_node_group.map_dev_nodes_m6i.subnet_ids)
   )
 
   # EKS attaches the cluster security group to every managed-nodegroup ENI, so this is what
@@ -562,6 +562,51 @@ resource "aws_eks_addon" "efs_csi" {
   })
 }
 
+resource "aws_s3files_access_point" "session_workspaces" {
+  file_system_id = aws_s3files_file_system.session_vfs.id
+
+  posix_user {
+    uid = local.session_uid
+    gid = local.session_gid
+  }
+
+  # Rooted at a prefix THIS RESOURCE CREATES, and that is the whole reason it exists
+  # separately from the access point above.
+  #
+  # `creation_permissions` is applied only when S3 Files has to create `path`. Point an
+  # access point at a prefix the bucket already holds and the field is silently ignored:
+  # the directory keeps the ownership it already had, which for every prefix synthesised
+  # from existing S3 objects is uid 0 / gid 0, mode 0755. The mount then succeeds and is
+  # unwritable, because `posix_user` squashes every operation through it to 10001.
+  #
+  # That is not a theoretical failure. The kubelet creates a volumeMount's `subPath`
+  # directory at mount time, through this access point, as 10001 -- so a root-owned root
+  # directory fails the pod at `CreateContainerConfigError` before its first container
+  # starts, with `failed to create subPath directory`. `workspaces` does not exist in the
+  # bucket, so S3 Files creates it here, owned by the identity that has to write into it,
+  # and every per-Session directory below it inherits that ownership by being created by
+  # a process the access point has already squashed to 10001.
+  #
+  # It is also why the workspace does not live under `sessions/`, where ADR-036's
+  # per-Session shape would otherwise have put it: that prefix exists and is root-owned.
+  # The split it forces turns out to be the one the design wanted anyway -- `sessions/`
+  # holds sealed artifacts written through the S3 API, `workspaces/` holds live mutable
+  # state written through NFS by the pod. Different writers, different lifecycles.
+  root_directory {
+    path = "/workspaces"
+
+    creation_permissions {
+      owner_uid   = local.session_uid
+      owner_gid   = local.session_gid
+      permissions = "0755"
+    }
+  }
+
+  tags = {
+    Name = "map-dev-session-workspaces"
+  }
+}
+
 output "session_vfs_file_system_id" {
   description = "What the PersistentVolume's volumeHandle names."
   value       = aws_s3files_file_system.session_vfs.id
@@ -570,4 +615,9 @@ output "session_vfs_file_system_id" {
 output "session_vfs_access_point_id" {
   description = "The access point that forces uid/gid 10001 on every file operation."
   value       = aws_s3files_access_point.session_vfs.id
+}
+
+output "session_workspaces_access_point_id" {
+  description = "The access point a Session pod's PersistentVolume mounts; its root is `workspaces/`."
+  value       = aws_s3files_access_point.session_workspaces.id
 }

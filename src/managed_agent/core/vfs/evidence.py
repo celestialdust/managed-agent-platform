@@ -253,6 +253,23 @@ class CaptureContext:
     capture_point: CapturePoint
 
 
+class EvidenceStorageUnconfigured(RuntimeError):
+    """No object bucket is named, so a payload has nowhere to be written.
+
+    Defined beside the two ports rather than in the adapter that first raised it,
+    because it is part of what a caller must be prepared for when it holds one of these
+    Protocols -- and a caller cannot import the adapter. The layer linter bans
+    `managed_agent.adapters` outside `adapters/` and `composition.py`, so an exception
+    living there is one no upstream handler is allowed to name; the Tool Gateway's error
+    map could only catch it as a bare `RuntimeError` and reported an unset bucket as the
+    registered server failing a call that server had in fact completed.
+
+    A `RuntimeError` rather than a domain error because it is a deployment that is
+    wrong, not a request: no argument a tenant could send makes it go away, and nothing
+    inside a running process can correct it.
+    """
+
+
 class EvidenceBlobs(Protocol):
     """The three object-store operations Evidence needs, and no others."""
 

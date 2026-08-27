@@ -151,6 +151,27 @@ class ErrorCode(StrEnum):
     # mistyped id, and 409 is what the surface already answers for a request refused by
     # the state of the thing it names rather than by its own shape.
     SKILL_OWNED_BY_COMMIT = "skill.owned_by_commit"
+    # Added 2026-08-25. A Turn whose agent wrote a produced path it had already
+    # delivered, with different bytes. Not `TURN_UNDELIVERABLE`, which is a 502 and
+    # which this wore until then: 502 tells a caller the platform failed and the two
+    # moves it invites -- retry, and report it -- are both wrong. Retrying re-runs an
+    # agent that writes the same path again, and there is nothing to report. 409 and
+    # the same reading `RESOURCE_FILENAME_ATTACHED` carries: the request was
+    # well-formed and the state of the thing it names refused it. The refusal's
+    # `detail` carries the path, because a Session that produced several files leaves
+    # the caller no way to tell which one collided -- and knowing which is the whole of
+    # the next move, which is to write it under a different name.
+    OUTPUT_NOT_REVISABLE = "output.not_revisable"
+    # Added 2026-08-25 with the tool-result route. A question a tool call put to the
+    # Session, marked by whoever put it as one whose answer is a credential. Refused
+    # rather than recorded: the answer to a tool-call question comes to rest in the
+    # Event Log, on the tenant's retention clock, and in the Rollout copied out of the
+    # pod -- two stores built to be read back and neither built to hold a secret. 409
+    # and the reading `OUTPUT_NOT_REVISABLE` carries: the request is well-formed, and
+    # what refuses it is the state of the thing it names. Its own member rather than
+    # `REQUEST_INVALID` because the next move is specific and is not "fix your request"
+    # -- the value goes into a Vault, which a tool already reads its credentials from.
+    ELICITATION_SECRET_REFUSED = "elicitation.secret_refused"
     WEBHOOK_NOT_FOUND = "webhook.not_found"
     VAULT_NOT_FOUND = "vault.not_found"
     CREDENTIAL_NOT_FOUND = "credential.not_found"
@@ -250,6 +271,8 @@ def _status(code: ErrorCode) -> int:
             | ErrorCode.RESOURCE_FILENAME_ATTACHED
             | ErrorCode.THREAD_RUNNING
             | ErrorCode.SKILL_OWNED_BY_COMMIT
+            | ErrorCode.OUTPUT_NOT_REVISABLE
+            | ErrorCode.ELICITATION_SECRET_REFUSED
         ):
             return 409
         case ErrorCode.TOOL_NOT_GRANTED | ErrorCode.TOOL_OUT_OF_SCOPE:
@@ -394,6 +417,8 @@ def _public_type(code: ErrorCode) -> PublicErrorType:
             | ErrorCode.SKILL_VERSION_RETIRED
             | ErrorCode.THREAD_RUNNING
             | ErrorCode.SKILL_OWNED_BY_COMMIT
+            | ErrorCode.OUTPUT_NOT_REVISABLE
+            | ErrorCode.ELICITATION_SECRET_REFUSED
         ):
             return PublicErrorType.INVALID_REQUEST
         case _ as unreachable:

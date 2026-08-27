@@ -128,7 +128,14 @@ class RecordingCluster:
         return PodPhase.ABSENT
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("a test in this file released a Session's pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
 
 class FixedPhase:
@@ -151,7 +158,14 @@ class FixedPhase:
         return self._phase
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("a test in this file released a Session's pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
 
 @dataclass(frozen=True, slots=True)
@@ -474,26 +488,32 @@ class UnusedAppend:
 
     This began as a fake that refused every append, on the premise that no case here
     reaches a pod dialled and RUNNING so no Turn event can be produced. That premise
-    still holds for Turn events and stopped holding for placement: `session.placing` is
-    appended *before* the wait for a pod, which is the whole point of it -- a tenant
-    cannot see "waiting for a node" in an event emitted after the node arrives. So it is
-    now reached by every case that places a pod, and refusing it turned eleven passing
-    tests red without anything being wrong.
+    still holds for Turn events and stopped holding for the two events a placement
+    itself writes -- `session.placing` before the wait, which is the whole point of it,
+    and `session.resumed` after it, which says a Session that had no pod now has one.
+    Both are reached by every case here that places a pod, and refusing either turns
+    passing tests red without anything being wrong.
 
-    Recorded rather than ignored, so a case that wants to assert the placement event
-    can. Refusal is kept for every other type: a case that somehow got past the phase
-    check should still fail on that rather than on an assertion about a fake HTTP
-    exchange nobody wrote.
+    Recorded rather than ignored, so a case that wants to assert either event can.
+    Refusal is kept for every other type: a case that somehow got past the phase check
+    should still fail on that rather than on an assertion about a fake HTTP exchange
+    nobody wrote. What the two events say is graded in
+    `test_placement_is_visible_to_the_tenant.py`, where the log is real; this only has
+    to stop being in the way.
     """
 
+    _PLACEMENT_EVENTS = frozenset(
+        {placement.SESSION_PLACING, lifecycle.SESSION_RESUMED}
+    )
+
     def __init__(self) -> None:
-        self.placements: list[tuple[SessionId, dict[str, object]]] = []
+        self.placements: list[tuple[SessionId, str, dict[str, object]]] = []
 
     async def append(
         self, session_id: SessionId, type_: str, payload: dict[str, object]
     ) -> Seq:
-        if type_ == placement.SESSION_PLACING:
-            self.placements.append((session_id, payload))
+        if type_ in self._PLACEMENT_EVENTS:
+            self.placements.append((session_id, type_, payload))
             return Seq(len(self.placements))
         raise AssertionError(f"a test in this file appended {type_}")
 
@@ -557,6 +577,7 @@ def _harness(
     attachments: AttachedFiles | None = None,
     file_ids: tuple[FileId, ...] = (),
     attached_later: tuple[FileId, ...] = (),
+    attached_after_a_turn: tuple[FileId, ...] = (),
     attach_before_creation: tuple[FileId, ...] = (),
     environment_revision: int | None = None,
 ) -> Harness:
@@ -609,15 +630,23 @@ def _harness(
         file_ids=[str(one) for one in file_ids],
         **pinned,
     )
-    # After the creation event and before any Turn, which is where a real attach lands:
-    # `POST /v1/sessions/{id}/resources` accepts one only while the Session would still
-    # take a Turn, and a Session that has completed none has no pod yet -- so the event
-    # sits here waiting for the placement this harness drives.
+    # After the creation event and before any Turn, which is one of the two places a
+    # real attach lands: `POST /v1/sessions/{id}/resources` accepts one whenever the
+    # Session would still take a Turn, and no pod exists to push into, so the event sits
+    # here waiting for the placement this harness drives.
     for late in attached_later:
         log.append(session_id, resource.SESSION_FILE_ATTACHED, file_id=str(late))
     if completed_a_turn:
         log.append(session_id, turn.TURN_SUBMITTED, turn_id=str(new_turn_id()))
         log.append(session_id, turn.TURN_COMPLETED, turn_id=str(new_turn_id()))
+    # The other place, and it needs its own parameter because position in the log is the
+    # whole difference: this is an attach to a Session that has already run. The route
+    # used to push those bytes itself, on the reading that a Session past its first Turn
+    # had a pod standing; under ADR-041 it has none, so this event is delivered the same
+    # way every other one is -- by the next Turn's placement, which is what the fold
+    # below has to pick up.
+    for after in attached_after_a_turn:
+        log.append(session_id, resource.SESSION_FILE_ATTACHED, file_id=str(after))
     placement = Placement(cluster)
     return Harness(
         session_id=session_id,
@@ -665,7 +694,7 @@ def _harness(
         (PodPhase.ABSENT, False, True, "starting"),
         (PodPhase.ABSENT, True, True, "starting"),
         (PodPhase.STARTING, False, False, "starting"),
-        (PodPhase.GONE, False, False, "gone"),
+        (PodPhase.GONE, False, True, "gone"),
         (PodPhase.RUNNING, False, False, None),
     ],
 )
@@ -684,6 +713,21 @@ async def test_what_a_turn_does_about_each_phase_the_cluster_can_report(
     pod either: it fails at the HTTP call, which is what a transport with no shim to
     dial does. What it proves here is that placement was not attempted for a Session
     that already has a pod.
+
+    **The GONE row places now, and did not before.** GONE covers a pod whose object is
+    still addressable but which nothing may be dispatched into -- one stamped for
+    deletion, or one that reached Succeeded or Failed. When a Session held a pod for its
+    whole life, finding either meant something had gone wrong that a new pod would not
+    fix, so the Turn refused without placing. Under ADR-041's per-Turn lease the
+    commonest way to find one is that the previous Turn released it a moment ago and the
+    grace period has not run out, so refusing failed every second Turn inside that
+    window. The refusal is still expected here because `FixedPhase` never leaves the
+    phase it was built with -- a cluster where the replacement does not come up either,
+    which is a real ending and the right one to refuse on.
+
+    STARTING keeps its row unchanged, and the difference is worth saying: a pod on its
+    way up belongs to a Turn that is already placing it, and a second placement over it
+    would be two pods for one Session.
     """
     cluster = RecordingCluster() if phase is PodPhase.ABSENT else FixedPhase(phase)
     harness = _harness(cluster=cluster, completed_a_turn=completed_a_turn)
@@ -1217,3 +1261,48 @@ def _accepted_at(token: str, second: int) -> bool:
     except InvalidSessionToken:
         return False
     return True
+
+
+async def test_a_file_attached_after_a_turn_is_carried_by_the_next_placement() -> None:
+    """The guarantee that replaced the attach route's own push, graded on its own.
+
+    `POST /v1/sessions/{id}/resources` used to PUT the bytes into a running pod whenever
+    the Session had completed a Turn, because a completed Turn meant a pod was standing
+    and meant placement would not run again. ADR-041 falsified both halves at once: the
+    pod goes when its Turn does, and the next Turn places another. The route now appends
+    and nothing else, which is only safe if the fold that builds a placement's file set
+    reaches an attach event sitting *after* the Turn events -- so that is what this
+    asserts, with the event in exactly that position.
+
+    Both files, and in log order. The file the Session was created with is not
+    re-derived from anywhere else, so a fold that restarted at the attach would deliver
+    the appendix into a workspace with no brief in it, and the agent would read a
+    document referring to one that is not there.
+    """
+    created_with, attached = new_file_id(), new_file_id()
+    placement = RecordingFilePlacement()
+    harness = _harness(
+        cluster=RecordingCluster(),
+        attachments=AttachedFiles(
+            HoldsTheseFiles(
+                {
+                    created_with: ("brief.md", b"# Brief\n"),
+                    attached: ("appendix.md", b"# Appendix\n"),
+                }
+            ),
+            placement,
+        ),
+        file_ids=(created_with,),
+        completed_a_turn=True,
+        attached_after_a_turn=(attached,),
+    )
+    with pytest.raises(TurnUndeliverable):
+        await harness.take_a_turn()
+
+    assert [(name, body) for _, name, body in placement.placed] == [
+        ("brief.md", b"# Brief\n"),
+        ("appendix.md", b"# Appendix\n"),
+    ], (
+        "a file attached after this Session's last Turn did not reach the pod the next "
+        "Turn placed, so the attach route accepted a document nothing will ever deliver"
+    )

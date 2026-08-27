@@ -56,6 +56,7 @@ from managed_agent.control.skills.evaluation import (
 from managed_agent.control.webhooks.registry import CallbackUrl, WebhookRecord
 from managed_agent.core.ids import DefinitionId, Seq, SessionId, TenantId
 from managed_agent.core.ports import Resolution, SessionListing, UnknownDefinition
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.definition import AgentDefinition, VersionFact
 from managed_agent.core.registration.environment import Environment, EnvironmentId
 from managed_agent.core.registration.scope_binding import (
@@ -65,7 +66,7 @@ from managed_agent.core.registration.scope_binding import (
     StreamableHttpServer,
     UnknownTool,
 )
-from managed_agent.core.session.session import SessionRecord, SessionState
+from managed_agent.core.session.session import SessionRecord
 
 _SHA = "0" * 39 + "a"
 
@@ -138,6 +139,9 @@ class InMemoryToolRegistry:
         for tool in registration.tools:
             self._tools[(tenant_id, tool.name)] = RegisteredTool(
                 name=tool.name,
+                advertised_name=advertised_name_for(
+                    registration.server_name, tool.name
+                ),
                 remote_name=tool.remote_name,
                 parameters=tool.parameters,
                 scope_bindings=tool.scope_bindings,
@@ -280,6 +284,11 @@ class Harness:
             "/v1/mcp_servers",
             json=_registration_body(**overrides),
             headers={TENANT_HEADER: str(self.tenant)},
+        )
+
+    def catalog(self) -> SyncResponse:
+        return self.client.get(
+            "/v1/mcp_servers", headers={TENANT_HEADER: str(self.tenant)}
         )
 
 
@@ -466,6 +475,129 @@ def test_the_route_is_reachable_on_the_real_app_under_the_version_prefix(
     assert "/v1/mcp_servers" in create_app(_unused_platform()).openapi()["paths"]
 
 
+def test_the_catalog_lists_every_registered_tool_under_the_server_it_lives_behind(
+    harness: Harness,
+) -> None:
+    """What a Grant may name, grouped under the server that offers it.
+
+    Two servers rather than one: a handler that flattened everything under the first
+    server it saw would satisfy a single-server catalog, and a caller reading it would
+    be told the wrong server owns half its tools.
+
+    `advertised_name` is carried beside `name` because that -- not `name` -- is the
+    string a Grant is written with, and it is the one field a caller cannot derive
+    without knowing how this platform joins the two halves.
+    """
+    assert (
+        harness.register(
+            tools=[_tool_body("read_wiki_structure", parameters={"repoName": "string"})]
+        ).status_code
+        == 201
+    )
+    assert (
+        harness.register(
+            server_name="weather",
+            tools=[
+                _tool_body(
+                    "forecast",
+                    parameters={"city": "string"},
+                    scope_bindings=[{"dimension": "region", "argument": "city"}],
+                )
+            ],
+        ).status_code
+        == 201
+    )
+
+    response = harness.catalog()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "servers": [
+            {
+                "server_name": "deepwiki",
+                "tools": [
+                    {
+                        "name": "read_wiki_structure",
+                        "advertised_name": "deepwiki__read_wiki_structure",
+                    }
+                ],
+            },
+            {
+                "server_name": "weather",
+                "tools": [{"name": "forecast", "advertised_name": "weather__forecast"}],
+            },
+        ]
+    }
+
+
+def test_another_tenants_catalog_is_absent_and_the_owner_still_reads_its_own(
+    harness: Harness,
+) -> None:
+    """The tenant goes into the store, so a stranger's tools are never fetched.
+
+    Both halves are asserted: the stranger reads an empty catalog *and* the owner still
+    reads its own. A guard on the first half alone is satisfied by a route that returns
+    nothing to anybody.
+    """
+    assert harness.register().status_code == 201
+
+    stranger = harness.client.get(
+        "/v1/mcp_servers", headers={TENANT_HEADER: str(uuid.uuid4())}
+    )
+
+    assert stranger.status_code == 200, stranger.text
+    assert stranger.json() == {"servers": []}
+    assert harness.catalog().json()["servers"][0]["server_name"] == "deepwiki"
+
+
+def test_a_tenant_that_has_registered_nothing_reads_an_empty_catalog(
+    harness: Harness,
+) -> None:
+    """200 and an empty list, rather than 404.
+
+    A tenant that has registered nothing has an empty catalog, and that is an answer. A
+    404 would say the route is not there and send a caller looking for a path that does
+    not exist.
+    """
+    response = harness.catalog()
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"servers": []}
+
+
+def test_reading_the_catalog_requires_a_tenant(harness: Harness) -> None:
+    """No tenant, no catalog -- rather than one tenant's tools answered to anyone."""
+    response = harness.client.get("/v1/mcp_servers")
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "request.tenant_missing"
+
+
+def test_the_catalog_carries_no_endpoint_and_no_credential_reference(
+    harness: Harness,
+) -> None:
+    """It answers what may be granted, and nothing about how the server is reached.
+
+    A registered endpoint carries a url and `credential_ref`, a name in the vault.
+    Neither is needed to write a Grant, and the reference buys nothing on its own --
+    which is exactly what makes leaking it easy to wave through. The assertion is over
+    the whole serialized body rather than over the fields this handler builds today, so
+    it still holds if the view grows one.
+    """
+    assert harness.register().status_code == 201
+
+    response = harness.catalog()
+    body = response.text
+
+    # The positive control first. Both absences below hold just as well against a 405
+    # or an empty body, so without a line proving the catalog is really here and really
+    # populated this test passes while the route does not exist at all.
+    assert response.status_code == 200, body
+    assert "deepwiki__ask_question" in body
+    assert "credential_ref" not in body
+    assert "mcp.deepwiki.com" not in body
+
+
 def _unused_platform() -> Platform:
     """Ports that would raise if a route reached them; this test reaches none."""
     log, registry = InMemoryLog(), InMemoryToolRegistry()
@@ -563,6 +695,14 @@ async def test_a_refused_registration_leaves_nothing_a_definition_could_reach(
     was not written first -- a registration that inserted its server row before
     discovering the tool collision would leave a server nothing can reach and a name
     the tenant cannot re-use, and the 409 would look identical.
+
+    **The collision is on the joined name, which is the only kind there still is.**
+    Re-using a tool name behind a second server stopped being a collision in `0032`:
+    a tool is identified by its (server, tool) pair, and the two rows resolve to two
+    servers. What still cannot happen is two rows advertising one string to the Agent
+    Runtime, so this forces that directly -- server `a` offering `b__c` and server
+    `a__b` offering `c` both join to `a__b__c`. That the join is ambiguous for such a
+    pair is not a defect being worked around; it is why the store keeps the index.
     """
     registry = PostgresToolRegistry(engine)
     platform = Platform(
@@ -584,15 +724,17 @@ async def test_a_refused_registration_leaves_nothing_a_definition_could_reach(
     ) as client:
         assert (
             await client.post(
-                "/v1/mcp_servers", json=_registration_body(), headers=tenant
+                "/v1/mcp_servers",
+                json=_registration_body(server_name="a", tools=[_tool_body("b__c")]),
+                headers=tenant,
             )
         ).status_code == 201
 
         refused = await client.post(
             "/v1/mcp_servers",
             json=_registration_body(
-                server_name="acme-wiki",
-                tools=[_tool_body(), _tool_body("read_wiki_contents")],
+                server_name="a__b",
+                tools=[_tool_body("c"), _tool_body("read_wiki_contents")],
             ),
             headers=tenant,
         )
@@ -602,11 +744,11 @@ async def test_a_refused_registration_leaves_nothing_a_definition_could_reach(
         refused.json()["error"]["code"]
         == "tool_registration.tool_name_already_registered"
     )
-    assert [tool.name for tool in await registry.list_for_tenant(tenant_id)] == [
-        "ask_question"
-    ]
+    assert [
+        tool.advertised_name for tool in await registry.list_for_tenant(tenant_id)
+    ] == ["a__b__c"]
     with pytest.raises(UnknownTool):
-        await registry.lookup(tenant_id, "read_wiki_contents")
+        await registry.lookup(tenant_id, "a__b__read_wiki_contents")
 
 
 class UnusedSessionRegistry:
@@ -641,7 +783,7 @@ class UnusedWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         raise AssertionError("a test in this file registered a webhook")
@@ -653,9 +795,9 @@ class UnusedWebhooks:
         raise AssertionError("a test in this file deleted a webhook")
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        raise AssertionError("a test in this file asked what watches a state")
+        raise AssertionError("a test in this file asked what watches a type")
 
 
 class UnusedEnvironmentStore:

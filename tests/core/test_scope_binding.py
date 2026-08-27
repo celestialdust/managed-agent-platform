@@ -21,6 +21,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.scope_binding import (
     ParameterType,
     RegisteredTool,
@@ -253,6 +254,7 @@ def test_a_registered_tool_round_trips_through_the_json_shape_a_row_holds() -> N
     read_back = RegisteredTool.model_validate(
         {
             "name": tool.name,
+            "advertised_name": advertised_name_for("deepwiki", tool.name),
             "remote_name": tool.remote_name,
             "parameters": {
                 argument: declared.value
@@ -268,5 +270,10 @@ def test_a_registered_tool_round_trips_through_the_json_shape_a_row_holds() -> N
 
     assert read_back.parameters == tool.parameters
     assert read_back.scope_bindings == tool.scope_bindings
+    # The three names stay three: the bare one the server reports, and the joined one
+    # the model is shown. A read that collapsed them would make the Gateway advertise
+    # a name no Grant was written against.
+    assert read_back.name == tool.name
+    assert read_back.advertised_name == f"deepwiki__{tool.name}"
     assert isinstance(read_back.endpoint, StreamableHttpServer)
     assert read_back.endpoint.url == "https://mcp.deepwiki.com"

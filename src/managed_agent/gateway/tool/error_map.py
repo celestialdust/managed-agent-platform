@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from typing import Final
+from typing import Final, assert_never
 from uuid import uuid4
 
 import httpx2
@@ -42,7 +42,10 @@ from mcp.types import (
 )
 
 from managed_agent.core.errors import ErrorCode, ErrorEnvelope
+from managed_agent.core.ports import SessionNotVisible
+from managed_agent.core.vfs.evidence import EvidenceStorageUnconfigured
 from managed_agent.gateway.tool.credential_broker import CredentialUnavailable
+from managed_agent.gateway.tool.scope_clamp import ScopeRefusal
 
 _log = logging.getLogger(__name__)
 
@@ -85,8 +88,19 @@ def _classify_one(exc: BaseException) -> ErrorCode:
     since Python 3.11, so a second arm for it would be unreachable. `OSError` is not
     dead weight next to the `httpx2` arms: a stdio registration naming a command that
     is not on PATH fails as `FileNotFoundError` before any protocol runs.
+
+    `SessionNotVisible` is the one arm here that is not about an upstream at all. It
+    reaches this module because a tool call reads the Session's Scope before it opens
+    anything, and that read is deliberately inside the same `try` as the call -- so a
+    Session the store will not hand back arrives beside the transport failures without
+    being one. Without an arm it falls to `INTERNAL`, which is reserved for a fault of
+    this platform's own; a Session swept at the end of its retention window is a
+    routine tenant-side condition, and calling it ours would send an operator looking
+    for a malfunction that is not there.
     """
     match exc:
+        case SessionNotVisible():
+            return ErrorCode.SESSION_NOT_FOUND
         case CredentialUnavailable():
             return ErrorCode.TOOL_UNAVAILABLE
         case MCPError():
@@ -100,7 +114,11 @@ def _classify_one(exc: BaseException) -> ErrorCode:
 
 
 def classify(exc: BaseException) -> ErrorCode:
-    """Which published code one upstream failure becomes.
+    """Which published code one failure on the call path becomes.
+
+    Almost always an upstream's failure, and not always: the Session's Scope is read on
+    that path too, so `SessionNotVisible` is classified here as well -- see the arm in
+    `_classify_one`.
 
     `INTERNAL` is reserved for a fault of this platform's own and is deliberately not
     the bucket everything unrecognized falls into: a server nobody can reach is the
@@ -139,43 +157,212 @@ def refusal(code: ErrorCode, subject: str, correlation_id: str) -> ErrorEnvelope
     )
 
 
-def out_of_scope(tool_name: str, dimension: str) -> ErrorEnvelope:
-    """The refusal for a call this Session's Scope could not narrow.
+def _scope_mismatch_said(tool_name: str, dimension: str, cause: ScopeRefusal) -> str:
+    """The sentence for one direction of a Scope-versus-bindings mismatch.
+
+    Two sentences because the tenant's next move differs and only one of them is true
+    of any given call. Told "this Session's Scope does not carry one" about a dimension
+    their Scope plainly carries, a reader goes looking at the half of the pair that is
+    already correct -- so a single sentence covering both would be actively misleading
+    rather than merely vague.
+
+    Matched exhaustively, so a third cause added to `ScopeRefusal` fails to type-check
+    here rather than falling through to whichever sentence was written last.
+    """
+    match cause:
+        case ScopeRefusal.DIMENSION_NOT_IN_SCOPE:
+            return (
+                f"the call to {tool_name} was not made: it is registered to be "
+                f"narrowed by the Scope dimension {dimension}, and this Session's "
+                f"Scope does not carry one"
+            )
+        case ScopeRefusal.DIMENSION_NOT_BOUND:
+            return (
+                f"the call to {tool_name} was not made: this Session's Scope narrows "
+                f"{dimension}, and {tool_name} declares no Scope Binding that could "
+                f"hold the call to it"
+            )
+        case _ as unreachable:
+            assert_never(unreachable)
+
+
+def out_of_scope(tool_name: str, dimension: str, cause: ScopeRefusal) -> ErrorEnvelope:
+    """The refusal for a call that could not be held to this Session's Scope.
 
     Its own function rather than `refusal` above, because that one's text says the
     registered server did not complete the call and here no server was reached at all
     -- nothing was opened, no credential was read, and a message saying otherwise would
     send whoever reads it looking at an upstream that never saw the request.
 
-    Names the tool and the dimension and no value. Both names came from the tenant's
-    own registration, so echoing them discloses nothing; a Scope *value* in here would
-    let a model read one refusal and learn what the Session is bounded to.
+    One code and one shape for both directions of the mismatch, and two sentences: the
+    caller branches on `tool.out_of_scope` either way, and reads which half to fix.
+
+    Names the tool and the dimension and no value. Both names came from the tenant --
+    one out of their registration, one out of the Scope on their own create call -- so
+    echoing them discloses nothing; a Scope *value* in here would let a model read one
+    refusal and learn what the Session is bounded to.
 
     No correlation id, unlike every other envelope this module builds, and the
     omission is deliberate rather than an oversight. The others carry one because they
     stand in for a cause that was logged and withheld; this refusal withholds nothing.
-    The registration binds this dimension, this Session's Scope does not carry it, and
-    both halves are already in the message -- an id here would point at a log line
-    holding strictly less than the reader is already looking at.
+    Which dimension, and which way it failed to meet the bindings, are both already in
+    the message -- an id here would point at a log line holding strictly less than the
+    reader is already looking at.
+
+    The log line carries the cause as well, because the two want different fixes from
+    different people: one is a Scope the Session was created with, the other a binding
+    the registration never declared.
     """
     _log.warning(
-        "tool call refused as out of scope tool=%s dimension=%s", tool_name, dimension
+        "tool call refused as out of scope tool=%s dimension=%s cause=%s",
+        tool_name,
+        dimension,
+        cause.value,
     )
     return ErrorEnvelope(
         code=ErrorCode.TOOL_OUT_OF_SCOPE,
-        message=(
-            f"the call to {tool_name} was not made: it is registered to be narrowed "
-            f"by the Scope dimension {dimension}, and this Session's Scope does not "
-            f"carry one"
-        ),
+        message=_scope_mismatch_said(tool_name, dimension, cause),
         detail={"subject": tool_name, "dimension": dimension},
     )
 
 
+def argument_not_offered(tool_name: str, argument: str) -> ErrorEnvelope:
+    """The refusal for a call that supplied an argument the Session's Scope fills.
+
+    Its own function rather than `out_of_scope` above, whose sentence says this
+    Session's Scope does not carry the dimension -- here it carries it, and the call
+    was refused for the opposite reason. A caller told the wrong one of those goes
+    looking at the Session it was given instead of at the argument it sent.
+
+    Its own sentence, but the same code, and that is deliberate. `REQUEST_INVALID`
+    would read as "this argument was malformed", which invites the caller to try
+    another value -- and trying another value is the probing loop the whole decision
+    closes. `TOOL_OUT_OF_SCOPE` says the platform holds this field, which is both true
+    and unrewarding to retry against.
+
+    Names the tool and the argument and neither value. The argument's name came from
+    the caller's own call, and it is the one thing it needs in order to stop sending
+    it. The value it attempted and the value the Scope holds are the two strings that
+    would let a model read the Session's bounds back out of a refusal, so neither is
+    here (ADR-034).
+
+    Nothing is logged here, unlike its two neighbours. The attempt is already recorded
+    by `scope_clamp.narrow` at the point it was detected, at WARNING and carrying the
+    attempted value this envelope may not repeat -- a second line here would be a
+    strictly poorer copy of one an operator already has.
+    """
+    return ErrorEnvelope(
+        code=ErrorCode.TOOL_OUT_OF_SCOPE,
+        message=(
+            f"the call to {tool_name} was not made: {argument} is written from this "
+            f"Session's Scope and is not offered in this tool's schema"
+        ),
+        detail={"subject": tool_name, "argument": argument},
+    )
+
+
+def session_unreadable(tool_name: str) -> ErrorEnvelope:
+    """The refusal for a call whose Session could not be read at all.
+
+    Its own function rather than `refusal`, for the reason `out_of_scope` above gives:
+    that sentence says the registered server did not complete the call, and here the
+    Scope read that failed happens before anything is opened -- no connection, no
+    credential, no request. A message blaming the server would send whoever reads it to
+    an upstream that never heard of this call.
+
+    **It says the Session could not be read and never which way.** The store answers a
+    Session that is gone and a Session belonging to somebody else with one exception on
+    purpose, so that a caller holding an id cannot learn from a refusal whether the id
+    names another tenant's Session. Two sentences here would rebuild that oracle one
+    layer out, so there is one -- and it carries no Session id either, since the only
+    reader of this envelope is an agent inside the Session the id would name.
+
+    No correlation id, like `out_of_scope` and unlike `refusal`: the withheld cause is
+    an exception whose whole content is the id of a Session the caller is already
+    running inside, so an id pointing at a log line holding that would be pointing at
+    nothing the reader wants.
+    """
+    _log.warning("tool call refused, session not readable tool=%s", tool_name)
+    return ErrorEnvelope(
+        code=ErrorCode.SESSION_NOT_FOUND,
+        message=(
+            f"the call to {tool_name} was not made: this Session could not be read, "
+            f"so nothing could narrow the call to its Scope"
+        ),
+        detail={"subject": tool_name},
+    )
+
+
+def evidence_unrecordable(tool_name: str, correlation_id: str) -> ErrorEnvelope:
+    """The refusal for a call this platform could not record Evidence for.
+
+    Its own function rather than `refusal`, for the reason `session_unreadable` above
+    gives, and here the sentence is false in both halves: the registered server did
+    complete the call, and what failed afterwards was this platform's own storage. A
+    tenant handed "the registered server did not complete the call" goes and reads the
+    logs of a service that did exactly what it was asked.
+
+    **The call is still refused, and the message says so.** Evidence is not a side
+    record that can be skipped when it is inconvenient -- a large tool result handed to
+    the model with nothing recording it is the one outcome the capture design exists to
+    make unreachable, so a result that cannot be recorded is not returned. The tenant's
+    move is to tell whoever runs this deployment, which is why the text points at the
+    platform rather than at anything they can change.
+
+    A correlation id, unlike `session_unreadable`: the withheld cause names an
+    environment variable and a deployment, which is exactly what an operator reading the
+    log needs and exactly what must not go on the wire.
+    """
+    return ErrorEnvelope(
+        code=ErrorCode.INTERNAL,
+        message=(
+            f"the call to {tool_name} completed but this platform could not record its "
+            f"Evidence, so the result was not returned; the cause is recorded under "
+            f"{correlation_id}"
+        ),
+        detail={"subject": tool_name, "correlation_id": correlation_id},
+    )
+
+
+def _cannot_record_evidence(exc: BaseException) -> bool:
+    """Whether this failure is the Evidence store refusing for want of configuration.
+
+    Over the unwrapped leaves rather than the exception itself, because capture runs
+    inside the same task group as the call and arrives grouped with whatever else failed
+    while it was unwinding -- the same reason `classify` walks them.
+    """
+    return any(isinstance(leaf, EvidenceStorageUnconfigured) for leaf in _leaves(exc))
+
+
 def record(exc: BaseException, subject: str) -> ErrorEnvelope:
-    """Log the real failure under a fresh correlation id, return only the envelope."""
+    """Log the real failure under a fresh correlation id, return only the envelope.
+
+    One code leaves by a different door. `SESSION_NOT_FOUND` is not an upstream
+    failure -- it is the Session's own row failing to come back, which happens before
+    any server is reached -- so it takes `session_unreadable`'s envelope, and it takes
+    that function's WARNING rather than the ERROR below. An ERROR with a traceback is
+    what an operator is paged by, and a Session that has been swept is not something
+    for anyone to fix.
+    """
     code = classify(exc)
+    if code is ErrorCode.SESSION_NOT_FOUND:
+        return session_unreadable(subject)
     correlation_id = uuid4().hex
+    if _cannot_record_evidence(exc):
+        # Told apart here rather than by its code, because `INTERNAL` is honestly what
+        # a caller should see -- it IS this platform's fault -- and the two things that
+        # must change are the sentence and the log line, neither of which the code
+        # decides. An ERROR with the traceback either way: an operator should be paged
+        # for a deployment that cannot store Evidence, and the traceback is what tells
+        # them which variable is unset.
+        _log.error(
+            "evidence could not be recorded, so the call was refused "
+            "subject=%s correlation_id=%s",
+            subject,
+            correlation_id,
+            exc_info=exc,
+        )
+        return evidence_unrecordable(subject, correlation_id)
     _log.error(
         "upstream MCP failure subject=%s code=%s correlation_id=%s",
         subject,

@@ -18,7 +18,7 @@ API. They never see an agent loop. **This is the layer that makes handing them o
 
 - [Quick start](#quick-start)
 - [Repository layout](#repository-layout)
-- [The REST API](#the-rest-api) — headers, refusals, and all 67 operations
+- [The REST API](#the-rest-api) — headers, refusals, and all 71 operations
 - [Deploying it](#deploying-it) — prerequisites, one command, rollback
 - [Customizing it for your company](#customizing-it-for-your-company) — every seam, and the one that deliberately isn't there
 - [Development](#development) — the gates, the test tiers, and what a green run does not mean
@@ -108,11 +108,11 @@ This is the idea the whole enforcement design hangs on. A traditional app author
 task*. What that task may reach should be far narrower than what the person may reach —
 and it is not one permission but the **intersection of five separate narrowings**.
 
-![Five narrowings intersecting: user authorization, agent definition, skill revision, session grant and scope, tool-side enforcement](.github/readme/03-five-rings.svg)
+![Five narrowings intersecting: user authorization, agent definition, skill revision, session grant and scope, and the target service's own check](.github/readme/03-five-rings.svg)
 
-**Capability is an intersection, not a permission.** Two rings are real, one is the
-tenant's own, and two are narrower on paper than in the running system. Measured from the
-source rather than from a design document:
+**Capability is an intersection, not a permission.** Three rings are enforced here and
+two are the tenant's own — the person's authorization at the top, and the target service's
+own check at the bottom. Measured from the source rather than from a design document:
 
 **Scope is enforced.** Every tool declares, at registration, which of its arguments the
 Session's Scope constrains — a tool with no expressible Scope Binding cannot be registered
@@ -124,18 +124,33 @@ on disagreement rather than overwriting was considered and rejected: it would ha
 model an oracle — call with a guess, read whether you were refused, binary-search the
 Scope value.
 
-**The Grant shapes the tool list; it is not yet checked at the call site.** The catalogue
-the model is offered is rendered from the Session's Grant, so a tool the Session was not
-granted is not advertised. But the Gateway resolves a called name against *the tenant on
-the token*, not against that Session's Grant. So today the guarantee is tenant-level, and
-it should not be described to a customer as anything more. The structure is in place and
-the missing piece is a comparison at one call site.
+**The Grant is enforced, and the listing is not what enforces it.** The catalogue the
+model is offered is rendered from the Session's Grant, so an ungranted tool is not
+advertised — and the Gateway checks the Grant again when a name is actually called, on a
+path that never consulted the listing. The two checks are deliberately independent: a
+model that has seen a name once never lists again before calling it, so a filtered
+catalogue is a presentation choice and never a control. An empty Grant means no tools, not
+all of them.
 
-> **The pitfall we are currently standing in.** Treating the tool list as the
-> authorization is a mistake. A tool list describes what the model should *see*; real
-> authorization has to be checked by the gateway and by the target service. Our Tool
-> Gateway resolves a tool against the tenant on the token and consults no per-Session
-> Grant on that path — the code says so in its own comment.
+> **The pitfall, and how we got out of it.** Treating the tool list as the authorization
+> is a mistake — a tool list describes what the model should *see*. This platform stood in
+> that pitfall: `SessionRecord.grant` was written at creation and read by nothing, so every
+> Session could reach every tool its tenant had ever registered. The fix was a check at the
+> call site, not a better filter.
+
+**A Grant is resolved before a pod is paid for.** Every name in a Grant is checked against
+the tenant's registrations at Session creation, and every unresolved one is named in the
+refusal. Before that, a Session with a typo was created `201`, started unable to call
+anything, and reported it mid-Turn as a missing tool — on a pod already placed and billed.
+Because a Grant names tools by their *advertised* name (`server__tool`), which a tenant
+cannot derive without knowing how the platform joins the two halves, `GET /v1/mcp_servers`
+exists to hand back exactly those names.
+
+**What the last ring is, and why it is not ours.** The Tool Gateway calls your tool server
+on the gateway's own credential, so what that server sees is the gateway rather than the
+Session. A server holding data worth this much narrowing should check for itself too. That
+is defence in depth and it is deliberately outside this platform — a boundary we could
+only claim, never enforce.
 
 ### Where we depart: the brain and the hands
 
@@ -200,12 +215,26 @@ The pod runs the agent loop in a sandbox. It holds **no keys and no cloud identi
 cannot even write to the object store; the control plane reads the resume state out over
 the channel it already opened. The two gateways on the far side hold the credentials.
 
-![The topology: a tenant service calls the control plane, which places a Session pod holding no credential; the two gateways, the event log and the object store sit outside it](.github/readme/05-topology.svg)
+![The topology: a tenant service calls the control plane, which places a Session pod holding no credential and dials it over mTLS; the two gateways, the event log and the object store sit outside it](.github/readme/05-topology.svg)
 
 **The credential boundary is the whole topology.** Because the pod holds no key and no
 cloud identity, an agent that goes wrong cannot use one. It can only ask a gateway — and
 the gateway looks up what it is allowed to do rather than believing anything the pod says
 about itself.
+
+**The hops inside the cluster are mutually authenticated.** The control plane holds a
+private CA and mints a certificate for each Session pod at placement, mounting it beside
+the bearer token it already mounts, so a compromised node cannot read a Session's token
+off the wire. A pod is leased for one Turn, so the certificate never renews — there is no
+rotation to schedule and no expiry to alarm on, which is most of what a certificate
+manager is for. **The security bound is the name, not the clock:** each pod gets its own
+keypair and a certificate naming one pod, marked `CA: FALSE`. The pod runs tenant code
+inside a sandbox we assume is imperfect, so the honest question is what a stolen key buys
+— and the answer has to be nothing beyond the Session it already belonged to.
+
+The shim reads its own mount and decides: three files present means TLS with a required
+client certificate, none means plain HTTP, **two means refuse to start** rather than let
+the control plane dial the wrong scheme at it.
 
 ### One tool call, start to finish
 
@@ -220,7 +249,7 @@ Second, **large output is captured and hashed before it is handed back**, at the
 an enterprise result passes that the pod cannot reach, inside the tool's own deadline. So a
 call that cannot be recorded fails rather than succeeding unrecorded.
 
-![One tool call: the gateway resolves the name, refuses unknown and forbidden alike, clamps arguments to the Scope, then captures evidence before the model reads the result](.github/readme/06-one-tool-call.svg)
+![One tool call: the gateway resolves the name against this Session's Grant, refuses unknown and ungranted alike, clamps arguments to the Scope, then captures evidence before the model reads the result](.github/readme/06-one-tool-call.svg)
 
 ### What a crash costs
 
@@ -239,6 +268,33 @@ happened to fail.
 write of the resume state at every single turn, growing with how long the conversation has
 run. It is the one thing here that gets more expensive with a Session's *age* rather than
 its activity.
+
+**A Turn nobody closed wedges the Session, so something closes it.** The events that end a
+Turn are written by the control plane, and a control plane killed mid-Turn writes neither.
+What that leaves is worse than a slow Turn: the open Turn refuses the Session's next Turn,
+refuses its archive, and pins the pod sweep next door. **There is no call a tenant can make
+that gets out of it.** A sweep runs inside the process that serves requests — the control
+plane already holds every dependency it needs, so a CronJob would be a second entrypoint, a
+second Role and a second manifest around the same call. Four independent signals can close
+a Turn and any one is enough, the strongest being that its pod is simply gone.
+
+**Age is not one of those signals, and used to be.** Any Turn open longer than sixty
+minutes was closed regardless of what its pod was doing, until a real run was measured
+thirty-eight minutes in — forty-three live threads, still reporting, twenty-two minutes
+from the ceiling, and every phase it had not reached yet was one of the long ones. A clock
+can express that rule, which is the only thing that ever recommended it. **Age was never
+evidence of death; it was a proxy for one, from before the platform could see the real
+thing.**
+
+> **The gap that removing it opened, stated rather than left to be rediscovered.** A
+> runtime retrying an unreachable provider emits one frame every ~170 seconds and never
+> answers. Measured over fifteen minutes: the idle clock reset six times and never passed a
+> third of the threshold, so the silence signal never fires — and with the ceiling gone,
+> nothing else closes that Turn either. An hour was a bad bound on a working agent, and it
+> did close this one. Telling that run apart from a healthy one doing slow tool work is a
+> question of *rate*, and one measurement of each is not enough to pick a threshold that
+> will not kill working agents. Guessing at it would repeat exactly the mistake the ceiling
+> was.
 
 ### The log is the state
 
@@ -280,24 +336,29 @@ a real cluster are opt-in — see [Development](#development).
 
 ```
 src/managed_agent/
-  core/          vocabulary, ids and ports — Protocols only, no drivers
+  core/          vocabulary, ids and ports — seventeen Protocols, no drivers
+    vfs/         the lane types: sealed evidence and rewritable working files
+    tls/         signing one Session pod's certificate, and the CA that signs it
+    registration/ what a tool declaration is, and the Scope Binding it must carry
   control/       the tenant REST surface, session placement, files, skills, webhooks
+    sweep_loop.py the periodic sweeps, run inside the process that serves requests
   gateway/model/ the model wires and their classification tables
-  gateway/tool/  the MCP surface, the Scope clamp, evidence capture, the credential broker
+  gateway/tool/  the MCP surface, the Grant check, the Scope clamp, evidence capture
   session_shim/  the pod-local translator between platform vocabulary and the runtime wire
   adapters/      postgres · s3 · kubernetes · secrets
   composition.py the only place a port meets an implementation
 
-migrations/      the DDL; the append-only guarantees live here, not in the code
+migrations/      alembic; the append-only guarantees are constraints here, not code
 deploy/
   terraform/     the account: cluster, nodegroup, RDS, VPC, buckets, IAM
   k8s/           the manifests, including the model routing table
+  iam/           one policy document per workload role, read back by a test tier
   docker/        image builds and pushes
   seccomp/       the sandbox profile
   bootstrap.py   the cluster objects a Session pod needs
   platform.py    the applier — nine refusals kubectl apply cannot make
 tools/           the checks and utilities the Makefile calls
-tests/           224 files; conventions under Development
+tests/           248 files; conventions under Development
 ```
 
 ---
@@ -364,6 +425,9 @@ an endpoint cannot be added without appearing here.
 | `POST` | `/v1/sessions/{session_id}/resources` | attach one more file to a running Session |
 | `POST` | `/v1/sessions/{session_id}/resources/{resource_id}` | update one held resource |
 | `GET` | `/v1/sessions/{session_id}/artifacts/{path}` | download a file the agent produced, at the path it wrote |
+| `GET` | `/v1/sessions/{session_id}/workspace` | list what is on the agent's disk right now, at the top of its tree |
+| `GET` | `/v1/sessions/{session_id}/workspace/{path}` | list a directory, or read a file, as it stands this instant |
+| `POST` | `/v1/sessions/{session_id}/tool_calls/{call_id}/result` | answer a question a tool call is waiting on |
 
 #### Agent definitions — what the agent *is*, written down instead of coded
 
@@ -394,6 +458,7 @@ an endpoint cannot be added without appearing here.
 | method | path | |
 |---|---|---|
 | `POST` | `/v1/mcp_servers` | register a server and every tool it offers, or refuse the whole registration — this is the only place a tool enters the platform, and a tool with no expressible Scope Binding is refused here |
+| `GET` | `/v1/mcp_servers` | your registered servers and the tools behind each, under the exact names a Grant must use — carries no endpoint and no credential reference |
 
 #### Vaults and credentials — the values the pod never sees
 
@@ -463,19 +528,22 @@ an endpoint cannot be added without appearing here.
 ### The shape of a first integration
 
 ```
-1.  POST /v1/vaults                          → a vault
-2.  POST /v1/vaults/{id}/credentials         → the key your tool server needs
-                                               (the pod will never see this value)
-3.  POST /v1/mcp_servers                     → your tool server + its Scope Bindings
-4.  POST /v1/environments                    → the runtime image and its limits
-5.  POST /v1/agents                          → instructions, model, tool list, skills
-6.  POST /v1/sessions                        → Grant + Scope for this one task
-7.  POST /v1/sessions/{id}/events            → submit a Turn
-8.  GET  /v1/sessions/{id}/events/stream     → watch it work
-9.  GET  /v1/sessions/{id}/artifacts/{path}  → take the output back
+ 1.  POST /v1/vaults                          → a vault
+ 2.  POST /v1/vaults/{id}/credentials         → the key your tool server needs
+                                                (the pod will never see this value)
+ 3.  POST /v1/mcp_servers                     → your tool server + its Scope Bindings
+ 4.  GET  /v1/mcp_servers                     → the exact names a Grant must use
+ 5.  POST /v1/environments                    → the runtime image and its limits
+ 6.  POST /v1/agents                          → instructions, model, tool list, skills
+ 7.  POST /v1/sessions                        → Grant + Scope for this one task
+ 8.  POST /v1/sessions/{id}/events            → submit a Turn
+ 9.  GET  /v1/sessions/{id}/events/stream     → watch it work
+10.  GET  /v1/sessions/{id}/artifacts/{path}  → take the output back
 ```
 
-Steps 1–5 happen once per integration. Steps 6–9 are the loop your product runs.
+Steps 1–6 happen once per integration. Steps 7–10 are the loop your product runs. Step 4
+is a read, and it is in the list because a Grant naming a tool that does not resolve is
+refused at step 7 — cheaply, but only if you know what the names are.
 
 ---
 
@@ -664,6 +732,18 @@ declared, not argued about at call time.
 The credential your server needs goes in a vault and is referenced by name. The Gateway
 fetches it per call within a TTL and injects it; the pod never holds it and cannot ask
 for it.
+
+**A tool's name is scoped to its server, and the model is shown the pair joined.** Two
+servers may each offer `search`; what a Grant names, and what the model sees, is
+`crm__search`. Since a tenant cannot derive that join rule by guessing, `GET
+/v1/mcp_servers` hands back every server it registered and the tools behind each, under
+exactly the names a Grant must use. It carries no endpoint and no credential reference —
+a Grant is written from names and nothing else, so that is all the read gives up.
+
+**Then narrow per Session.** A Session's Grant is the subset of those names this one job
+may call, and it is frozen for the Session's life. A name that resolves to nothing is
+refused at creation rather than at the first tool call, so a typo costs a `400` instead of
+a placed pod.
 
 ### Bound what the agent may touch
 

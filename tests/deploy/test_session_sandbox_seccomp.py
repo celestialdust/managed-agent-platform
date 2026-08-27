@@ -451,6 +451,39 @@ def _kubectl(*argv: str, stdin: str | None = None) -> str:
     return done.stdout
 
 
+def _spike_image() -> str:
+    """The spike image, with the placeholder account swapped for this cluster's own.
+
+    `deploy/spike/pod.yaml` spells the registry account `000000000000`, the convention
+    across every manifest in this tree: the account is not a repository value, and the
+    appliers substitute it at apply time (`deploy/platform.py`, `deploy/bootstrap.py`
+    both say so where they do it). Nothing applies the spike pod -- it is a hand-run
+    artefact -- so this case is its only reader and has to substitute for itself.
+
+    Used raw, the reference names a registry in an account nobody has, and the pod sits
+    at ImagePullBackOff. That surfaced here as `kubectl logs` failing with "waiting to
+    start: trying and failing to pull image", which reads like a cluster problem rather
+    than a placeholder nobody filled in.
+
+    The registry is taken off a Deployment that is running rather than from
+    `sts get-caller-identity`, so this needs no credential beyond the kubectl the rest
+    of the file already uses, and it cannot disagree with the registry the cluster
+    actually pulls from.
+    """
+    declared = str(_SPIKE["spec"]["containers"][0]["image"])
+    running = json.loads(
+        _kubectl("get", "deploy", "control-plane", "-n", "map-dev", "-o", "json")
+    )
+    reference = str(running["spec"]["template"]["spec"]["containers"][0]["image"])
+    registry, _, path = declared.partition("/")
+    assert registry.endswith(".amazonaws.com"), (
+        f"deploy/spike/pod.yaml names {declared!r}, whose registry is not an ECR host, "
+        "so there is no account here to substitute and this helper is rewriting "
+        "something it does not understand"
+    )
+    return f"{reference.split('/')[0]}/{path}"
+
+
 def _probe_manifest() -> str:
     """A pod shaped like session-pod.yaml where it matters: the same uid, the same
     dropped capabilities, the same pod-level floor, and the container-level override
@@ -478,7 +511,7 @@ def _probe_manifest() -> str:
             "containers": [
                 {
                     "name": "probe",
-                    "image": _SPIKE["spec"]["containers"][0]["image"],
+                    "image": _spike_image(),
                     "imagePullPolicy": "Always",
                     "securityContext": runtime["securityContext"],
                     "command": ["/bin/sh", "-c", _PROBE_SCRIPT],

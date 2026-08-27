@@ -238,7 +238,7 @@ def rollout_key(session_id: SessionId) -> str:
 
 
 class RolloutSync:
-    """Ship-out at a completed Turn, restore at a resume, and no third operation."""
+    """Ship-out at the end of a Turn, restore at a resume, and no third operation."""
 
     def __init__(self, store: RolloutObjectStore) -> None:
         self._store = store
@@ -266,13 +266,30 @@ class RolloutSync:
 
 
 class ShipOutAtTurnCompletion:
-    """The `TurnCompleted` a completed Turn's durability hangs on.
+    """The `TurnCompleted` a Turn's durability hangs on, however that Turn ended.
 
     Satisfies `shim.turn_runner.TurnCompleted` structurally -- no import, because that
     Protocol lives on the pod-wire side and this module deliberately reaches none of it.
-    `HttpPodDispatch` awaits this after a Turn's terminal event is appended and only for
-    a Turn that actually completed, so a Turn that went quiet ships nothing. That is the
-    correct reading: there is no completed Turn to make durable.
+    `HttpPodDispatch` awaits this after a Turn's terminal event is appended, for a Turn
+    that completed and -- wired as `on_terminal` as well -- for one that ended without
+    completing. The second wiring is why the name says *completion* and the work says
+    *the Rollout as it stands*: nothing here reads the outcome, because the bytes a pod
+    holds are worth the same either way and the pod is about to be allowed to die.
+
+    This class was for a while the completed-only seam, and its docstring argued that
+    was the correct reading -- there being no completed Turn to make durable. That
+    argument was about the wrong noun. What a failed Turn has is a *conversation*, which
+    the runtime folded into compaction checkpoints no other record here reproduces, and
+    losing it is not the tenant declining to save work; it is the platform discarding
+    what the tenant already paid for.
+
+    **What this does NOT yet buy, and a reader should not assume it does.** The bytes
+    reach the store, and `restore_for_resume` cuts them at the last `turn_complete` on
+    the way back out, so a failed Turn's lines are stored and then dropped before they
+    reach the next pod. Widening that cut moves ADR-004's recovery boundary from the
+    last completed Turn to the last closed one, which is a decision this class is not
+    where to make. Until it is made, this seam is a prerequisite that is not yet a
+    remedy.
 
     **A pod holding no Rollout ships nothing rather than an empty object.** Overwriting
     a good stored Rollout with zero bytes destroys the very thing recovery reads, so the

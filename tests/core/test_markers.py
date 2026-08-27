@@ -450,9 +450,11 @@ def test_two_stretches_keep_their_own_causes_rather_than_being_merged() -> None:
 def test_a_marker_moves_the_state_fold_nowhere() -> None:
     """`project` has no case for a marker, so it advances the sequence and nothing else.
 
-    That totality is what lets this slice add an event type without editing the fold,
-    and it is exactly what a later diff could break -- so it is asserted by comparing
-    against the same log with the marker events taken out.
+    The fold reads the turn family now, so it is no longer total over everything -- but
+    a marker says which past work was abandoned rather than whether work is running, so
+    it is squarely in the population that still passes through untouched. Asserted by
+    comparing against the same log with the marker events taken out, which is the
+    comparison that fails the moment a row is added for one.
     """
     log = [
         _event(1, "session.created"),
@@ -462,7 +464,7 @@ def test_a_marker_moves_the_state_fold_nowhere() -> None:
         _event(5, "session.suspended"),
     ]
     without = [event for event in log if event.type != WORK_DISCARDED]
-    assert project(log) == project(without) == (SessionState.SUSPENDED, 5)
+    assert project(log) == project(without) == (SessionState.IDLE, 5)
 
 
 def test_the_forward_read_reports_discarded_work_as_discarded_not_current() -> None:
@@ -476,14 +478,14 @@ def test_the_forward_read_reports_discarded_work_as_discarded_not_current() -> N
     """
     log = [
         _event(1, "session.created"),
-        _event(2, "session.suspended"),
+        _event(2, "turn.submitted"),
         _marker(3, discarded_from=2, cause=DiscardCause.ROLLED_BACK, detail="undone"),
     ]
     raw_state, raw_last = project(log)
     live_state, live_last = project(effective(log))
 
-    assert raw_state is SessionState.SUSPENDED
-    assert live_state is SessionState.RUNNING
+    assert raw_state is SessionState.RUNNING
+    assert live_state is SessionState.IDLE
     assert raw_last == live_last == 3
 
 

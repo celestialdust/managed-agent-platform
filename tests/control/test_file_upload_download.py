@@ -59,7 +59,7 @@ from managed_agent.core.registration.scope_binding import (
     RegisteredTool,
     ServerRegistration,
 )
-from managed_agent.core.session.session import SessionRecord, SessionState
+from managed_agent.core.session.session import SessionRecord
 
 AWKWARD_BODY = b"\x00\xff head\xe2\x80\x94tail \x00 end"
 
@@ -689,7 +689,7 @@ class UnusedWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         raise AssertionError("a file test registered a webhook")
@@ -701,7 +701,7 @@ class UnusedWebhooks:
         raise AssertionError("a file test deleted a webhook")
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
         raise AssertionError("a file test asked what watches a state")
 

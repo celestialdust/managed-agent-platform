@@ -27,7 +27,9 @@ from managed_agent.adapters.s3.uploaded_file import S3UploadedFiles
 from managed_agent.control.files.output_shipout import (
     OUTPUT_BUDGET_BYTES,
     OUTPUT_COUNT_LIMIT,
+    OUTPUT_TREE_LIMIT,
     EachAtTurnCompletion,
+    OutputNotRevisable,
     OutputsNotShippable,
     ProducedFile,
     ShipOutOutputsAtTurnCompletion,
@@ -54,8 +56,9 @@ from managed_agent.core.ids import (
     TurnId,
     new_session_id,
 )
-from managed_agent.core.ports import EventLogAppend
+from managed_agent.core.ports import EventLogAppend, EventRecord
 from managed_agent.core.session.session import SessionRecord
+from managed_agent.core.vfs.evidence import digest_of
 from managed_agent.core.vfs.session_vfs import (
     LaneBlobs,
     LaneEntry,
@@ -63,7 +66,11 @@ from managed_agent.core.vfs.session_vfs import (
 )
 from managed_agent.core.vocabulary import output, vfs
 from managed_agent.session_shim.client import RuntimeConnection
-from managed_agent.session_shim.pod_channel import PodOutputFetch, shim_token_for
+from managed_agent.session_shim.pod_channel import (
+    _LISTING_LIMIT_BYTES,
+    PodOutputFetch,
+    shim_token_for,
+)
 from managed_agent.session_shim.serve import ServedSession, create_shim_app
 
 _THREAD = "0199c4de-6f2a-7b81-9c3d-4e5f60718293"
@@ -199,6 +206,35 @@ class FakePod:
         )
         self.fetched: list[tuple[str, int]] = []
 
+    @classmethod
+    def of(cls, files: Mapping[str, bytes]) -> FakePod:
+        """A pod whose listing reports the real length and digest of each body.
+
+        The digest is what makes this pod like the shim: `_collect_produced` hashes
+        every file it lists, and the control plane's already-delivered filter compares
+        that hex against what the lane recorded. A fixture leaving the field None
+        would exercise only the fail-safe branch -- the one that re-ships everything.
+
+        **The listing is handed back in REVERSE order, deliberately.** A real pod walks
+        `scandir` and yields directory order, and ship-out's ceiling promises a stable
+        *sorted* prefix so a tail drains predictably rather than thrashing. A fixture
+        that listed alphabetically would satisfy every assertion about which files
+        shipped without ship-out sorting anything at all -- measured, not assumed: with
+        this fixture sorted, removing the sort broke one case out of four that claim to
+        depend on it.
+        """
+        return cls(
+            tuple(
+                ProducedFile(
+                    name=name,
+                    byte_length=len(body),
+                    content_sha256=content_digest(body),
+                )
+                for name, body in sorted(files.items(), reverse=True)
+            ),
+            dict(files),
+        )
+
     async def list_outputs(self, session_id: SessionId, /) -> tuple[ProducedFile, ...]:
         return self._listing
 
@@ -221,22 +257,59 @@ and not signatures, which is the half that actually drifts."""
 
 
 class FakeLog:
-    """The Event Log, recording what was appended and in what order.
+    """The Event Log, recording what was appended and in what order, and readable back.
 
     A list rather than a counter, because the order is a claim this module makes: the
     append for one file follows that file's store, so a run that raises partway has
     appended exactly the files that are durable. A counter could not tell that from
     appending them all at the end.
+
+    **It reads back what it was appended, over a two-row page**, because ship-out now
+    decides what to transfer by folding this log -- and the events it folds are the
+    `vfs.object_placed` rows the real lane store appended on an earlier Turn through
+    this same object. A double that served a listing of its own would let the two halves
+    of that loop agree without ever having been connected, which is the one thing these
+    cases exist to prove. The narrow page is `docs/lessons.md`'s standing guard against
+    the capped-read defect: a fold that reads one page passes against a wide one.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, page: int = 2) -> None:
         self.appended: list[tuple[str, dict[str, object]]] = []
+        self.records: list[EventRecord] = []
+        self._page = page
 
     async def append(
         self, session_id: SessionId, type_: str, payload: dict[str, object]
     ) -> Seq:
         self.appended.append((type_, payload))
-        return Seq(len(self.appended))
+        seq = Seq(len(self.appended))
+        self.records.append(
+            _LoggedRow(session_id=session_id, seq=seq, type=type_, payload=payload)
+        )
+        return seq
+
+    async def read(
+        self, session_id: SessionId, start: Seq, end: Seq, limit: int = 500
+    ) -> Sequence[EventRecord]:
+        found = [r for r in self.records if start <= r.seq <= end]
+        return found[: min(limit, self._page)]
+
+
+class _LoggedRow:
+    """One appended event, in the shape `EventRecord` is read in.
+
+    Carries `session_id` although every case here runs one Session, because the port
+    declares it: a double that dropped the field would let a fold that read the wrong
+    Session's events pass.
+    """
+
+    def __init__(
+        self, session_id: SessionId, seq: Seq, type: str, payload: dict[str, object]
+    ) -> None:
+        self.session_id = session_id
+        self.seq = seq
+        self.type = type
+        self.payload = payload
 
 
 _LOG_PORT: EventLogAppend = FakeLog()
@@ -257,12 +330,39 @@ def _a_ship_out(
     log = FakeLog()
     return (
         ShipOutOutputsAtTurnCompletion(
-            pod, SessionVfsStore(bucket, log), sessions, log
+            pod, SessionVfsStore(bucket, log), sessions, log, log
         ),
         bucket,
         sessions,
         log,
     )
+
+
+def _a_ship_out_over(
+    pod: FakePod, tenant_id: TenantId, bucket: FakeLaneBlobs, log: FakeLog
+) -> ShipOutOutputsAtTurnCompletion:
+    """A ship-out over a bucket and a log the caller keeps across Turns.
+
+    Both, and not just the bucket. The bucket is the durable state a later Turn
+    collides with; the log is where that Turn learns what is already in it. A case
+    sharing one and not the other would exercise a Session whose lane and whose record
+    of that lane disagree, which is a state the platform never reaches.
+    """
+    return ShipOutOutputsAtTurnCompletion(
+        pod, SessionVfsStore(bucket, log), FakeSessions(tenant_id), log, log
+    )
+
+
+def _shipped_paths(log: FakeLog) -> list[str]:
+    """Just the paths `output.produced` announced, in the order they were announced."""
+    return [str(payload["path"]) for payload in _announcements(log)]
+
+
+def _partials(log: FakeLog) -> list[Mapping[str, object]]:
+    """Just the `output.partial` payloads. Empty when everything offered fitted."""
+    return [
+        payload for type_, payload in log.appended if type_ == output.OUTPUT_PARTIAL
+    ]
 
 
 def _announcements(log: FakeLog) -> list[Mapping[str, object]]:
@@ -558,27 +658,215 @@ async def test_a_turn_that_produced_nothing_asks_the_store_and_registry_nothing(
     assert pod.fetched == []
 
 
-async def test_more_files_than_the_limit_refuses_and_ships_none_of_them() -> None:
-    """The count bound, exceeded on purpose so the refusal is measured.
+async def test_more_new_files_than_one_turn_ships_takes_a_prefix_and_says_so() -> None:
+    """**The ceiling ships part and announces the tail; it does not fail the Turn.**
 
-    Nothing stored is the half that matters. A ship-out that refused after storing the
-    first thirty-two would leave a tenant holding an arbitrary subset of what the agent
-    produced, with no way to know which files are missing or that any are.
+    Failing it was the old shape, and it was the wrong one here for a reason that does
+    not apply to a mere quantity: nothing removes a file from a pod, so a Turn refused
+    for the size of `out/` is refused again on every Turn after it, and the Session can
+    never deliver anything again. The objection that shape rested on was *silence* -- a
+    tenant handed part of what they produced cannot tell which the platform dropped
+    if nothing says so. `output.partial` says so, and carries the ceiling that bound it.
+
+    The prefix is asserted by name, not just by count. A ceiling that took an arbitrary
+    subset would drain in a different order every Turn and might never converge; a
+    sorted prefix reaches strictly further into the tail each time.
     """
-    session_id = new_session_id()
-    listing = tuple(
-        ProducedFile(name=f"file-{index:03d}.md", byte_length=1)
-        for index in range(OUTPUT_COUNT_LIMIT + 1)
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    files = {
+        f"file-{index:03d}.md": f"body {index}".encode()
+        for index in range(OUTPUT_COUNT_LIMIT + 3)
+    }
+    ship_out, bucket, sessions, log = _a_ship_out(FakePod.of(files), tenant_id)
+
+    await ship_out.turn_completed(session_id, _TURN)
+
+    assert len(bucket.objects) == OUTPUT_COUNT_LIMIT
+    assert sorted(_shipped_paths(log)) == sorted(files)[:OUTPUT_COUNT_LIMIT]
+    assert _partials(log) == [
+        {
+            "paths_shipped": OUTPUT_COUNT_LIMIT,
+            "paths_left": 3,
+            "bytes_shipped": sum(
+                len(files[name]) for name in sorted(files)[:OUTPUT_COUNT_LIMIT]
+            ),
+            "path_ceiling": OUTPUT_COUNT_LIMIT,
+            "byte_ceiling": OUTPUT_BUDGET_BYTES,
+            "tree_ceiling": OUTPUT_TREE_LIMIT,
+            "tree_truncated": False,
+        }
+    ]
+
+
+async def test_the_tail_a_ceiling_left_behind_is_taken_by_the_next_turn() -> None:
+    """**The claim `output.partial` makes on the tenant's behalf, proved rather than
+    asserted in a docstring.**
+
+    "Left behind" is only tolerable because it means "later", and nothing about the
+    ceiling alone guarantees that: it is true because what shipped is weighed out of the
+    next Turn's count and the prefix is stable, so each Turn reaches further. A bound
+    that took an arbitrary subset would satisfy the case above and still never converge.
+    """
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    files = {
+        f"file-{index:03d}.md": f"body {index}".encode()
+        for index in range(OUTPUT_COUNT_LIMIT + 3)
+    }
+    bucket, log = FakeLaneBlobs(), FakeLog()
+    await _a_ship_out_over(FakePod.of(files), tenant_id, bucket, log).turn_completed(
+        session_id, _TURN
     )
-    pod = FakePod(listing)
-    ship_out, bucket, sessions, log = _a_ship_out(pod, TenantId(uuid4()))
+    assert len(bucket.objects) == OUTPUT_COUNT_LIMIT
 
-    with pytest.raises(OutputsNotShippable, match="more than"):
-        await ship_out.turn_completed(session_id, _TURN)
+    await _a_ship_out_over(FakePod.of(files), tenant_id, bucket, log).turn_completed(
+        session_id, TurnId(uuid4())
+    )
 
-    assert bucket.objects == {}
-    assert sessions.read_for == []
-    assert pod.fetched == []
+    assert len(bucket.objects) == len(files), "the tail did not drain on the next Turn"
+    assert len(_partials(log)) == 1, (
+        "a Turn that drained the tail still called it partial"
+    )
+
+
+def test_the_pods_hash_and_the_lanes_hash_are_the_same_function() -> None:
+    """**Two functions in two modules, and the filter is the comparison between them.**
+
+    The shim hashes a produced file with `content_digest` and reports the hex; the lane
+    store hashes the stored object with `digest_of` and records `.hex` in
+    `vfs.object_placed`. Nothing in the type system says those agree, and if they ever
+    stopped agreeing the comparison would simply never match -- which does not fail, it
+    degrades to re-transferring and re-downloading every delivered file on every Turn,
+    exactly the behaviour this change removed. The bucket holds the right bytes either
+    way, so only a count of what moved would ever show it.
+
+    Compared over bodies rather than asserted about the algorithm names, because the
+    algorithm agreeing is not the claim; the output agreeing is.
+    """
+    for body in (b"", _REPORT, b"\x00\xff" * 1024):
+        assert content_digest(body) == digest_of(body).hex
+
+
+async def test_a_session_at_the_limit_still_ships_what_the_next_turn_adds() -> None:
+    """**The wedge, and it is the reason this filter exists.**
+
+    Nothing empties the agent's output directory between Turns, so the pod re-offers
+    every file it has ever produced. Counted whole, a Session sitting on exactly the
+    limit is refused for every Turn after it -- and no route deletes a file out of a
+    pod, so it can never deliver again. A run writing four files a Turn shipped seven
+    times and died on the eighth, having done nothing different.
+
+    Two Turns over one bucket AND one log, because the fold that makes the second Turn
+    cheap reads the `vfs.object_placed` rows the first Turn's lane store appended. A
+    second log here would let both halves pass without ever having been connected.
+    """
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    delivered = {
+        f"file-{index:03d}.md": f"body {index}".encode() for index in range(32)
+    }
+    bucket, log = FakeLaneBlobs(), FakeLog()
+    first = _a_ship_out_over(FakePod.of(delivered), tenant_id, bucket, log)
+
+    await first.turn_completed(session_id, _TURN)
+    assert len(bucket.objects) == 32
+
+    added = {"summary.md": b"the answer", "table.csv": b"a,b\n1,2\n"}
+    second = _a_ship_out_over(FakePod.of(delivered | added), tenant_id, bucket, log)
+
+    await second.turn_completed(session_id, TurnId(uuid4()))
+
+    assert len(bucket.objects) == 34
+    assert (
+        bucket.objects[f"sessions/{tenant_id}/{session_id}/artifacts/summary.md"]
+        == b"the answer"
+    )
+
+
+async def test_a_turn_that_added_nothing_touches_neither_pod_nor_bucket() -> None:
+    """A Turn that answered in text re-offers yesterday's files and must cost nothing.
+
+    Before the filter this was the expensive path, not the free one: every already
+    delivered file was fetched off the pod, placed, refused as occupied, and then
+    downloaded back out of the bucket to compare bytes. A Session holding two hundred
+    documents paid that on every Turn for the rest of its life.
+
+    `sessions.read_for` is the sharpest of the three assertions. The tenant is looked up
+    only to compose a key, so a run that resolved one did work it had no file to do.
+    """
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    files = {"report.md": _REPORT, "notes.md": b"some notes"}
+    bucket, log = FakeLaneBlobs(), FakeLog()
+    await _a_ship_out_over(FakePod.of(files), tenant_id, bucket, log).turn_completed(
+        session_id, _TURN
+    )
+
+    pod = FakePod.of(files)
+    sessions = FakeSessions(tenant_id)
+    again = ShipOutOutputsAtTurnCompletion(
+        pod, SessionVfsStore(bucket, log), sessions, log, log
+    )
+    before = len(log.appended)
+
+    await again.turn_completed(session_id, TurnId(uuid4()))
+
+    assert pod.fetched == [], "an already-delivered file was pulled off the pod again"
+    assert sessions.read_for == [], "the tenant was resolved for a Turn with no file"
+    assert log.appended[before:] == [], "a Turn that added nothing announced something"
+
+
+async def test_the_same_path_with_new_bytes_is_kept_and_refused_not_dropped() -> None:
+    """The one case the filter must NOT swallow.
+
+    A delivered path re-offered with different bytes is the agent revising an artifact
+    the seal will not let it revise. Dropping it as "already delivered" would end the
+    Turn reporting success with neither version stored, which is the silent wrong answer
+    this whole module is built to refuse. It has to survive the filter and be refused by
+    name.
+    """
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    bucket, log = FakeLaneBlobs(), FakeLog()
+    await _a_ship_out_over(
+        FakePod.of({"report.md": b"first draft"}), tenant_id, bucket, log
+    ).turn_completed(session_id, _TURN)
+
+    revised = _a_ship_out_over(
+        FakePod.of({"report.md": b"second draft"}), tenant_id, bucket, log
+    )
+
+    with pytest.raises(OutputsNotShippable, match="cannot be revised"):
+        await revised.turn_completed(session_id, TurnId(uuid4()))
+
+    assert (
+        bucket.objects[f"sessions/{tenant_id}/{session_id}/artifacts/report.md"]
+        == b"first draft"
+    )
+
+
+async def test_a_pod_that_reports_no_digest_is_re_shipped_rather_than_assumed() -> None:
+    """An older shim image reports no digest, and silence is not "unchanged".
+
+    Reading it as unchanged would freeze the lane at whatever it held when that pod
+    started -- a wrong answer that looks exactly like a working one. So the file
+    survives the filter, is fetched, and is settled on its bytes by the occupied-key
+    path instead. That is the slow branch and the correct one.
+    """
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    bucket, log = FakeLaneBlobs(), FakeLog()
+    await _a_ship_out_over(
+        FakePod.of({"report.md": _REPORT}), tenant_id, bucket, log
+    ).turn_completed(session_id, _TURN)
+
+    mute = FakePod(
+        (ProducedFile(name="report.md", byte_length=len(_REPORT)),),
+        {"report.md": _REPORT},
+    )
+    again = ShipOutOutputsAtTurnCompletion(
+        mute, SessionVfsStore(bucket, log), FakeSessions(tenant_id), log, log
+    )
+
+    await again.turn_completed(session_id, TurnId(uuid4()))
+
+    assert mute.fetched == [("report.md", len(_REPORT))]
+    assert len(bucket.objects) == 1
 
 
 async def test_exactly_the_limit_is_admitted() -> None:
@@ -599,26 +887,30 @@ async def test_exactly_the_limit_is_admitted() -> None:
     assert len(bucket.objects) == OUTPUT_COUNT_LIMIT
 
 
-async def test_more_bytes_than_the_budget_refuses_before_any_transfer() -> None:
-    """The byte bound, and it is checked against the listing rather than the transfer.
+async def test_two_files_that_exceed_the_budget_together_ship_the_first_only() -> None:
+    """The byte bound, spent against the listing rather than against what arrives.
 
-    That ordering is the point: two files each inside the budget can exceed it together,
-    and a ship-out that discovered this on the second file would already have stored the
-    first. `pod.fetched` being empty is what says nothing was pulled at all.
+    Two files each inside the budget can exceed it together, and the old shape summed
+    the set and refused both -- so one file over the line cost every file beside it. Now
+    the prefix stops where the next file would cross, and what it already took ships.
+
+    `pod.fetched` naming exactly one file is the sharp half: the file that did not fit
+    was never pulled into this worker's memory, which is what the budget is bounding.
     """
-    session_id = new_session_id()
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
     half = OUTPUT_BUDGET_BYTES // 2 + 1
     listing = (
         ProducedFile(name="a.bin", byte_length=half),
         ProducedFile(name="b.bin", byte_length=half),
     )
-    ship_out, bucket, sessions, _ = _a_ship_out(FakePod(listing, {}), TenantId(uuid4()))
+    pod = FakePod(listing, {"a.bin": b"x" * half, "b.bin": b"y" * half})
+    ship_out, bucket, _, log = _a_ship_out(pod, tenant_id)
 
-    with pytest.raises(OutputsNotShippable, match="bytes"):
-        await ship_out.turn_completed(session_id, _TURN)
+    await ship_out.turn_completed(session_id, _TURN)
 
-    assert bucket.objects == {}
-    assert sessions.read_for == []
+    assert _shipped_paths(log) == ["a.bin"]
+    assert [name for name, _ in pod.fetched] == ["a.bin"]
+    assert _partials(log)[0]["paths_left"] == 1
 
 
 async def test_each_fetch_is_capped_at_the_length_its_own_listing_reported() -> None:
@@ -638,7 +930,8 @@ async def test_each_fetch_is_capped_at_the_length_its_own_listing_reported() -> 
 
     await ship_out.turn_completed(session_id, _TURN)
 
-    assert pod.fetched == [("small.md", 3), ("larger.md", 11)]
+    # Sorted, because the ceiling takes a stable prefix so a tail drains predictably.
+    assert pod.fetched == [("larger.md", 11), ("small.md", 3)]
 
 
 async def test_a_body_shorter_than_its_listing_is_refused_rather_than_stored() -> None:
@@ -775,7 +1068,7 @@ async def test_a_file_that_vanished_between_the_listing_and_the_fetch_is_skipped
     assert [one["path"] for one in _announcements(log)] == ["report.md"]
 
 
-async def test_one_file_larger_than_the_whole_turns_budget_is_refused() -> None:
+async def test_one_file_larger_than_the_whole_turns_budget_never_ships() -> None:
     """The per-Turn budget is now the only ceiling on a produced file, so it has to
     catch the single-file case as well as the several-files-together one.
 
@@ -784,12 +1077,18 @@ async def test_one_file_larger_than_the_whole_turns_budget_is_refused() -> None:
     so `UploadSizeLimit` -- the bound on what a tenant may POST -- applied to it as a
     second, possibly tighter ceiling: a deployment capping uploads at a mebibyte capped
     agent output there too. A lane has no such per-object bound, so what governs now is
-    `OUTPUT_BUDGET_BYTES` alone. That is the more honest place for the rule (what an
-    agent may produce is not the same question as what a tenant may upload) and it is
-    strictly more permissive, so it is written down rather than left to be discovered.
+    `OUTPUT_BUDGET_BYTES` alone.
 
-    The refusal lands before any transfer, which is what `pod.fetched` says: a file the
-    platform will not keep should not first be pulled into this worker's memory.
+    **It is left behind rather than refused, and that costs something real.** No prefix
+    containing it ever fits, so unlike an ordinary tail this one never drains -- it is
+    left behind again on every Turn for the life of the Session. Refusing instead would
+    be worse, because the file is equally unshippable and the Session would additionally
+    be unable to deliver anything else ever again. `output.partial` is the only place
+    either the tenant or an operator can learn this happened, which is why it is
+    appended for every non-empty tail and not only for the ones that will drain.
+
+    Nothing is pulled off the pod, which is what `pod.fetched` says: a file the platform
+    will not keep should not first be read into this worker's memory.
     """
     session_id = new_session_id()
     pod = FakePod(
@@ -797,13 +1096,22 @@ async def test_one_file_larger_than_the_whole_turns_budget_is_refused() -> None:
     )
     ship_out, bucket, sessions, log = _a_ship_out(pod, TenantId(uuid4()))
 
-    with pytest.raises(OutputsNotShippable, match="bytes"):
-        await ship_out.turn_completed(session_id, _TURN)
+    await ship_out.turn_completed(session_id, _TURN)
 
     assert bucket.objects == {}
-    assert log.appended == []
     assert pod.fetched == []
-    assert sessions.read_for == []
+    assert _shipped_paths(log) == []
+    assert _partials(log) == [
+        {
+            "paths_shipped": 0,
+            "paths_left": 1,
+            "bytes_shipped": 0,
+            "path_ceiling": OUTPUT_COUNT_LIMIT,
+            "byte_ceiling": OUTPUT_BUDGET_BYTES,
+            "tree_ceiling": OUTPUT_TREE_LIMIT,
+            "tree_truncated": False,
+        }
+    ]
 
 
 class Recording:
@@ -868,7 +1176,14 @@ class FixedPhase:
         return self._phase
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("shipping outputs tried to remove a pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
 
 def _a_pod_serving(
@@ -1041,15 +1356,19 @@ async def test_a_listing_that_is_not_one_closes_the_turn_rather_than_reading_as_
 
 
 async def test_a_listing_padded_past_its_cap_is_refused_on_the_way_in() -> None:
-    """The listing has its own bound, derived from the count limit rather than chosen.
+    """The listing has its own bound, derived from the enumeration limit not chosen.
 
     A pod padding its JSON with whitespace would otherwise put an unbounded body into a
     control-plane worker before anything could look at how many entries it held.
+
+    The padding is taken FROM that bound rather than written as a literal. A literal
+    is a second copy of a derivation, and this one stopped exceeding the cap the day
+    the enumeration limit was raised -- which is exactly how a bound goes untested.
     """
     session_id = new_session_id()
 
     async def _enormous(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=b" " * (2 * 1024 * 1024) + b"{}")
+        return httpx.Response(200, content=b" " * (_LISTING_LIMIT_BYTES + 1) + b"{}")
 
     fetch = _a_fetch(httpx.MockTransport(_enormous))
 
@@ -1191,3 +1510,177 @@ async def test_a_pod_that_reports_no_digest_still_ships() -> None:
     assert bucket.objects == {
         f"sessions/{tenant_id}/{session_id}/artifacts/report.md": _REPORT
     }
+
+
+async def test_a_rewritten_artifact_refuses_with_its_own_type_carrying_the_path() -> (
+    None
+):
+    """The collision is the one refusal here a tenant can act on, so it is its own type.
+
+    Every other reason this module refuses is the pod misbehaving -- a body that did
+    not match its listed length, a name the listing rule would not have offered -- and
+    the tenant's move for all of them is the same: retry, and if it repeats, tell the
+    platform. Rewriting a delivered artifact is not that. The agent did it, the seal
+    that refused it is the platform working as designed, and the fix is a different
+    path.
+
+    The subclass rather than a separate hierarchy is what keeps that true without
+    reopening every caller: `pod_channel.py` translates this one and collapses the
+    rest, and a caller that only knows `OutputsNotShippable` still catches it.
+
+    The path rides on the exception rather than in its message, because the caller two
+    hops up puts it in a refusal envelope's `detail`, and parsing it back out of prose
+    would make a tenant-visible field depend on how the sentence is worded.
+    """
+    session_id, tenant_id, bucket = new_session_id(), TenantId(uuid4()), FakeLaneBlobs()
+    first, _, _, _ = _a_ship_out(
+        FakePod(
+            (ProducedFile(name="report.md", byte_length=len(_REPORT)),),
+            {"report.md": _REPORT},
+        ),
+        tenant_id,
+        bucket,
+    )
+    await first.turn_completed(session_id, _TURN)
+
+    revised = b"# Report\n\nWhat the agent found, on reflection.\n"
+    second, _, _, _ = _a_ship_out(
+        FakePod(
+            (ProducedFile(name="report.md", byte_length=len(revised)),),
+            {"report.md": revised},
+        ),
+        tenant_id,
+        bucket,
+    )
+
+    with pytest.raises(OutputNotRevisable) as refused:
+        await second.turn_completed(session_id, TurnId(uuid4()))
+
+    assert refused.value.path == "report.md"
+    assert isinstance(refused.value, OutputsNotShippable)
+
+
+async def test_the_other_refusals_stay_the_general_type_and_not_the_precise_one() -> (
+    None
+):
+    """A pod serving something other than what it listed is not a revision.
+
+    Without this the subclass above could be raised for every refusal in the module and
+    nothing would fail -- which would hand a 409 and "write it under a different path"
+    to a tenant whose pod truncated a body.
+    """
+    session_id, tenant_id, bucket = new_session_id(), TenantId(uuid4()), FakeLaneBlobs()
+    ship_out, _, _, _ = _a_ship_out(
+        FakePod(
+            (ProducedFile(name="report.md", byte_length=len(_REPORT) + 10),),
+            {"report.md": _REPORT},
+        ),
+        tenant_id,
+        bucket,
+    )
+
+    with pytest.raises(OutputsNotShippable) as refused:
+        await ship_out.turn_completed(session_id, _TURN)
+
+    assert not isinstance(refused.value, OutputNotRevisable)
+
+
+async def test_a_tree_the_pod_could_not_enumerate_whole_says_so() -> None:
+    """**The bound that used to lose files in silence.**
+
+    A pod stops walking `out/` at `OUTPUT_TREE_LIMIT` entries plus one, and that extra
+    entry is a signal nothing acted on: the control plane weighed what it was shown,
+    shipped a prefix of it, and said nothing about a tree it had not been shown all of.
+    Past that bound a file the agent wrote is not merely late -- it is invisible, and it
+    stays invisible for the life of the Session, because the walk is sorted and a name
+    beyond the cut is beyond it on every Turn.
+
+    It mattered less while one Turn shipped thirty-two of two thousand: reaching the
+    enumeration bound took sixty-four Turns of maximum output. At five hundred it takes
+    four, which is inside one afternoon of the kind of run this exists for. So the
+    signal is now read, and it is read as an announcement rather than a refusal -- there
+    is nothing the platform can do about it, and everything the tenant can.
+    """
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    files = {
+        f"file-{index:05d}.md": f"body {index}".encode()
+        for index in range(OUTPUT_TREE_LIMIT + 1)
+    }
+    ship_out, bucket, _, log = _a_ship_out(FakePod.of(files), tenant_id)
+
+    await ship_out.turn_completed(session_id, _TURN)
+
+    assert len(bucket.objects) == OUTPUT_COUNT_LIMIT
+    assert [partial["tree_truncated"] for partial in _partials(log)] == [True]
+    assert _partials(log)[0]["tree_ceiling"] == OUTPUT_TREE_LIMIT
+
+
+async def test_a_truncated_tree_is_announced_on_a_turn_with_nothing_left_to_ship() -> (
+    None
+):
+    """**The case that would otherwise be silent, and it is the steady state.**
+
+    A Session that has produced more files than the pod will enumerate does not stop
+    running. It goes on taking Turns, and on most of them everything the listing shows
+    is already delivered -- so `paths_left` is zero, every ceiling on this side is
+    satisfied, and by every measure the control plane has of its own work the Turn went
+    perfectly. The files past the cut are still there and still unreachable.
+
+    So the announcement is conditioned on the truncation and not only on a tail. Without
+    that, the one Turn that reported the problem would be the Turn it first appeared on,
+    and a tenant who was not watching then would never hear about it again.
+
+    Driven by running the Session until it drains rather than by seeding a log, because
+    what makes `paths_left` zero here is the already-delivered filter reading back what
+    earlier Turns of this same object wrote. A hand-written provenance row would let
+    both halves of that agree without ever having been connected.
+    """
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    files = {
+        f"file-{index:05d}.md": f"body {index}".encode()
+        for index in range(OUTPUT_TREE_LIMIT + 1)
+    }
+    bucket, log = FakeLaneBlobs(), FakeLog(page=OUTPUT_COUNT_LIMIT)
+    while len(bucket.objects) < len(files):
+        await _a_ship_out_over(
+            FakePod.of(files), tenant_id, bucket, log
+        ).turn_completed(session_id, TurnId(uuid4()))
+
+    drained = len(_partials(log))
+    await _a_ship_out_over(FakePod.of(files), tenant_id, bucket, log).turn_completed(
+        session_id, TurnId(uuid4())
+    )
+
+    quiet = _partials(log)[drained:]
+    assert [partial["paths_left"] for partial in quiet] == [0]
+    assert [partial["tree_truncated"] for partial in quiet] == [True]
+    assert [partial["paths_shipped"] for partial in quiet] == [0]
+
+
+async def test_a_tree_that_fits_the_enumeration_bound_announces_nothing() -> None:
+    """The negative, without which `tree_truncated` could be hardcoded true.
+
+    Exactly the bound and not one past it, which is the boundary the pod's own walk is
+    written against: at the limit the listing carries the whole tree and there is
+    nothing to announce, and a comparison written `>=` instead of `>` would call every
+    full tree truncated and put a false alarm on a correct Turn.
+    """
+    session_id, tenant_id = new_session_id(), TenantId(uuid4())
+    files = {
+        f"file-{index:05d}.md": f"body {index}".encode()
+        for index in range(OUTPUT_TREE_LIMIT)
+    }
+    bucket, log = FakeLaneBlobs(), FakeLog(page=OUTPUT_COUNT_LIMIT)
+    while len(bucket.objects) < len(files):
+        await _a_ship_out_over(
+            FakePod.of(files), tenant_id, bucket, log
+        ).turn_completed(session_id, TurnId(uuid4()))
+
+    settled = len(_partials(log))
+    await _a_ship_out_over(FakePod.of(files), tenant_id, bucket, log).turn_completed(
+        session_id, TurnId(uuid4())
+    )
+
+    assert len(_partials(log)) == settled, (
+        "a tree inside the enumeration bound was called truncated"
+    )

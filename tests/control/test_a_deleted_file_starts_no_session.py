@@ -169,7 +169,7 @@ def _creation_body(
         "definition_id": definition_id,
         "environment_id": environment_id,
         "file_ids": file_ids,
-        "grant": ["fs.read"],
+        "grant": [],
         "scope": {},
         "budget_minor_units": 500,
         "budget_currency": "USD",

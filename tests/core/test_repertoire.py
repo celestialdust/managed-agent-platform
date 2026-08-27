@@ -16,6 +16,7 @@ from managed_agent.core.pod.repertoire import (
     REPERTOIRE,
     REQUIRES_EXPERIMENTAL_API,
     RepertoireMethod,
+    ThreadResumeRequest,
     ThreadStartRequest,
     TurnSteerRequest,
 )
@@ -122,3 +123,45 @@ def test_the_one_notification_is_the_only_entry_without_a_response_model() -> No
         entry.method for entry in REPERTOIRE.values() if entry.response_model is None
     }
     assert without == {RepertoireMethod.INITIALIZED}
+
+
+def test_a_resumed_thread_carries_the_same_approval_policy_as_a_new_one() -> None:
+    """A resume that omits it inherits the runtime's default, and that default asks.
+
+    Measured on the live cluster, and it is silent. Turn 1 opens a new thread, which
+    fixes `approvalPolicy: never`, and the agent works. Turn 2 after the pod is replaced
+    resumes the thread, this field was absent, and the Agent Runtime fell back to
+    `unless-trusted` -- so it asked for approval, nobody was inside the pod to give it,
+    and every shell command the agent tried was refused. The model reported that as its
+    own limitation ("every shell command is being rejected by the current approval
+    policy"), the Turn still ended `turn.completed`, and nothing in the Event Log said a
+    policy had refused anything.
+
+    The blast radius is every Turn that is not a Session's first. Under ADR-041, where
+    the pod is destroyed at the end of each Turn, that is every Turn but one -- an agent
+    that can run a command once and never again, for the life of the Session.
+
+    `ThreadResumeParams` accepts `approvalPolicy`, so this is a field that was omitted
+    rather than one the protocol does not offer.
+    """
+    body = ThreadResumeRequest(
+        thread_id="t", path="/session/rollout.jsonl", permissions="map-session"
+    ).model_dump(by_alias=True, exclude_none=True)
+
+    assert body["approvalPolicy"] == "never"
+
+
+def test_a_resumed_thread_cannot_be_asked_to_seek_approval() -> None:
+    """The same closure `ThreadStartRequest` has, for the same reason.
+
+    Fixed by the type rather than defaulted, so the one value that works is also the
+    only value that can be written -- a default alone would leave the failing state one
+    keyword argument away.
+    """
+    with pytest.raises(ValidationError):
+        ThreadResumeRequest(
+            thread_id="t",
+            path="/session/rollout.jsonl",
+            permissions="map-session",
+            approval_policy="unless-trusted",  # type: ignore[arg-type]
+        )

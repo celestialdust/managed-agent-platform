@@ -27,10 +27,12 @@ from managed_agent.control.api.refusals import refuse
 from managed_agent.control.api.request.dependencies import platform_from_request
 from managed_agent.control.api.request.tenancy import unauthenticated_tenant_from_header
 from managed_agent.control.webhooks.registry import (
+    EventTypeInvalid,
     RegisterWebhook,
     WebhookInvalid,
     WebhookView,
     parse_callback_url,
+    parse_event_types,
     parse_secret_ref,
 )
 from managed_agent.core.errors import STATUS_FOR, ErrorCode, PublicErrorEnvelope
@@ -56,21 +58,44 @@ async def register(
     request: Request,
     tenant_id: Annotated[TenantId, Depends(unauthenticated_tenant_from_header)],
 ) -> WebhookView | JSONResponse:
-    """Register a destination and the states it wants. Returns it as stored.
+    """Register a destination and the event types it wants. Returns it as stored.
 
-    Both fields are parsed here rather than in the model so their refusals carry a code
-    from the closed set in the platform's own envelope, which a field validator's 400
-    would not.
+    All three fields are parsed here rather than in the model so their refusals carry a
+    code from the closed set in the platform's own envelope, which a field validator's
+    422 would not.
 
     The reference is refused for the same reason the url is: it is a registration only
     the tenant can fix. Left to the delivery path it becomes callbacks that silently
     never arrive, with the reason in a platform log the tenant cannot read -- the
     misattribution running the other way.
+
+    A type this platform will not deliver is refused here for a third version of that
+    reason. Stored, it is a subscription that matches nothing for the life of the
+    platform, and the tenant's only evidence is an endpoint that stays quiet -- which is
+    exactly what a broken delivery path looks like from outside.
+
+    In the order the body declares them, so a request wrong in two places is answered
+    about the earlier one and a tenant fixing fields top to bottom converges.
+
+    `REQUEST_INVALID` rather than a code of its own. The closed set already has the
+    member that means "this request named something the API does not accept", and the
+    three refusals here are the same kind of thing said about three fields -- which is
+    what `detail` is for (ADR-013): each names the field to change, and a caller
+    branching on the code was never going to act differently on any of them.
     """
     try:
         url = parse_callback_url(body.url)
     except WebhookInvalid as invalid:
         return refuse(ErrorCode.REQUEST_INVALID, invalid.reason, url=body.url)
+    try:
+        event_types = parse_event_types(body.event_types)
+    except EventTypeInvalid as invalid:
+        # The detail carries the one type that was refused rather than the whole set, so
+        # a tenant reading it is told which member to change instead of being handed
+        # back what they sent.
+        return refuse(
+            ErrorCode.REQUEST_INVALID, invalid.reason, event_type=invalid.event_type
+        )
     try:
         secret_ref = parse_secret_ref(body.secret_ref)
     except WebhookInvalid as invalid:
@@ -82,7 +107,7 @@ async def register(
             ErrorCode.REQUEST_INVALID, invalid.reason, secret_ref=body.secret_ref
         )
     record = await platform_from_request(request).webhooks.register(
-        tenant_id, url, body.states, secret_ref
+        tenant_id, url, event_types, secret_ref
     )
     return WebhookView.of(record)
 

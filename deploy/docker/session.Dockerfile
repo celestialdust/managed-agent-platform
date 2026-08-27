@@ -198,12 +198,22 @@ RUN NODE_MODULES="$(npm root -g)" \
 # the model all four is a paragraph it can get wrong on any Turn. Telling it one command
 # name is a paragraph it cannot.
 #
-# Under a dotted directory so `_is_a_bare_leaf` in shim/serve.py excludes the tree from
-# ship-out: an installed dependency is not a document and must never be returned to a
-# tenant as one. `core/workspace_contract.py` owns both names and is what tells the
-# model this command exists; the paths here and there are compared by
+# On pod-local scratch and no longer under the workspace (ADR-037). It sat at
+# <workspace>/.map/lib while the workspace was pod-local, under a dotted directory so
+# `_is_a_bare_leaf` in shim/serve.py would exclude the tree from ship-out. The workspace
+# is a network mount now, so leaving it there would put every run-time install across
+# NFS for bytes that are rebuildable by definition -- and the dot is no longer what
+# keeps a site-packages tree out of a tenant's deliverables: ship-out walks the
+# workspace and this path is not under it.
+#
+# `core/pod/workspace_contract.py` owns both names and is what tells the model this
+# command exists; the paths here and there are compared by
 # tests/deploy/test_the_image_honours_the_workspace_contract.py, because a wrapper
 # writing somewhere the contract does not name is a promise the platform breaks.
+#
+# TMPDIR is still set inline for the one command that needs it, rather than being an
+# image-wide default. The image sets no TMPDIR at all and that is deliberate -- see the
+# ENV block at the bottom of this file.
 #
 # `exec` so the agent sees pip's own exit status and pip's own error text. A wrapper
 # swallowing either would turn "no such package" into a silent failure inside a Turn.
@@ -224,8 +234,8 @@ RUN mkdir -p /usr/local/bin \
 # Install a Python package where this Session can import from.
 # Written by deploy/docker/session.Dockerfile; see core/workspace_contract.py.
 set -eu
-lib="/session/workspace/.map/lib"
-tmp="/session/workspace/.map/tmp"
+lib="/session/scratch/lib"
+tmp="/session/scratch/tmp"
 mkdir -p "$lib" "$tmp"
 TMPDIR="$tmp" exec python3 -m pip install \
   --no-cache-dir --no-input --disable-pip-version-check \
@@ -327,6 +337,54 @@ assert len(PdfReader('/tmp/merged.pdf').pages) == 2" \
  && python3 -c "import pdfplumber; \
 assert 'probe' in pdfplumber.open('/tmp/probe.pdf').pages[0].extract_text()" \
  && rm -f /tmp/probe.pdf /tmp/probe.txt /tmp/merged.pdf
+
+# Where a build tool's output and caches go, which is pod-local scratch and not the
+# workspace (ADR-037).
+#
+# A tool decides these paths and no instruction to the model reaches them: `cargo build`
+# writes to target/, `npm install` to its cache, pip and uv to theirs, and the agent did
+# not choose any of them. Under ADR-035 the workspace is a network mount, so left alone
+# every one of those writes is a round trip for bytes nobody needs afterwards. These
+# variables are the half of ADR-037 that needs no compliance from the agent.
+#
+# BELOW every build layer on purpose. npm, pip and uv all run above this line, and a
+# cache variable declared before them would point the build itself at a directory that
+# exists only inside a Session pod.
+#
+# In the image rather than on the container, unlike PYTHONPATH beside them in
+# session-pod.yaml, and the difference is which processes may see the value. PYTHONPATH
+# has to be scoped: set here it would also be on the shim's own interpreter, putting a
+# tenant's installed packages on the import path of the process that serves this pod's
+# HTTP. These name tools nothing in this pod runs outside the sandbox, so the image is
+# where a default belonging to a tool belongs.
+#
+# Most of them name a toolchain this image does not carry -- there is no cargo, no rustc
+# and no go here, and network egress is off unless an Environment granted it, so nothing
+# can fetch one either. They are set anyway, and cheaply: a toolchain that arrives later,
+# in a derived image or through a Turn, then lands pod-local by default instead of
+# discovering the mount. `npm_config_cache` and `PIP_CACHE_DIR` are the two with a tool
+# present today.
+#
+# THERE IS DELIBERATELY NO TMPDIR HERE, and ADR-037 asks for one. All three containers
+# run this image, so an `ENV TMPDIR=` reaches the Agent Runtime's own process
+# environment, and `std::env::temp_dir()` in that process is where the sandbox helper
+# builds its registry of synthetic bwrap mount targets before every confined command --
+# outside the sandbox. Pointing it at /session/scratch would hand the confined agent
+# write access to the staging area its own confinement is assembled in, and pointing it
+# anywhere else makes the /tmp mount in session-pod.yaml inert while it still reads as
+# present, which was measured on map-dev as worse than the panic it was meant to avoid.
+# The variable cannot be aimed at the agent without also aiming it at the runtime,
+# because they are one process's environment. Not setting it changes nothing ADR-037
+# was protecting: with TMPDIR unset a tool's temporary files go to /tmp, which bwrap
+# ro-binds, so they never reached the mount either. What is missing is a writable
+# temporary directory for the agent, which the contract's scratch clause names instead.
+# `test_no_container_redirects_the_system_temporary_directory` refuses it in this file
+# as well as in the manifest.
+ENV CARGO_TARGET_DIR=/session/scratch/cargo-target
+ENV npm_config_cache=/session/scratch/npm
+ENV PIP_CACHE_DIR=/session/scratch/pip
+ENV UV_CACHE_DIR=/session/scratch/uv
+ENV GOCACHE=/session/scratch/go-build
 
 # No ENTRYPOINT and no CMD *of its own*. Three containers run this image with three
 # different commands and all three name `command` explicitly, so a default here is never

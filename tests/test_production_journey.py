@@ -105,7 +105,7 @@ def _create_body(definition_id: str, environment_id: str) -> dict[str, object]:
     return {
         "definition_id": definition_id,
         "environment_id": environment_id,
-        "grant": ["fs.read"],
+        "grant": [],
         "scope": {"repository": "acme/widgets"},
         "budget_minor_units": 500,
         "budget_currency": "USD",
@@ -171,7 +171,7 @@ async def test_a_tenant_registers_creates_reads_and_lists_while_another_sees_non
         assert created.status_code == 201, created.text
         body = created.json()
         session_id, first_seq = body["id"], body["seq"]
-        assert body["state"] == "running"
+        assert body["state"] == "idle"
         assert first_seq == 1, (
             f"the creation event landed at seq {first_seq}. Sequence numbers are "
             "per-Session and this is the Session's first event, so anything but 1 "

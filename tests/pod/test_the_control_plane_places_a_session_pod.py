@@ -10,16 +10,45 @@ an object whose name is derived from the Session id it was handed. That is what 
 control plane put it there" means, and it is why the name is computed rather than
 searched for: a leftover `map-session-*` from another run would satisfy a search.
 
-Two findings here are absences, and each has a control in the same run. That no SECOND
-pod appears is paired with the first Turn, where one MUST appear. That the Tool Gateway
-accepts the token the control plane signed is paired with a token minted here under a
-throwaway key, which MUST be refused -- an endpoint that accepts everything and an
-endpoint that verifies are indistinguishable from one probe.
+One finding here is an absence and it has its control in the same run: that the Tool
+Gateway accepts the token the control plane signed is paired with a token minted here
+under a throwaway key, which MUST be refused -- an endpoint that accepts everything and
+an endpoint that verifies are indistinguishable from one probe.
 
-What this file does not show is a Turn *finishing*. It waits for the pod object and not
-for RUNNING, so every case here costs one placement and no image pull and no model call.
-Whether a Turn completes -- and whether two tenants' Turns stay apart -- is
-`test_two_tenants_run_at_once_through_the_deployed_api.py`, which is built to wait.
+**A pod exists only while its Turn is in flight, and that is why this file watches
+rather than looks afterwards.** A pod is leased for exactly one Turn and given back when
+that Turn ends (ADR-041), and `POST /v1/sessions/{id}/events` holds its response open
+until the Turn is over -- so at the moment a submission answers, the pod and its three
+Secrets have already been deleted. Every case below reads a snapshot a watcher took
+while the submission was still in flight; none of them reads the namespace for itself.
+Looking after the answer is what these cases used to do, and under the lease that finds
+an absence which is correct rather than a control plane that placed nothing.
+
+What this file still does not do is wait for RUNNING. The watcher stops at the pod
+object, so no case here spends anything on a fact another file grades. The submission
+underneath it is a different matter, and the cost is real and unavoidable: the response
+is held for the whole Turn, so the one Turn this file takes pays an image pull and a
+model round trip whether or not anything here reads the answer. That is the argument for
+taking exactly one. Whether a Turn completes -- and whether two tenants' Turns stay
+apart -- is `test_two_tenants_run_at_once_through_the_deployed_api.py`, which is built
+to wait.
+
+**The fourth case was reversed rather than deleted, and the second Turn it takes is
+submitted immediately.** It asserted that a second Turn REUSES the pod the first one
+placed -- one Session, one pod object, whatever a caller does -- which was the
+platform's rule until ADR-041 withdrew it. The same instrument now reads the other way:
+both Turns' pods carry one name, so only the UID the API server assigns per object can
+say whether the second Turn got a pod of its own.
+
+Submitting it with no wait in between is what keeps this from duplicating
+`test_a_reaped_session_takes_another_turn.py`. A Turn sent straight after the last one
+arrives while the previous pod is still inside its grace period, listed and stamped for
+deletion, which reads as GONE -- and a Turn that finds GONE is placed by waiting that
+pod out and creating in its place. That file waits the window out on purpose, so that it
+grades the ABSENT path deterministically instead of racing ten seconds, and its own
+docstring records that the GONE path is the one an interactive tenant takes and is not
+graded there. It is graded here. Refusing that Turn is what the platform did until it
+was fixed, and it broke every second Turn a tenant sent promptly.
 
 Three of these cases asserted the opposite until 2026-08-23: that the Turn ends in
 `turn.failed` and the API answers 502. That was correct, and for a reason that has gone
@@ -46,6 +75,8 @@ import subprocess
 import time
 import tomllib
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any, Final
 from uuid import UUID, uuid4
 
@@ -113,12 +144,44 @@ def _session_image() -> str:
 
 
 _PLACEMENT_DEADLINE_S: Final = 120.0
-"""How long the placement behind a 202 is given to produce a pod object.
+"""How long the watcher looks for a pod object before giving up on the Turn placing one.
 
 Covers the compile, three Secret creates and one pod create against the real API server,
 plus whatever the control plane's own queue is doing. It does NOT cover an image pull --
 nothing here waits for RUNNING -- so a value in minutes would only ever be spent on a
 control plane that is not going to place at all.
+
+It bounds the watcher and not the submission. The submission is bounded by
+`_SUBMIT_TIMEOUT_S`, which has to be far larger for a reason that belongs to the
+platform rather than to this file.
+
+A second Turn's placement can also include waiting the previous pod out -- the adapter
+allows a minute for that -- so this has to exceed that wait plus the creates, and two
+minutes does.
+"""
+
+_SUBMIT_TIMEOUT_S: Final = 660
+"""How long this client waits for a submitted Turn to end.
+
+Larger than it looks like it should be, because it covers a placement, a cold image pull
+and a model round trip end to end. On an autoscaled cluster the placement alone has been
+measured at a minute for the node plus fifteen seconds for the pull.
+
+It used to be the HTTP timeout on a route that held its response for all of that. The
+route answers 202 immediately now, so this is the polling deadline in
+`_wait_out_the_turn` instead -- the same span, waited for in a different place.
+
+It was 300, chosen when this file expected a synchronous refusal rather than a Turn. A
+client that gives up here aborts a Turn the platform was going to finish, and the pod it
+leaves behind is deleted by the cleanup rather than by the lease.
+"""
+
+_TERMINAL_DEADLINE_S: Final = _SUBMIT_TIMEOUT_S + 60.0
+"""How long the watcher waits for the submission thread after it has taken its snapshot.
+
+Longer than the client's own timeout by a margin, because the thread ends when that
+timeout fires: a deadline shorter than it would report this file as hanging when what
+is actually happening is an HTTP client giving up on schedule.
 """
 
 _SECRET_SUFFIXES: Final = ("compiled", "requirements", "shim-token")
@@ -165,10 +228,12 @@ def _exists(kind: str, name: str) -> bool:
 def _pod_uid(name: str) -> str | None:
     """The pod's UID, or None if no pod of that name exists.
 
-    A UID and not a name, because a name cannot answer the question. `pod_name_for` is a
-    function of the Session id, so a placement that deleted the pod and made another
-    would produce the same name twice and a name comparison would call that idempotent.
-    The UID is assigned by the API server per object and changes when the object does.
+    Presence, and which object it was. A name cannot carry the second half:
+    `pod_name_for` is a function of the Session id, so every pod this Session ever gets
+    is called the same thing, and under a lease it gets one per Turn. The UID is
+    assigned by the API server per object, so recording it says WHICH pod was seen and
+    not merely that something by that name was there -- which is what makes a snapshot
+    taken during a Turn attributable to that Turn afterwards.
 
     This replaced a helper that collected every `map-session-*` pod in the namespace and
     compared the whole set before and after. That reading was wrong in a way worth
@@ -183,13 +248,19 @@ def _pod_uid(name: str) -> str | None:
     return listed or None
 
 
-def _session_token_of(session_id: SessionId) -> str:
+def _session_token_of(session_id: SessionId) -> str | None:
     """The `x-map-session` header out of that Session's own compiled Secret.
 
     Read out of the object the control plane wrote, because that is the only place the
     token it signed exists -- the compiler mints it and hands it straight to the Secret.
     What comes back is passed to an HTTP client and to nothing else: never printed,
     never logged, never compared to a key.
+
+    Called only from inside a Turn, because that Secret is deleted when the Turn ends.
+    None rather than a failure when there is nothing to read, and the caller can tell
+    the two absences apart without this saying which: whether the Secret existed at all
+    is recorded beside the token, so an empty answer with the Secret present means a
+    compiled document that carries no such header.
     """
     encoded = kubectl(
         "get",
@@ -197,15 +268,27 @@ def _session_token_of(session_id: SessionId) -> str:
         f"{pod_name_for(session_id)}-compiled",
         "-o",
         r"jsonpath={.data.config\.toml}",
-    )
-    assert encoded, "the compiled Secret carries no config.toml"
+        check=False,
+    ).strip()
+    if not encoded:
+        return None
     document = tomllib.loads(base64.b64decode(encoded).decode())
     for server in document.get("mcp_servers", {}).values():
         headers = server.get("http_headers", {})
         if SESSION_TOKEN_HEADER_NAME in headers:
             token: str = headers[SESSION_TOKEN_HEADER_NAME]
             return token
-    pytest.fail(f"no {SESSION_TOKEN_HEADER_NAME} in the compiled document")
+    return None
+
+
+def _secrets_present(pod: str) -> tuple[str, ...]:
+    """Which of the three per-Session Secrets are in the namespace right now.
+
+    Returned as the suffixes that ARE there rather than the ones that are not, so one
+    reading answers both questions a caller has: a Turn in flight wants everything
+    present, and a Turn that has ended wants nothing left.
+    """
+    return tuple(one for one in _SECRET_SUFFIXES if _exists("secret", f"{pod}-{one}"))
 
 
 # ---------------------------------------------------------------------------
@@ -266,21 +349,71 @@ def _register_a_session(base: str) -> SessionId:
         return SessionId(UUID(session.json()["id"]))
 
 
-def _take_a_turn(base: str, session_id: SessionId) -> httpx.Response:
-    """Submit one Turn and return whatever the API answered.
+_ENDED = frozenset({"turn.completed", "turn.failed"})
+"""The two events either of which means a Turn is over and the Session is free again.
 
-    202: the API admits a Turn and dispatches it behind the response, so the outcome
-    arrives in the Event Log rather than on this connection. This used to expect 502 --
-    a pod from an image that resolves nowhere is never reachable -- and the expectation
-    was correct for as long as the placement never worked. It is a placement failure
-    now, not an ordinary state, so it is asserted at the call sites rather than here.
+Read out of the log rather than off the submission, because since `2316348` the API
+answers 202 the moment a Turn is admitted and runs it on a background task. There is no
+longer a response to wait on, and the only thing that says a Turn ended is one of these
+appearing in its Session's events.
+"""
+
+
+def _take_a_turn(base: str, session_id: SessionId) -> httpx.Response:
+    """Submit one Turn and return the submission's answer, once the Turn has ended.
+
+    Blocks for the whole Turn, which is why every caller here runs it on a thread --
+    but the block is this function's own polling now, not the API's. Until `2316348`
+    the route held its response until the dispatch returned, and this could simply
+    return the POST. It starts a background task and answers 202 immediately now, so a
+    caller that returns on the POST is handed a Turn that has not begun: the pod is
+    still initialising, and a second Turn submitted straight after is refused 409
+    because the first is genuinely still running. Both of those were read as platform
+    defects before the waiting moved here.
+
+    A non-202 answer is returned as it stands. It is a refusal, there is no Turn to wait
+    for, and the call sites grade the status line themselves.
     """
-    with _client(base, timeout=300) as caller:
-        return caller.post(
+    with _client(base, timeout=_SUBMIT_TIMEOUT_S) as caller:
+        answered = caller.post(
             f"/v1/sessions/{session_id}/events",
             json={"prompt": "Reply with exactly one word: acknowledged"},
             headers={"Idempotency-Key": uuid4().hex},
         )
+        if answered.status_code != 202:
+            return answered
+        _wait_out_the_turn(caller, session_id, str(answered.json()["turn_id"]))
+        return answered
+
+
+def _wait_out_the_turn(
+    caller: httpx.Client, session_id: SessionId, turn_id: str
+) -> None:
+    """Poll this Session's events until THIS Turn ends, or fail saying where it got to.
+
+    Keyed on the turn id and not merely on the event type, because a Session that has
+    already taken a Turn carries that Turn's terminal event for ever -- so a check for
+    "is there a `turn.completed` in here" is satisfied by the previous Turn before this
+    one has started, which is precisely the second-Turn case this file exists to grade.
+    """
+    deadline = time.monotonic() + _SUBMIT_TIMEOUT_S
+    seen: list[str] = []
+    while time.monotonic() < deadline:
+        answered = caller.get(f"/v1/sessions/{session_id}/events")
+        if answered.status_code == 200:
+            events = [
+                event
+                for event in answered.json()["events"]
+                if str((event.get("payload") or {}).get("turn_id")) == turn_id
+            ]
+            seen = [str(event["type"]) for event in events]
+            if _ENDED.intersection(seen):
+                return
+        time.sleep(2)
+    pytest.fail(
+        f"turn {turn_id} on session {session_id} never ended inside "
+        f"{_SUBMIT_TIMEOUT_S:.0f}s. Its events were {seen or 'none at all'}."
+    )
 
 
 def _event_types(base: str, session_id: SessionId) -> list[str]:
@@ -292,7 +425,14 @@ def _event_types(base: str, session_id: SessionId) -> list[str]:
 
 
 def _clean_up(session_id: SessionId) -> None:
-    """Delete the pod and its three Secrets. The namespace is left as it was found."""
+    """Delete the pod and its three Secrets. The namespace is left as it was found.
+
+    Ordinarily a no-op now, and kept for the runs where it is not. The lease deletes all
+    four objects when a Turn ends, so a run that completed leaves nothing here to
+    collect -- but a run that died mid-Turn, or one whose client gave up on a submission
+    the platform was still carrying, leaves a pod nothing else will reap. Every delete
+    tolerates absent, so the ordinary case costs four refusals nobody reads.
+    """
     pod = pod_name_for(session_id)
     kubectl("delete", "pod", pod, "--ignore-not-found", "--wait=false", check=False)
     for suffix in _SECRET_SUFFIXES:
@@ -302,60 +442,189 @@ def _clean_up(session_id: SessionId) -> None:
 
 
 # ---------------------------------------------------------------------------
-# One run, read four ways
+# One run, watched twice, read four ways
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def placed() -> Iterator[tuple[str, SessionId, httpx.Response]]:
-    """One Session, one Turn, and the port-forward the cases below keep reading through.
+@dataclass(frozen=True, slots=True)
+class _Watched:
+    """What one Turn had in the namespace while it ran, and what it left behind.
 
-    Module-scoped because placing a pod costs a compilation, three Secret creates and a
-    pod create against the real API server, and because these cases are four readings of
-    ONE run rather than four runs: "no second pod appeared" only means anything about
-    the same Session the first Turn placed one for.
+    A record taken as the Turn happened rather than a set of live reads, because the
+    objects it describes exist only for the length of that Turn and the submission's own
+    answer arrives after they are gone. Every field but the last was read at one
+    sighting, so a case that pairs two of them is comparing two facts about one moment
+    instead of two moments -- which, under a lease, is the difference between "this pod
+    has no Secrets" and "somebody looked either side of the handback".
+    """
+
+    answered: httpx.Response
+    """What the API finally said, which is after the Turn ended and the pod went."""
+
+    pod_uid: str | None
+    """The pod's UID at the first sighting, or None if none appeared while it ran.
+
+    A UID rather than a bool, because it names the object that was seen. The pod's name
+    is a function of the Session id and so is the same for every pod this Session is
+    ever given, which makes "a pod called this was there" a weaker statement than it
+    reads as -- and the failure message wants to be able to say which one.
+    """
+
+    secrets_present: tuple[str, ...]
+    """Which of the three Secrets existed at that same sighting."""
+
+    session_token: str | None
+    """The `x-map-session` header out of the compiled Secret. Never printed."""
+
+
+def _watch_one_turn(
+    base: str, session_id: SessionId, ignoring: str | None = None
+) -> _Watched:
+    """Submit one Turn and read the namespace while that Turn is still being carried.
+
+    The submission runs on a thread of its own, and that is the whole reason this
+    function exists. The API holds its response until the Turn is over, and the lease
+    deletes the pod and its Secrets before it answers -- so called inline there is no
+    moment left at which any of this can be looked at. Everything the cases below read
+    is gathered here, between the placement and the handback.
+
+    The pod and its Secrets are read in one breath, and the ordering is the invariant
+    being graded: the placer creates the three Secrets and then the pod, so a pod
+    sighted with a Secret missing is a pod whose volume can never mount.
+
+    `ignoring` is the UID of a pod this Turn must NOT be credited with, and it is what
+    makes a second Turn observable at all. A Turn submitted straight after another finds
+    the previous pod still listed, stamped for deletion and working through its grace
+    period -- at the SAME NAME, because the name is a function of the Session. A watcher
+    without this would latch onto that object within a second, report the Turn as having
+    been placed a pod, and hand back the previous Turn's UID -- which then reads as one
+    pod serving two Turns, the exact defect this file used to assert was impossible.
+
+    Returns only once the submission has answered, so the caller is handed a Turn that
+    is over and a namespace the platform has already been given back.
+    """
+    pod = pod_name_for(session_id)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        flying = pool.submit(_take_a_turn, base, session_id)
+        uid, present, token = _watch_for_the_pod(pod, session_id, flying, ignoring)
+        answered = flying.result(timeout=_TERMINAL_DEADLINE_S)
+    return _Watched(
+        answered=answered, pod_uid=uid, secrets_present=present, session_token=token
+    )
+
+
+def _watch_for_the_pod(
+    pod: str,
+    session_id: SessionId,
+    flying: Future[httpx.Response],
+    ignoring: str | None,
+) -> tuple[str | None, tuple[str, ...], str | None]:
+    """Poll until a pod that is not `ignoring` appears, then read it and its Secrets.
+
+    Stops the moment the submission has answered, because after that the lease has
+    already taken the pod back and a poll that kept going would spend its whole deadline
+    on a namespace that is correctly empty.
+
+    The Secrets are read only once a pod this Turn owns has been sighted, and that
+    ordering is what makes them attributable. A pod being replaced has its Secrets
+    deleted with it and the next set minted before the next pod is created, so a reading
+    taken at the sight of the NEW pod cannot be describing the old one's.
+
+    Reports nothing found rather than failing. Which case that is a finding for depends
+    on what the caller was looking for -- the first Turn owes a pod, the second owes a
+    different one -- and a helper that failed here would report all of them as the same
+    thing and name none of them.
+    """
+    deadline = time.monotonic() + _PLACEMENT_DEADLINE_S
+    while time.monotonic() < deadline:
+        uid = _pod_uid(pod)
+        if uid is not None and uid != ignoring:
+            return uid, _secrets_present(pod), _session_token_of(session_id)
+        if flying.done():
+            return None, (), None
+        time.sleep(1)
+    return None, (), None
+
+
+@dataclass(frozen=True, slots=True)
+class _Run:
+    """One Session's two watched Turns, and the forward the cases read the API through.
+
+    A record rather than a tuple because the two Turns are told apart by which one they
+    are and by nothing else -- both carry the same fields, over the same Session, under
+    the same pod name -- and a case that unpacked them positionally could compare the
+    first with itself and still pass.
+    """
+
+    base: str
+    session_id: SessionId
+    first: _Watched
+    second: _Watched | None
+    """None when the first Turn placed nothing, so the second was never attempted."""
+
+    first_pod_at_second_submit: str | None
+    """The first Turn's pod as the second Turn was submitted, or None if already gone.
+
+    Not asserted on, and recorded because it says which of two placement paths this run
+    actually took. A pod still listed here is stamped for deletion and reads as GONE, so
+    the second Turn is placed by waiting that pod out; a pod already collected reads as
+    ABSENT and is placed straight away. Both are correct and both end on a new pod, so
+    no assertion turns on it -- but a run that never lands in the ten-second window
+    graded the path its sibling file already grades, and a reader deserves to know which
+    happened rather than infer it.
+    """
+
+
+@pytest.fixture(scope="module")
+def placed() -> Iterator[_Run]:
+    """One Session, two watched Turns back to back, and the forward cases read through.
+
+    Module-scoped because these cases are four readings of ONE run rather than four runs
+    of their own, and because each Turn is expensive in a way it did not use to be: the
+    API holds its response until the Turn ends, so every submission pays a placement, an
+    image pull and a model round trip.
+
+    **Nothing waits between the two Turns, and that is the point of the second one.**
+    The first Turn's pod is deleted as its response is written and then lingers for its
+    grace period, so a Turn submitted immediately arrives while that pod is still
+    listed. That is what an interactive tenant does -- ask, read the answer, ask again
+    -- and it is the placement path a Turn takes when the pod it is replacing is still
+    terminating. Waiting here would produce the other path, which
+    `test_a_reaped_session_takes_another_turn.py` already grades deterministically and
+    says in as many words that it grades instead of this one.
+
+    The second Turn is attempted only if the first placed a pod. Without it there is
+    nothing to compare against, and a run whose control plane places nothing would
+    otherwise spend another eleven minutes finding that out twice.
     """
     with forwarded("deploy/control-plane", _CONTROL_PLANE_PORT) as base:
         session_id = _register_a_session(base)
         try:
-            answered = _take_a_turn(base, session_id)
-            _await_the_pod(session_id, answered)
-            yield base, session_id, answered
+            first = _watch_one_turn(base, session_id)
+            still_there = None
+            second = None
+            if first.pod_uid is not None:
+                # Read BEFORE the second submission and not after it: this is the only
+                # moment at which "was the old pod still there when the next Turn
+                # arrived" is answerable, and a read taken afterwards would be
+                # describing whatever the second Turn had by then done about it.
+                still_there = _pod_uid(pod_name_for(session_id))
+                second = _watch_one_turn(base, session_id, ignoring=first.pod_uid)
+            yield _Run(
+                base=base,
+                session_id=session_id,
+                first=first,
+                second=second,
+                first_pod_at_second_submit=still_there,
+            )
         finally:
             _clean_up(session_id)
 
 
-def _await_the_pod(session_id: SessionId, answered: httpx.Response) -> None:
-    """Block until the Session's pod object exists, or fail saying it never did.
-
-    Necessary because the API answers 202 and places behind the response. Every case
-    below reads objects in the namespace, and without this they race the dispatch: the
-    pod would be absent for the first few hundred milliseconds and "the control plane
-    placed nothing" is what that looks like. It did not use to race, because the old
-    expectation was a synchronous 502 that only came back after the placement had been
-    attempted and cleaned up.
-
-    Waits for the object and not for RUNNING. The object is what these cases are about,
-    and requiring RUNNING would make every one of them pay an image pull for a fact that
-    another file grades against a Turn that completes.
-    """
-    deadline = time.monotonic() + _PLACEMENT_DEADLINE_S
-    pod = pod_name_for(session_id)
-    while time.monotonic() < deadline:
-        if _pod_uid(pod) is not None:
-            return
-        time.sleep(1)
-    pytest.fail(
-        f"the API answered {answered.status_code} and no pod {pod} appeared in "
-        f"{_PLACEMENT_DEADLINE_S}s. A control plane that admits a Turn and places "
-        "nothing is the state this file exists to end."
-    )
-
-
 def test_the_pod_exists_and_the_control_plane_is_what_created_it(
-    placed: tuple[str, SessionId, httpx.Response],
+    placed: _Run,
 ) -> None:
-    """The whole slice, in one object's existence.
+    """The whole slice, in one object's existence, read while the Turn held it.
 
     Before this slice every deployment change could be in place and this would still
     fail, because nothing in `src/` called `Placement.place` or `compile_session_config`
@@ -364,15 +633,20 @@ def test_the_pod_exists_and_the_control_plane_is_what_created_it(
 
     The three Secrets are asserted with the pod rather than in a case of their own: a
     pod whose secret volumes have nothing behind them can never mount, kubelet retries
-    for ever, and an existence check on the pod alone would call that a pass.
+    for ever, and an existence check on the pod alone would call that a pass. Both
+    halves come from one sighting, which is what keeps the pairing meaningful now that
+    the pod is leased -- read at two moments, "the pod is here and its Secrets are not"
+    is also what a correct handback looks like from the wrong side of it.
     """
-    _, session_id, _ = placed
-    pod = pod_name_for(session_id)
-    assert _exists("pod", pod), (
-        f"no pod {pod} in {NAMESPACE}. The control plane accepted the Session and the "
-        "Turn and placed nothing, which is the state this slice exists to end."
+    watched = placed.first
+    pod = pod_name_for(placed.session_id)
+    assert watched.pod_uid is not None, (
+        f"no pod {pod} was ever in {NAMESPACE} while its Turn was in flight, and the "
+        f"API then answered {watched.answered.status_code}. The control plane accepted "
+        "the Session and the Turn and placed nothing, which is the state this slice "
+        "exists to end."
     )
-    missing = [s for s in _SECRET_SUFFIXES if not _exists("secret", f"{pod}-{s}")]
+    missing = [s for s in _SECRET_SUFFIXES if s not in watched.secrets_present]
     assert not missing, (
         f"the pod exists and {missing} do not. Its secret volumes have nothing behind "
         "them, so kubelet retries the mount for ever and the pod can never start."
@@ -380,7 +654,7 @@ def test_the_pod_exists_and_the_control_plane_is_what_created_it(
 
 
 def test_the_turn_is_admitted_and_recorded_before_anything_is_dispatched(
-    placed: tuple[str, SessionId, httpx.Response],
+    placed: _Run,
 ) -> None:
     """The Turn is admitted, and the log records the admission independently of it.
 
@@ -398,15 +672,15 @@ def test_the_turn_is_admitted_and_recorded_before_anything_is_dispatched(
     Environment named an image that resolves nowhere. That is a placement failure now
     and not the ordinary path.
     """
-    base, session_id, first = placed
+    first = placed.first.answered
     assert first.status_code == 202, first.text
-    types = _event_types(base, session_id)
+    types = _event_types(placed.base, placed.session_id)
     assert types[0] == "session.created", types
     assert "turn.submitted" in types, types
 
 
 def test_the_tool_gateway_accepts_the_token_the_control_plane_signed(
-    placed: tuple[str, SessionId, httpx.Response],
+    placed: _Run,
 ) -> None:
     """Ask the process that decides, rather than compare two spellings.
 
@@ -419,9 +693,26 @@ def test_the_tool_gateway_accepts_the_token_the_control_plane_signed(
     The control in the same run is a token minted here under a key this file invented,
     which must be refused. Without it, an endpoint that accepts everything and an
     endpoint that verifies are indistinguishable from one probe.
+
+    The token is lifted during the Turn and presented after it, because the Secret
+    holding it is deleted with the pod while the answer this case wants is not. Nothing
+    about that weakens the question: the gateway's middleware decides on the signature
+    and the expiry alone -- it reads no pod, no Session and no cluster -- and the
+    deployed lifetime is a day, so a token minted minutes ago is exactly as acceptable
+    to it as one minted while its pod was up. What would weaken it is presenting a token
+    that had expired, and this file cannot run for long enough to do that.
     """
-    _, session_id, _ = placed
-    signed = _session_token_of(session_id)
+    session_id = placed.session_id
+    signed = placed.first.session_token
+    assert signed is not None, (
+        "no Session token was read while the Turn was in flight, so there is nothing "
+        "to present. The compiled Secret was "
+        + (
+            "in the namespace and carried no such header"
+            if "compiled" in placed.first.secrets_present
+            else "not in the namespace at all"
+        )
+    )
     forged = mint_session_token(
         session_id=session_id,
         tenant_id=TenantId(UUID(_TENANT)),
@@ -456,32 +747,66 @@ def test_the_tool_gateway_accepts_the_token_the_control_plane_signed(
     )
 
 
-def test_a_second_turn_reuses_the_pod_the_first_one_placed(
-    placed: tuple[str, SessionId, httpx.Response],
-) -> None:
-    """One Session, one pod object, whatever a caller does.
+def test_a_second_turn_is_given_a_pod_of_its_own(placed: _Run) -> None:
+    """A Turn arriving on the heels of the last one is placed a pod, not handed the old.
 
-    The branch under test is idempotence: `ensure_for` finds the pod it made a moment
-    ago rather than making another. A placement that ignored what already exists would
-    replace the object, and the replacement would carry the SAME NAME -- `pod_name_for`
-    is a function of the Session id -- so this compares UIDs, which the API server
-    assigns per object.
+    This case asserted the opposite until ADR-041 -- one Session, one pod object,
+    whatever a caller does -- and what it graded, `ensure_for` finding the pod it made a
+    moment ago rather than making another, is the rule that record withdrew. The
+    instrument survives the reversal exactly: both Turns' pods carry the SAME NAME
+    because the name is a function of the Session id, so only the UID the API server
+    assigns per object can tell a new pod from the old one still standing.
 
-    ADR-004's other rule, that a Session which HAS completed a Turn never gets a fresh
-    pod, is graded in the Tier-1 file. This Session has completed none.
+    **What makes this worth a case rather than a duplicate is WHEN the second Turn is
+    submitted.** Nothing waits, so it arrives while the first pod is still working
+    through its grace period, listed and stamped for deletion. That pod reads as GONE,
+    and a Turn that finds GONE is placed by waiting it out and creating in its place --
+    a different path from the one a Turn takes when the object has already been
+    collected. `test_a_reaped_session_takes_another_turn.py` waits the window out
+    deliberately, so that it can grade the second path without racing a ten-second
+    window, and its own docstring records that the first path is the one an interactive
+    tenant takes and is not graded there. This is where it is graded.
 
-    Scoped to this Session's own pod. It used to compare every `map-session-*` pod in
-    the namespace before and after, which is a reading that fails whenever any other
-    Session is running -- the normal condition on the platform this is meant to grade.
+    Refusing a Turn in that window is not hypothetical: it is what the platform did
+    until it was fixed, as a 502 reading "the pod for session ... is gone", and it
+    failed every second Turn a tenant sent promptly. So the assertions here are the
+    shape of that regression -- a Turn answered, a pod that is new, and Secrets behind
+    its volumes.
+
+    Which path a given run took is reported and not asserted. Landing inside a
+    ten-second window is not something a test can promise, and both paths end on a new
+    pod, so an assertion on the window would fail runs where the platform was merely
+    quick.
     """
-    base, session_id, _ = placed
-    pod = pod_name_for(session_id)
-    before = _pod_uid(pod)
-    assert before is not None, f"no pod {pod} before the second Turn"
-    second = _take_a_turn(base, session_id)
-    assert second.status_code == 202, second.text
-    after = _pod_uid(pod)
-    assert after == before, (
-        f"a second Turn replaced the pod object for {session_id}: uid {before} -> "
-        f"{after}. One Session has one pod, whatever a caller does."
+    first, second = placed.first, placed.second
+    assert first.pod_uid is not None, (
+        "the first Turn placed no pod, so the second was never submitted and there is "
+        "nothing here to compare. What failed is above this case, not in it."
+    )
+    assert second is not None, "the second Turn was not attempted"
+    arrived = (
+        "while the first pod was still terminating"
+        if placed.first_pod_at_second_submit == first.pod_uid
+        else "after the first pod had already been collected"
+    )
+    assert second.answered.status_code == 202, (
+        f"a second Turn submitted {arrived} was answered "
+        f"{second.answered.status_code}: {second.answered.text}"
+    )
+    assert second.pod_uid is not None, (
+        f"a second Turn on session {placed.session_id}, submitted {arrived}, was "
+        "answered 202 and no pod of its own ever appeared. Every Turn pays its own "
+        "placement, so a second Turn placing nothing is a Session usable exactly once."
+    )
+    missing = [s for s in _SECRET_SUFFIXES if s not in second.secrets_present]
+    assert not missing, (
+        f"the second Turn's pod exists and {missing} do not, so its secret volumes "
+        "have nothing behind them and it can never start. A pod that replaces another "
+        "takes the old one's Secrets with it, so this is the reading that says the "
+        "replacement minted its own rather than inheriting a deletion."
+    )
+    assert second.pod_uid != first.pod_uid, (
+        f"the second Turn on session {placed.session_id} ran on the pod the first one "
+        f"placed: uid {first.pod_uid} twice. A pod is leased for one Turn, so a UID "
+        "surviving into the next one is a pod that was never given back."
     )

@@ -21,45 +21,84 @@ the allowlist is decoration. And this cluster's own control plane must not, beca
 answers without authentication (`deploy/k8s/network-policies.yaml` says so in those
 words) and a Session that could dial it could act as the platform.
 
-No model is asked anything. The Turn exists only to make the control plane place a pod;
-every measurement is a command run under `codex sandbox` through `kubectl exec`.
+**No Turn, and no control plane, and that is what ADR-041 changed here.** This file used
+to create two Sessions through the public API, submit one throwaway Turn each purely to
+make the control plane place a pod, and then `kubectl exec` the probe into those pods
+afterwards. A pod is now leased for exactly one Turn and destroyed when that Turn ends,
+so by the time the Turn the probe was waiting on is over there is nothing left to exec
+into -- the exec failed, its error was swallowed, and six cases read an empty transcript
+as six refusals. The Turn was never the measurement; its own helper said so. So the pods
+are built here directly from `deploy/k8s/session-pod.yaml`, which is a pod the control
+plane never leased and therefore never releases, and every measurement is a command run
+under `codex sandbox` exactly as before.
+
+**What that costs, stated plainly.** Building the pods here means the documents they
+mount are compiled in this process rather than fetched from a Session the API created,
+so the hop from `POST /v1/environments` to the Environment record no longer runs inside
+this file. That hop is graded offline -- `tests/control/test_environment_lifecycle.py`
+and `test_environment_reference.py` carry `allowed_domains` through the route and the
+store -- and the hop this file still owns is the one nothing else covers: a real
+`Environment` through `compile_session_config` into a real pod, and out to the kernel.
+What no single test walks any more is the whole chain in one piece. That is the price of
+observing the property at all under the lease, and the alternative -- asking a model,
+inside a Turn, to try the fetches and report what happened -- would rest a security
+finding on an LLM's willingness to cooperate and report verbatim.
+
+The two arms cannot both read the Secret names the manifest spells, since they differ
+only in what those documents say, so each pod is pointed at a pair of its own.
 """
 
 from __future__ import annotations
 
-import json
-import subprocess
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Final
-from uuid import UUID, uuid4
+from uuid import uuid4
 
-import httpx
 import pytest
-from cluster_access import NAMESPACE, forwarded, kubectl
+import yaml
 
+# The pod wrappers, imported rather than copied, for the reason
+# `test_a_confined_command_runs_in_a_session_pod.py` gives where it does the same: this
+# would be the third copy. By bare module name because `tests/` carries no
+# `__init__.py`, so pytest's own sys.path entry is what resolves it.
+from test_the_pod_materialises_its_sandbox_targets import (
+    _EXPIRY,
+    _TOKEN_KEY,
+    _image,
+    _kubectl,
+    _probe_pod,
+    _secret,
+    _transcript,
+    drop_the_workspace_volume,
+    make_the_workspace_volume,
+)
+
+from managed_agent.control.pod_config import compiler as config_compiler
 from managed_agent.control.pod_config.compiler import PROFILE_NAME, WORKSPACE_ROOT
-from managed_agent.control.session.placement import pod_name_for
-from managed_agent.core.ids import SessionId
+from managed_agent.core.ids import TenantId, new_definition_id, new_session_id
+from managed_agent.core.registration.definition import AgentDefinition, SkillsRevision
+from managed_agent.core.registration.environment import Environment, new_environment_id
+from managed_agent.core.session.session import SessionRecord
 
-_CONTROL_PLANE: Final = "deploy/control-plane"
-_CONTROL_PLANE_PORT: Final = 8080
-_REPOSITORY: Final = "map/session-shim"
-_REGION: Final = "us-east-1"
-_MODEL: Final = "gsds-claude-opus-4-6"
-TENANT_HEADER: Final = "X-Tenant-Id"
+_NAMESPACE: Final = "map-egress-reach"
 
 _GRANTED: Final = "pypi.org"
 _NOT_GRANTED: Final = "example.com"
-_CLUSTER: Final = f"control-plane.{NAMESPACE}.svc.cluster.local"
+_CLUSTER: Final = "control-plane.map-dev.svc.cluster.local"
+"""The platform's own control plane, addressed across namespaces on purpose.
 
-_TURN_DEADLINE_S: Final = 600
-_SECRET_SUFFIXES: Final = ("compiled", "requirements", "shim-token")
+These pods live in a namespace of their own and the destination has to stay the real
+one: the finding is that a confined command cannot reach the service that answers
+without authentication, and a copy of that service would be a different claim.
+"""
 
 requires_the_cluster = pytest.mark.skipif(
     __import__("os").environ.get("MAP_CLUSTER_TESTS") != "1",
-    reason="MAP_CLUSTER_TESTS=1 places real pods and calls a real model",
+    reason=(
+        "MAP_CLUSTER_TESTS=1 creates a namespace of its own and two pods in it, and "
+        "reaches the public internet from inside them. SKIPPED MEANS NOTHING RAN."
+    ),
 )
 
 _REACH = '''
@@ -120,133 +159,103 @@ echo probe=complete
 """
 
 
-def _session_image() -> str:
-    done = subprocess.run(
-        (
-            "aws",
-            "ecr",
-            "describe-images",
-            "--repository-name",
-            _REPOSITORY,
-            "--region",
-            _REGION,
-            "--output",
-            "json",
-        ),
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    details = json.loads(done.stdout)["imageDetails"]
-    assert details, f"{_REPOSITORY} holds no images, so no Session pod can start"
-    newest = max(details, key=lambda one: str(one["imagePushedAt"]))
-    return (
-        f"{newest['registryId']}.dkr.ecr.{_REGION}.amazonaws.com/"
-        f"{_REPOSITORY}@{newest['imageDigest']}"
-    )
+def _compiled_for(
+    image: str, domains: tuple[str, ...]
+) -> config_compiler.CompiledConfig:
+    """The documents the compiler emits for a shape granting exactly `domains`.
 
+    Compiled rather than hand-written, and this is the seam the file is here to grade:
+    the allowlist has to travel from an `Environment` through `compile_session_config`
+    into the document the runtime reads, and a copy of that document written here would
+    be free to name something the compiler never emits.
 
-def _client(base: str, tenant_id: str, timeout: int = 900) -> httpx.Client:
-    return httpx.Client(
-        base_url=base, timeout=timeout, headers={TENANT_HEADER: tenant_id}
-    )
+    A near-twin of `_compiled` in the module the wrappers come from, which differs in
+    one argument: that one pins an empty allowlist, because its own subject is the
+    sandbox's filesystem targets and egress would be noise in it. Parameterising it
+    there would put this file's variable into a module that has no use for it, so the
+    second copy is deliberate and it is the second rather than the third.
 
-
-def _created(answered: httpx.Response) -> dict[str, Any]:
-    assert answered.status_code == 201, answered.text
-    body: dict[str, Any] = answered.json()
-    return body
-
-
-def _a_session(
-    base: str, tenant_id: str, image: str, run: str, domains: tuple[str, ...]
-) -> SessionId:
-    with _client(base, tenant_id) as caller:
-        environment = _created(
-            caller.post(
-                "/v1/environments",
-                json={
-                    "name": f"reach-{run}",
-                    "runtime_image": image,
-                    "allowed_domains": list(domains),
-                },
-            )
-        )
-        definition = _created(
-            caller.post(
-                "/v1/agents",
-                json={
-                    "name": f"reach-{run}",
-                    "instructions": "You reply with one word.",
-                    "model": _MODEL,
-                    "skills_repository": "git@github.com:acme/skills.git",
-                    "skills_revision": "0" * 39 + "a",
-                    "skills": [],
-                    "tool_servers": [],
-                },
-            )
-        )
-        session = _created(
-            caller.post(
-                "/v1/sessions",
-                json={
-                    "definition_id": definition["id"],
-                    "environment_id": environment["id"],
-                    "budget_minor_units": 500_000,
-                    "budget_currency": "USD",
-                    "retention_days": 1,
-                },
-            )
-        )
-    return SessionId(UUID(session["id"]))
-
-
-def _place(base: str, tenant_id: str, session_id: SessionId) -> None:
-    """One trivial Turn, whose only purpose is to make the control plane place a pod.
-
-    The Turn is not the measurement and its answer is never read. A pod is what this
-    file needs and the platform places one when a Turn arrives, so this is the cheapest
-    prompt that gets one.
+    The signing key and the expiry are the same test-only pair, reaching nothing outside
+    the namespace this file deletes. No container here starts a Turn or dials the Tool
+    Gateway -- the runtime's command is replaced by the probe -- so the token in the
+    document is never presented to anything, and both arguments exist only because the
+    compiler refuses to emit a document without them.
     """
-    with _client(base, tenant_id) as caller:
-        answered = caller.post(
-            f"/v1/sessions/{session_id}/events",
-            json={"prompt": "Reply with exactly the word READY and nothing else."},
-            headers={"Idempotency-Key": uuid4().hex},
-        )
-    assert answered.status_code == 202, answered.text
-    deadline = time.monotonic() + _TURN_DEADLINE_S
-    while time.monotonic() < deadline:
-        with _client(base, tenant_id, timeout=60) as caller:
-            events = caller.get(f"/v1/sessions/{session_id}/events").json()["events"]
-        if any(one["type"] in ("turn.completed", "turn.failed") for one in events):
-            return
-        time.sleep(3)
-    pytest.fail(f"session {session_id} never reached a terminal event")
-
-
-def _reach(session_id: SessionId) -> str:
-    """The probe's transcript, run under the sandbox inside the runtime container."""
-    return kubectl(
-        "exec",
-        pod_name_for(session_id),
-        "-c",
-        "agent-runtime",
-        "--",
-        "/bin/sh",
-        "-c",
-        _probe_script(),
-        check=False,
+    return config_compiler.compile_session_config(
+        SessionRecord(
+            id=new_session_id(),
+            tenant_id=TenantId(uuid4()),
+            definition_id=new_definition_id(),
+            definition_revision="rev-1",
+            grant=frozenset(),
+            scope=(),
+            budget_minor_units=10_000,
+            budget_currency="USD",
+            retention_days=30,
+        ),
+        tool_gateway_url="https://tool-gateway.map.internal/mcp",
+        model_gateway_url="http://model-gateway.map-dev.svc.cluster.local/v1",
+        definition=AgentDefinition(
+            name="egress-probe",
+            instructions="Nothing here starts a Turn.",
+            model="gpt-5-codex",
+            skills_repository="git@github.com:acme/skills.git",
+            skills_revision=SkillsRevision("0" * 39 + "a"),
+        ),
+        environment=Environment(
+            id=new_environment_id(),
+            tenant_id=TenantId(uuid4()),
+            name="egress-probe",
+            runtime_image=image,
+            denied_paths=(),
+            allowed_domains=domains,
+        ),
+        session_token_key=_TOKEN_KEY,
+        session_token_expiry_epoch_s=_EXPIRY,
     )
 
 
-def _clean_up(session_id: SessionId) -> None:
-    name = pod_name_for(session_id)
-    kubectl("delete", "pod", name, "--ignore-not-found", "--wait=false", check=False)
-    for suffix in _SECRET_SUFFIXES:
-        kubectl(
-            "delete", "secret", f"{name}-{suffix}", "--ignore-not-found", check=False
-        )
+def _point_at_its_own_documents(pod: dict[str, Any], name: str) -> dict[str, str]:
+    """Give this pod Secrets no other pod in the namespace shares, and name them back.
+
+    The manifest spells one Secret name per document, and the two pods here differ ONLY
+    in what those documents say -- so they cannot both read the names it spells. The
+    alternative is a namespace per arm, which doubles the workspace volume and the
+    teardown in order to separate two pods that otherwise want to be as alike as it is
+    possible to make them.
+
+    Returns the new name per volume so the caller creates exactly the Secrets the pod
+    will mount, rather than a list of names written out twice and free to disagree.
+
+    The assertion is the guard on the pruning `_probe_pod` does. It drops the shim, and
+    with it every volume the shim was the only mounter of -- `shim-token` among them --
+    so a pod arriving here with a third Secret volume is one whose containers changed
+    shape, and it would be pointed at a Secret this function never created.
+    """
+    renamed = {}
+    for volume in pod["spec"]["volumes"]:
+        secret = volume.get("secret")
+        if secret is None:
+            continue
+        renamed[volume["name"]] = f"{name}-{volume['name']}"
+        secret["secretName"] = renamed[volume["name"]]
+    assert set(renamed) == {"compiled", "requirements"}, renamed
+    return renamed
+
+
+def _labelled(transcript: str, label: str) -> str:
+    """The one probe line carrying `label`, or the empty string if it never printed.
+
+    Read by label rather than searched for as a substring of the whole transcript,
+    because a transcript is built from container logs and status fields and is wider
+    than the probe's own output. A bare `"403" in transcript` could be satisfied by
+    something with no connection to the destination it is supposed to be about, and a
+    case that can be satisfied by an unrelated line is a case that cannot fail honestly.
+    """
+    for line in transcript.splitlines():
+        if line.startswith(f"{label}="):
+            return line
+    return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -259,26 +268,47 @@ class _Reached:
 def reached() -> Iterator[_Reached]:
     """Two pods, one Environment apart, and the transcript each produced.
 
-    Both are torn down whatever happened, including a failure while placing the second:
-    a run that died between them still created a Session the control plane placed a pod
-    for, and three aborted runs once left forty-two squatting the namespace.
+    Both are applied before either transcript is read, so the two arms run against the
+    same cluster at the same moment: a comparison whose halves were measured ten minutes
+    apart is a comparison a passing deploy could have changed underneath.
+
+    The namespace is created and deleted here, which is what takes the pods with it --
+    and the volume is dropped separately, because `Retain` leaves it behind otherwise.
+    The create tolerates a namespace an interrupted run left behind rather than failing
+    the tier on it; if it is genuinely unusable, applying the pods below says so.
     """
-    run = uuid4().hex[:8]
-    tenant_id = str(uuid4())
-    image = _session_image()
-    with forwarded(_CONTROL_PLANE, _CONTROL_PLANE_PORT) as base:
-        with_grant = _a_session(base, tenant_id, image, f"y{run}", (_GRANTED,))
-        without = _a_session(base, tenant_id, image, f"n{run}", ())
-        try:
-            _place(base, tenant_id, with_grant)
-            _place(base, tenant_id, without)
-            yield _Reached(
-                granted=_reach(with_grant),
-                ungranted=_reach(without),
+    image = _image()
+    _kubectl("create", "namespace", _NAMESPACE, check=False)
+    try:
+        make_the_workspace_volume(_NAMESPACE)
+        pods = {}
+        for label, domains in (("granted", (_GRANTED,)), ("ungranted", ())):
+            name = f"egress-{label}"
+            pod = _probe_pod(
+                name, image=image, namespace=_NAMESPACE, probe=_probe_script()
             )
-        finally:
-            _clean_up(with_grant)
-            _clean_up(without)
+            renamed = _point_at_its_own_documents(pod, name)
+            documents = _compiled_for(image, domains)
+            _secret(
+                renamed["compiled"],
+                {"config.toml": documents.config_toml},
+                namespace=_NAMESPACE,
+            )
+            _secret(
+                renamed["requirements"],
+                {"requirements.toml": documents.requirements_toml},
+                namespace=_NAMESPACE,
+            )
+            pods[label] = pod
+        for pod in pods.values():
+            _kubectl("apply", "-n", _NAMESPACE, "-f", "-", stdin=yaml.safe_dump(pod))
+        yield _Reached(
+            granted=_transcript("egress-granted", namespace=_NAMESPACE),
+            ungranted=_transcript("egress-ungranted", namespace=_NAMESPACE),
+        )
+    finally:
+        _kubectl("delete", "namespace", _NAMESPACE, "--ignore-not-found", check=False)
+        drop_the_workspace_volume(_NAMESPACE)
 
 
 @requires_the_cluster
@@ -322,23 +352,29 @@ def test_the_only_route_out_of_the_sandbox_is_the_proxy(reached: _Reached) -> No
     below asserts.
     """
     for transcript in (reached.granted, reached.ungranted):
-        assert "granted-tcp=REFUSED gaierror" in transcript, transcript[-600:]
-        assert "ungranted-tcp=REFUSED gaierror" in transcript, transcript[-600:]
-        assert "cluster-tcp=REFUSED gaierror" in transcript, transcript[-600:]
+        for label in ("granted-tcp", "ungranted-tcp", "cluster-tcp"):
+            line = _labelled(transcript, label)
+            assert line.startswith(f"{label}=REFUSED gaierror"), (
+                f"{label!r} was {line!r}\n{transcript[-600:]}"
+            )
 
 
 @requires_the_cluster
 def test_a_granted_domain_is_reachable(reached: _Reached) -> None:
-    """The capability, end to end: an Environment named `pypi.org` and the agent's own
-    command fetched from it.
+    """The capability, end to end: an Environment named `pypi.org` and a command in the
+    pod fetched from it.
 
     `CODEX_NETWORK_PROXY_ACTIVE=1` is asserted beside the fetch because the two answer
     different questions. The variable says the runtime read our managed keys and started
     its proxy -- the half this repository is responsible for. The 200 says the proxy
     then let this destination through.
     """
-    assert "CODEX_NETWORK_PROXY_ACTIVE=1" in reached.granted, reached.granted[:400]
-    assert "granted-https=REACHED status=200" in reached.granted, reached.granted[-800:]
+    assert "CODEX_NETWORK_PROXY_ACTIVE=1" in _labelled(reached.granted, "proxy-env"), (
+        reached.granted[:800]
+    )
+    assert _labelled(reached.granted, "granted-https").startswith(
+        "granted-https=REACHED status=200"
+    ), reached.granted[-800:]
 
 
 @requires_the_cluster
@@ -349,9 +385,13 @@ def test_a_domain_that_was_not_granted_is_refused(reached: _Reached) -> None:
     be decoration -- which is exactly the failure `test_egress_is_bounded_or_absent.py`
     refuses on paper. This is the same claim measured: same pod, same proxy, same run,
     one destination through and one refused at the tunnel.
+
+    The status is read off the refusal's own line rather than looked for anywhere in the
+    transcript, so `403` cannot be supplied by something that is not this attempt.
     """
-    assert "ungranted-https=REFUSED" in reached.granted, reached.granted[-800:]
-    assert "403" in reached.granted, reached.granted[-800:]
+    refused = _labelled(reached.granted, "ungranted-https")
+    assert refused.startswith("ungranted-https=REFUSED"), reached.granted[-800:]
+    assert "403" in refused, refused
 
 
 @requires_the_cluster
@@ -365,8 +405,11 @@ def test_the_platforms_own_control_plane_is_refused(reached: _Reached) -> None:
     forbid it is declared and not enforced by this cluster's CNI, so this is the guard
     that is actually running.
     """
-    assert "cluster-http=REFUSED" in reached.granted, reached.granted[-800:]
-    assert "cluster-http=REFUSED" in reached.ungranted, reached.ungranted[-800:]
+    for transcript in (reached.granted, reached.ungranted):
+        line = _labelled(transcript, "cluster-http")
+        assert line.startswith("cluster-http=REFUSED"), (
+            f"cluster-http was {line!r}\n{transcript[-800:]}"
+        )
 
 
 @requires_the_cluster
@@ -378,7 +421,16 @@ def test_a_shape_that_granted_nothing_has_no_network_and_no_proxy(
     Not merely "the fetch failed" -- the proxy was never started, which is what an
     Environment granting no domain is supposed to produce. A pod with the proxy running
     and an empty list would fail these fetches too and would be a different platform.
+
+    The proxy line has to be PRESENT and empty. Asserting only that
+    `CODEX_NETWORK_PROXY_ACTIVE` is absent from the transcript would be satisfied by a
+    probe that never printed the line at all, which is the same evidence a pod that
+    never started produces.
     """
-    assert "proxy-env=\n" in reached.ungranted, reached.ungranted[:400]
+    assert _labelled(reached.ungranted, "proxy-env") == "proxy-env=", reached.ungranted[
+        :800
+    ]
     assert "CODEX_NETWORK_PROXY_ACTIVE" not in reached.ungranted
-    assert "granted-https=REFUSED" in reached.ungranted, reached.ungranted[-800:]
+    assert _labelled(reached.ungranted, "granted-https").startswith(
+        "granted-https=REFUSED"
+    ), reached.ungranted[-800:]

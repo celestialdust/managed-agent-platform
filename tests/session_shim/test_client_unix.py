@@ -211,3 +211,38 @@ def _a_shape_that_narrows_nothing() -> Environment:
         runtime_image="registry.map.internal/session@sha256:" + "a" * 64,
         denied_paths=(),
     )
+
+
+async def test_closing_after_the_runtime_vanished_is_not_itself_a_failure() -> None:
+    """A connection whose socket died is closable, and closing it raises nothing.
+
+    The reader task ends on the socket dying, and `close` awaits it to be sure it has
+    stopped -- so whatever the reader ended with is re-raised there unless the reader
+    treats a dead socket as its ordinary terminal condition. It did not, and the shim
+    calls `close` from its lifespan shutdown: a Session pod whose runtime exited
+    without a closing handshake logged `Application shutdown failed. Exiting.` and was
+    torn down hard, which cut the response stream the control plane was still reading
+    and turned a Turn that had done its work into `runtime_lost`.
+
+    The in-flight call is how this case knows the reader has already finished rather
+    than been cancelled by `close`. Its `RuntimeConnectionClosed` is raised from the
+    reader's own `finally`, so seeing it means the reader ran to the end -- without it
+    `close` would cancel a reader still parked on `recv` and pass for the wrong reason.
+    """
+    async with fake_agent_runtime() as runtime:
+        runtime.silent.add("thread/read")
+        connection = RuntimeConnection(runtime.socket_path)
+        await connection.connect()
+        call = asyncio.create_task(
+            connection.read_thread(
+                ThreadReadRequest(thread_id="th_1", include_turns=False)
+            )
+        )
+        await runtime.wait_until(
+            lambda: "thread/read" in runtime.methods_received,
+            "the call never reached the runtime, so the socket died before it mattered",
+        )
+        await runtime.vanish()
+        with pytest.raises(RuntimeConnectionClosed):
+            await asyncio.wait_for(call, timeout=5.0)
+        await connection.close()

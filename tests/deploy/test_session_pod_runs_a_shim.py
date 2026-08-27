@@ -28,6 +28,7 @@ from managed_agent.control.pod_config.compiler import (
     WORKSPACE_ROOT,
 )
 from managed_agent.session_shim.serve import (
+    PROBE_PORT,
     READY_ROUTE,
     RUNTIME_WAIT_ATTEMPTS,
     RUNTIME_WAIT_SECONDS,
@@ -68,8 +69,16 @@ def test_the_pod_runs_a_shim_beside_the_runtime() -> None:
 
 
 def test_the_port_the_manifest_publishes_is_the_port_the_control_plane_dials() -> None:
+    """Both ports, and both against the constants the code binds them from.
+
+    The second one exists for the kubelet's readiness probe: once a pod holds a
+    certificate the Session port requires one back, and a probe presents none. Declared
+    in the manifest so the probe can name it rather than repeat a number. It is bound on
+    every interface, because a probe dials the pod IP -- what keeps it off the pod
+    network is the NetworkPolicy, which admits nothing on this port.
+    """
     ports = _container("session-shim")["ports"]
-    assert [port["containerPort"] for port in ports] == [SHIM_PORT]
+    assert [port["containerPort"] for port in ports] == [SHIM_PORT, PROBE_PORT]
 
 
 def test_the_service_name_the_pod_subdomain_and_the_constant_all_agree() -> None:
@@ -149,21 +158,44 @@ def test_the_readiness_probe_points_at_the_route_that_reports_readiness() -> Non
     undeliverable while the shim worked."""
     probe = _container("session-shim")["readinessProbe"]["httpGet"]
     assert probe["path"] == READY_ROUTE
-    assert probe["port"] == _container("session-shim")["ports"][0]["name"]
+    published = {
+        port["name"]: port["containerPort"]
+        for port in _container("session-shim")["ports"]
+    }
+    # The probe port, not the Session port. Asserted through the published mapping
+    # rather than by index, because "the first port" stopped being a fact about this
+    # manifest the moment there were two.
+    assert published[probe["port"]] == PROBE_PORT
+    # No `host`, so the kubelet dials the pod IP. Setting one here would send the probe
+    # to that address from the NODE's namespace -- `host: 127.0.0.1` would probe the
+    # node itself -- and the shim would never see it. The default is the only value
+    # that reaches this container, so its absence is the assertion.
+    assert "host" not in probe, (
+        f"the probe names a host ({probe.get('host')!r}); a kubelet resolves it in the "
+        "node's network namespace, not this pod's"
+    )
 
 
-def test_the_shim_command_names_an_entry_point_that_exists() -> None:
-    """`uvicorn --factory` resolves this string when the container starts, so a typo in
-    it is a container that fails at start-up against a manifest nothing else reads.
+def test_the_shim_command_names_a_module_that_runs_when_it_is_run() -> None:
+    """`python -m <module>` resolves this name at container start, so a typo in it is a
+    container that fails to start against a manifest nothing else reads.
 
-    The attribute is looked up, never called: calling it builds an app whose lifespan
-    dials a socket that does not exist here.
+    It used to be `uvicorn <module>:<attribute> --factory`, and the module took over
+    because whether this pod serves TLS depends on what was mounted into it -- a
+    decision a manifest cannot express, since naming `--ssl-certfile` unconditionally
+    fails every pod placed without CA material.
+
+    What is checked is that the module imports and that `python -m` will find something
+    to run in it, which is `__main__` at module scope. `serve` is looked up but never
+    called: calling it binds a port.
     """
     command = _container("session-shim")["command"]
-    targets = [word for word in command if ":" in word]
-    assert len(targets) == 1, f"expected one module:attribute in {command}"
-    module_name, _, attribute = targets[0].partition(":")
-    assert callable(getattr(importlib.import_module(module_name), attribute))
+    assert command[:2] == ["python", "-m"], command
+    module = importlib.import_module(command[2])
+    assert callable(module.serve)
+    assert importlib.util.find_spec(command[2]) is not None, (
+        f"{command[2]} is not importable as a module"
+    )
 
 
 def test_the_runtime_container_still_launches_the_argv_config_compiler_emits() -> None:
@@ -234,14 +266,22 @@ def test_the_shim_reaches_the_attachment_directory_and_nothing_else_beside_it() 
     exist, or the route answers 500 for every attached file. Its path has to be the
     constant the route writes to, or the file lands in the pod at a path the agent has
     no route to -- the bytes are on the disk and the agent reports the document missing.
-    And it has to carry `subPath`, because without it this container mounts the whole
-    workspace: the pod's one outward-facing process would then be able to write over
+    And it has to narrow to the attachment directory, because a mount that stopped at
+    this Session's own root would let the pod's one outward-facing process write over
     anything the agent produced, from off the pod, through a route whose only check is a
     bearer token.
 
-    The runtime container is asserted to mount the same volume WHOLE, at the root the
-    compiler makes writable, because that is the half that makes the file reachable. Two
-    containers, one volume, two mounts of different shapes -- and the file path only
+    Asserted as a SUFFIX rather than as the whole string, because the rest of the
+    subPath is the Session's subtree of a volume shared by every Session on the cluster
+    (ADR-035) and is filled in per Session by the pod runner. The property here is the
+    last segment -- how far past its own root this container reaches -- and pinning the
+    whole literal would make this test fail on a correct manifest the day the subtree
+    layout changes. The subtree itself is graded by `tests/adapters/test_pod_runner.py`,
+    which is where the substitution lives.
+
+    The runtime container is asserted to mount the same volume at its own root, the one
+    the compiler makes writable, because that is the half that makes the file reachable.
+    Two containers, one volume, two mounts of different shapes -- and the file path only
     works out if both are as written.
     """
     volume = "workspace"
@@ -259,9 +299,10 @@ def test_the_shim_reaches_the_attachment_directory_and_nothing_else_beside_it() 
         "so the file route writes into its own container filesystem and the agent "
         "never sees the document"
     )
-    assert shim[0].get("subPath") == WORKSPACE_FILES.name, (
-        "without subPath this container mounts the whole workspace read-write, so a "
-        "caller holding the shim token could overwrite anything the agent wrote"
+    assert str(shim[0].get("subPath", "")).endswith(f"/{WORKSPACE_FILES.name}"), (
+        "this container's attachment mount does not end at the attachment directory, "
+        "so it reaches further up its Session's tree read-write and a caller holding "
+        "the shim token could overwrite anything the agent wrote"
     )
     assert shim[0].get("readOnly") is not True, (
         "the attachment mount is read-only, so every attached file fails to be placed "
@@ -275,28 +316,45 @@ def test_the_shim_reaches_the_attachment_directory_and_nothing_else_beside_it() 
     ]
     assert runtime, "the runtime container no longer mounts the workspace"
     assert runtime[0]["mountPath"] == WORKSPACE_ROOT
-    assert "subPath" not in runtime[0], (
-        "the runtime mounts a subtree of the workspace, so a file placed under "
-        f"{WORKSPACE_FILES} is not at that path for the agent"
+    # Both containers carry a subPath now, because the volume is one claim shared by
+    # every Session (ADR-035) and the subtree is what separates two tenants. So the
+    # question this asks is no longer "does the runtime mount a subtree" -- it must --
+    # but whether the two subtrees line up: the agent sees the Session's root, the shim
+    # writes one directory inside it, and the file the shim places is therefore at
+    # WORKSPACE_FILES for the agent. Compared against the shim's own mount rather than
+    # against a literal, so the two cannot be edited apart.
+    assert f"{runtime[0]['subPath']}/{WORKSPACE_FILES.name}" == shim[0]["subPath"], (
+        "the runtime and the shim are not mounting one Session's tree one directory "
+        f"apart, so a file the shim places is not at {WORKSPACE_FILES} for the agent"
     )
 
 
 def test_the_shim_can_read_what_the_agent_produced_and_still_cannot_write_it() -> None:
     """The second workspace mount, and the whole of why it does not undo the first.
 
-    Shipping a produced file out needs this container to SEE the workspace root, which
-    the `subPath: files` mount above does not reach. Without a second mount the listing
-    route reads a directory that does not exist, answers `{"files": []}` with **no
-    exception**, and every completed Turn ships nothing while nothing anywhere says
+    Shipping a produced file out needs this container to SEE this Session's workspace
+    root, which the attachment mount above does not reach. Without a second mount the
+    listing route reads a directory that does not exist, answers `{"files": []}` with
+    **no exception**, and every completed Turn ships nothing while nothing anywhere says
     so -- which is the failure this asserts against, and the same shape as the
     codex-home mount's above.
+
+    "The workspace root" now means this SESSION's root and not the volume's. The volume
+    is one claim shared by every Session on the cluster (ADR-035), so a mount here with
+    no subPath at all would map every tenant's workspace into the one container in this
+    pod reachable from outside it -- and `readOnly` would not save it, because this
+    route's whole job is to read bytes out and hand them to whoever holds the token.
+    That is why the widening is asserted as a RELATIONSHIP between the two mounts below
+    rather than as the absence of a subPath: exactly one directory of narrowing
+    separates them, which is what "reads the Session root, writes only the attachment
+    directory" means once both live under a per-Session subtree.
 
     What makes the widening safe is that it is read-only and at its own path, and both
     halves are asserted. `readOnly: true` is the security control: the reason the write
     mount is narrowed is that a caller holding the shim token must not be able to write
-    over anything the agent produced, and a second read-write mount of the whole volume
-    would hand that back while leaving the narrowed mount in place and passing the test
-    above it.
+    over anything the agent produced, and a second read-write mount of the Session's
+    whole tree would hand that back while leaving the narrowed mount in place and
+    passing the test above it.
 
     The distinct `mountPath` is the correctness control. Mounted at the workspace root
     this would be the *parent* of the read-write mount, so which of the two governed the
@@ -321,13 +379,21 @@ def test_the_shim_can_read_what_the_agent_produced_and_still_cannot_write_it() -
         "one outward-facing process write access to everything the agent produced -- "
         "the exact thing the subPath on the other mount exists to prevent"
     )
-    assert "subPath" not in read_root[0], (
-        "the mount that reads the agent's output is narrowed to a subtree, so a file "
-        "written at the workspace root is not in it and is never shipped"
-    )
-
     writable = [m for m in mounts if m["mountPath"] == str(WORKSPACE_FILES)]
     assert writable, "the attachment mount is gone, so no attached file can be placed"
+
+    assert read_root[0].get("subPath"), (
+        "the mount that reads the agent's output carries no subPath, so it maps the "
+        "whole shared volume -- every tenant's workspace -- into the one container in "
+        "this pod that is reachable from off it"
+    )
+    assert (
+        f"{read_root[0]['subPath']}/{WORKSPACE_FILES.name}" == writable[0]["subPath"]
+    ), (
+        "the read mount and the write mount are not one directory apart, so either the "
+        "read is narrowed below this Session's root -- and a file written at that root "
+        "is never shipped -- or the write reaches above the attachment directory"
+    )
     assert (
         Path(str(read_root[0]["mountPath"]))
         not in Path(str(writable[0]["mountPath"])).parents

@@ -41,8 +41,10 @@ _INSERT_SERVER = sa.text(
 
 _INSERT_TOOL = sa.text(
     "INSERT INTO registered_tool"
-    " (tenant_id, name, server_id, remote_name, parameters, scope_bindings)"
-    " VALUES (:tenant, :name, :server_id, :remote_name, :parameters, :bindings)"
+    " (tenant_id, name, advertised_name, server_id, remote_name, parameters,"
+    " scope_bindings)"
+    " VALUES (:tenant, :name, :advertised, :server_id, :remote_name, :parameters,"
+    " :bindings)"
 ).bindparams(
     sa.bindparam("tenant", type_=sa.Uuid()),
     sa.bindparam("server_id", type_=sa.Uuid()),
@@ -74,13 +76,22 @@ async def _tool(
     server_id: uuid.UUID,
     name: str = "ask_question",
     bindings: object = None,
+    server_name: str = "deepwiki",
 ) -> None:
+    """Insert one tool row directly, joining its advertised name the way the app does.
+
+    `server_name` is passed rather than read back from `server_id`, because this file
+    grades constraints and a helper that queried for it would make every case depend on
+    a read the constraint under test does not involve. The cases that need the two to
+    disagree pass it explicitly.
+    """
     async with engine.begin() as conn:
         await conn.execute(
             _INSERT_TOOL,
             {
                 "tenant": tenant_id,
                 "name": name,
+                "advertised": f"{server_name}__{name}",
                 "server_id": server_id,
                 "remote_name": name,
                 "parameters": {"repoName": "string"},
@@ -129,22 +140,60 @@ async def test_two_tenants_may_each_register_the_same_server_name(
     assert registered == 2
 
 
-async def test_a_second_tool_taking_a_name_the_tenant_already_uses_is_refused(
+async def test_a_second_server_may_offer_a_tool_name_the_first_already_uses(
     engine: AsyncEngine,
 ) -> None:
-    """Refused rather than silently disambiguated, and refused across servers.
+    """The key is `(tenant, server, name)`, so the same bare name behind two servers is
+    two rows.
 
-    The key is `(tenant, name)` and not `(server, name)`, because a Grant names a tool
-    and never says which server it came from -- so a second server offering the same
-    name to one tenant is exactly the collision a Grant cannot resolve.
+    `search`, `list_issues` and `get_file` are named the same by everyone, and until
+    `0032` a tenant could hold exactly one of each across its whole catalogue. A tool is
+    identified by its (server, tool) pair now -- the same shape the upstream Managed
+    Agents API uses, where an `mcp_tool_use` block carries `name` and `server_name` as
+    separate fields.
     """
     tenant_id = uuid.uuid4()
     first_server = await _server(engine, tenant_id, "deepwiki")
     second_server = await _server(engine, tenant_id, "acme-wiki")
-    await _tool(engine, tenant_id, first_server)
+
+    await _tool(engine, tenant_id, first_server, server_name="deepwiki")
+    await _tool(engine, tenant_id, second_server, server_name="acme-wiki")
+
+    async with engine.connect() as conn:
+        held = await conn.scalar(
+            sa.text(
+                "SELECT count(*) FROM registered_tool"
+                " WHERE tenant_id = :tenant AND name = 'ask_question'"
+            ).bindparams(sa.bindparam("tenant", type_=sa.Uuid())),
+            {"tenant": tenant_id},
+        )
+    assert held == 2
+
+
+async def test_two_tools_advertising_one_name_to_a_tenant_are_refused(
+    engine: AsyncEngine,
+) -> None:
+    """What per-server scoping did not loosen, held by the index that replaced the key.
+
+    The Agent Runtime is handed one namespace for a tenant's whole catalogue, and it
+    appends a SHA1-derived suffix when two names it receives would sanitize to one -- so
+    a Grant written against the original stops resolving. Tenant-unique *advertised*
+    names are what leave that suffix nothing to disambiguate, which is why the
+    constraint moved to `advertised_name` rather than being dropped.
+
+    Forced here by writing the collision directly, which is the only way to reach the
+    index: the adapter checks for a taken advertised name before it inserts, so through
+    the app this arrives as a refusal rather than as an integrity error. Both matter --
+    the check is the legible refusal, the index is what holds under a concurrent second
+    registration.
+    """
+    tenant_id = uuid.uuid4()
+    first_server = await _server(engine, tenant_id, "deepwiki")
+    second_server = await _server(engine, tenant_id, "acme-wiki")
+    await _tool(engine, tenant_id, first_server, server_name="deepwiki")
 
     with pytest.raises(IntegrityError):
-        await _tool(engine, tenant_id, second_server)
+        await _tool(engine, tenant_id, second_server, server_name="deepwiki")
 
 
 async def test_two_tenants_may_each_register_a_tool_of_the_same_name(

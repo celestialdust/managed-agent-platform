@@ -18,6 +18,7 @@ Turn in, and a reader of the Event Log cannot tell a reordered stream from a wro
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -733,3 +734,187 @@ async def test_a_completion_naming_no_thread_is_read_as_this_turns_own() -> None
     assert log.written[-1].payload["text"] == "the answer"
     assert "said after the Turn was over" not in repr(log.written)
     assert notified.told == [(session_id, turn_id)]
+
+
+class Paced:
+    """A runtime that leaves a real gap between frames, so a timer can run in it.
+
+    `Scripted` yields everything it holds without ever awaiting, which finishes a Turn
+    before the event loop reaches any other task. The gap is precisely the subject of
+    the cases below -- what the shim says while the runtime is saying nothing -- so a
+    fake that cannot produce one certifies nothing about it.
+    """
+
+    def __init__(self, frames: Sequence[dict[str, Any]], gap_s: float) -> None:
+        self._frames = list(frames)
+        self._gap_s = gap_s
+        self.started: list[TurnStartRequest] = []
+
+    async def start_turn(self, request: TurnStartRequest) -> str:
+        self.started.append(request)
+        return _RUNTIME_TURN
+
+    async def notifications(self) -> AsyncIterator[dict[str, Any]]:
+        for frame in self._frames:
+            await asyncio.sleep(self._gap_s)
+            yield frame
+
+
+async def _run_paced(
+    frames: Sequence[dict[str, Any]], *, gap_s: float, interval_s: float
+) -> RecordingLog:
+    log = RecordingLog()
+    await run_turn(
+        new_session_id(),
+        TurnId(uuid4()),
+        _THREAD,
+        _PROMPT,
+        Paced(frames, gap_s),
+        log,
+        Notified(),
+        progress_interval_s=interval_s,
+    )
+    return log
+
+
+def _reports(log: RecordingLog) -> list[Appended]:
+    return [one for one in log.written if one.type == turn.TURN_PROGRESS]
+
+
+async def test_a_turn_whose_runtime_is_silent_still_says_what_it_is_doing() -> None:
+    """The shim reports while the runtime says nothing, which is the whole point.
+
+    A Turn that emits no frame for a stretch used to be indistinguishable from a dead
+    pod, because the only signal either produced was silence. This is the case that
+    makes them different: nothing but the ticker runs during the gap, so any report
+    here was produced by the shim on its own account rather than by a frame arriving.
+    """
+    log = await _run_paced([_started(), _completed()], gap_s=0.06, interval_s=0.01)
+
+    assert _reports(log), f"the shim said nothing while it waited: {log.types()}"
+
+
+async def test_each_report_carries_a_count_that_moves_with_the_work() -> None:
+    """A pulse alone would repeat the defect one level up, so the count is the payload.
+
+    `frames` counts the notifications this Turn has drawn from the runtime. It is
+    asserted to be non-decreasing across the reports and to have actually moved by the
+    end -- a counter that never moves is the wedged case, and one that moves is proof
+    the Turn is doing something rather than merely running.
+    """
+    log = await _run_paced(
+        [_started(), _delta("a"), _delta("b"), _completed()],
+        gap_s=0.04,
+        interval_s=0.01,
+    )
+
+    counts = [int(str(one.payload["frames"])) for one in _reports(log)]
+    assert counts == sorted(counts), f"the count went backwards: {counts}"
+    assert counts[0] < counts[-1], f"the count never moved: {counts}"
+
+
+async def test_the_reports_stop_when_the_turn_does() -> None:
+    """The ticker is the Turn's, and it does not outlive it.
+
+    A timer left running after `run_turn` returns would append to a closed Turn for as
+    long as the process lived, which is both a lie about a Turn that has ended and an
+    unbounded write to the log. Asserted by waiting several intervals after the call
+    returns and requiring the count not to have grown.
+    """
+    log = await _run_paced([_started(), _completed()], gap_s=0.06, interval_s=0.01)
+    settled = len(log.written)
+
+    await asyncio.sleep(0.05)
+
+    assert len(log.written) == settled, f"a report landed after the Turn: {log.types()}"
+    assert log.written[-1].type == turn.TURN_COMPLETED
+
+
+class ProgressFailsOnce(RecordingLog):
+    """A log that refuses exactly one progress append, then behaves normally.
+
+    Models the ordinary transient: the control plane this shim posts to was briefly
+    unreachable, or answered one request with a 503. `SequenceRace` is deliberately not
+    the failure used -- `append_in_order` already retries that eight times, so a case
+    built on it would pass without proving anything about the ticker. This raises
+    something the retry loop does not catch, which is what a real transport failure
+    looks like from here.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused = 0
+
+    async def append(
+        self, session_id: SessionId, type_: str, payload: dict[str, object]
+    ) -> Seq:
+        if type_ == turn.TURN_PROGRESS and self.refused == 0:
+            self.refused += 1
+            raise RuntimeError("the control plane was briefly unreachable")
+        return await super().append(session_id, type_, payload)
+
+
+async def _run_paced_with(
+    log: RecordingLog,
+    frames: Sequence[dict[str, Any]],
+    *,
+    gap_s: float,
+    interval_s: float,
+) -> RecordingLog:
+    await run_turn(
+        new_session_id(),
+        TurnId(uuid4()),
+        _THREAD,
+        _PROMPT,
+        Paced(frames, gap_s),
+        log,
+        Notified(),
+        progress_interval_s=interval_s,
+    )
+    return log
+
+
+async def test_one_refused_report_does_not_end_the_reporting_for_the_whole_turn() -> (
+    None
+):
+    """A failed progress append must not silence every later report of this Turn.
+
+    The ticker is a bare `create_task` that nothing supervises, so an exception inside
+    it ends the task rather than one iteration. Every later report of that Turn is then
+    never written, and the Turn goes on working perfectly -- which is the worst possible
+    combination, because the sweep's only signal for a live pod is the report this Turn
+    has stopped sending. Since the hour-long ceiling was removed nothing else closes it
+    either, so a single unlucky append can strand a Session permanently.
+
+    Asserted on reports landing *after* the refusal rather than on any count, so the
+    case fails for the actual defect and not for a slow event loop: the refusal is the
+    first report, and at least one more has to follow it.
+    """
+    log = ProgressFailsOnce()
+    await _run_paced_with(
+        log, [_started(), _delta("a"), _completed()], gap_s=0.05, interval_s=0.01
+    )
+
+    assert log.refused == 1, "the case never produced the failure it grades"
+    assert _reports(log), (
+        "no report survived one refused append, so the ticker died with it and this "
+        f"Turn is invisible to the sweep for the rest of its life: {log.types()}"
+    )
+
+
+async def test_a_turn_still_completes_after_a_report_was_refused() -> None:
+    """The Turn's own ending must not be replaced by the ticker's stored exception.
+
+    `run_turn`'s `finally` awaits the cancelled ticker, and `suppress` there catches
+    only `CancelledError`. A ticker that died earlier holds its exception until that
+    await, which then raises it out of the `finally` -- turning a Turn that finished
+    into one that failed, for a reason that has nothing to do with the agent's work.
+    """
+    log = ProgressFailsOnce()
+    await _run_paced_with(
+        log, [_started(), _delta("a"), _completed()], gap_s=0.05, interval_s=0.01
+    )
+
+    assert log.types()[-1] == turn.TURN_COMPLETED, (
+        f"the Turn did not end in completion after a refused report: {log.types()}"
+    )

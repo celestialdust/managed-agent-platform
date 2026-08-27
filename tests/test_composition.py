@@ -13,13 +13,14 @@ import os
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
 from mcp.types import CallToolResult, TextContent
 from sqlalchemy.pool import QueuePool
 
-from managed_agent.adapters.s3.evidence_store import EvidenceStorageUnconfigured
 from managed_agent.composition import (
     Platform,
     build,
+    internal_ca_from_environment,
     pod_runner_from_environment,
 )
 from managed_agent.control.files.store import UPLOAD_BUCKET_ENV_VAR
@@ -34,9 +35,11 @@ from managed_agent.control.session.turn_dispatch import (
 from managed_agent.control.skills.inventory import NoSkillInventory
 from managed_agent.core.ids import new_session_id, new_turn_id
 from managed_agent.core.ports import EventLogAppend, EventLogRange
+from managed_agent.core.tls.session_certificate import new_internal_ca
 from managed_agent.core.vfs.evidence import (
     THRESHOLD_ENV_VAR,
     CaptureThreshold,
+    EvidenceStorageUnconfigured,
     threshold_from_env,
 )
 from managed_agent.session_shim.pod_channel import HttpPodDispatch
@@ -283,20 +286,25 @@ async def test_a_platform_built_with_a_pod_runner_wires_no_nopodtransport(
     `map-session` and the runner above is a stand-in, so this grades the wiring and
     nothing beyond it.
 
-    Dispatched against a pod the cluster reports GONE rather than one it reports
-    ABSENT, and the difference is the point: an absent pod is now *placed* -- a Turn
-    that finds none compiles a configuration and creates one -- so ABSENT would send
-    this case through the compilation path and into the undialled database, which is a
-    different claim from the one it makes. GONE is still refused by the transport, and
-    the refusal is what says the real transport rather than `NoPodTransport` answered.
+    Dispatched against a pod the cluster reports STARTING, and the choice of phase is
+    load-bearing: this case needs one the transport refuses *without* placing, because a
+    phase that places sends it through the compilation path and into the undialled
+    database, which is a different claim from the one it makes.
+
+    That used to be GONE, and is not any more. Under ADR-041's per-Turn lease the
+    commonest way to find a pod GONE is that the previous Turn released it moments ago
+    and its grace period has not run out, so GONE became a cue to place rather than to
+    refuse. STARTING is what is left: a pod on its way up belongs to a Turn that is
+    already placing it, and a second placement over it would be two pods for one
+    Session -- which is a refusal with no reason to change.
     """
     monkeypatch.setenv("MAP_SHIM_TOKEN_KEY", "a signing key")
     _the_placers_four_other_variables(monkeypatch)
-    platform, engine = build(_UNDIALLED, pod_runner=AbsentPod(PodPhase.GONE))
+    platform, engine = build(_UNDIALLED, pod_runner=AbsentPod(PodPhase.STARTING))
     try:
         assert isinstance(platform.turn_dispatch, HttpPodDispatch)
         assert not isinstance(platform.turn_dispatch, NoPodTransport)
-        with pytest.raises(TurnUndeliverable, match="is gone"):
+        with pytest.raises(TurnUndeliverable, match="is starting"):
             await platform.turn_dispatch.dispatch(
                 new_session_id(), new_turn_id(), "summarise the findings"
             )
@@ -475,3 +483,122 @@ def test_only_the_composition_root_constructs_the_evidence_blobs() -> None:
         and "S3EvidenceBlobs(" in module.read_text()
     ]
     assert offenders == [], f"a second place constructs the evidence blobs: {offenders}"
+
+
+def _ca_environment() -> tuple[str, str]:
+    """A CA as the two PEM strings a deployment would supply from its Secret."""
+    key, certificate = new_internal_ca()
+    return (
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ).decode(),
+        certificate.public_bytes(serialization.Encoding.PEM).decode(),
+    )
+
+
+def test_a_deployment_with_no_ca_material_places_pods_exactly_as_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent is the state every deployment is in until an operator creates the Secret.
+
+    It has to stay indistinguishable from the platform before the CA existed, because
+    the material arrives by a hand somebody has not yet moved -- not by a bug.
+    """
+    monkeypatch.delenv("MAP_INTERNAL_CA_CERT", raising=False)
+    monkeypatch.delenv("MAP_INTERNAL_CA_KEY", raising=False)
+
+    assert internal_ca_from_environment() is None
+
+
+def test_half_an_internal_ca_stops_the_process_rather_than_placing_undialable_pods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Either half alone is silent, which is why it is refused where it is read.
+
+    A certificate with no key signs nothing; a key with no certificate signs chains no
+    pod can verify. Both look like a working deployment right up until a Turn is
+    dispatched, so the refusal is at startup where a deploy can still fail visibly.
+    """
+    key_pem, certificate_pem = _ca_environment()
+
+    monkeypatch.setenv("MAP_INTERNAL_CA_CERT", certificate_pem)
+    monkeypatch.delenv("MAP_INTERNAL_CA_KEY", raising=False)
+    with pytest.raises(RuntimeError, match="MAP_INTERNAL_CA_KEY is not"):
+        internal_ca_from_environment()
+
+    monkeypatch.delenv("MAP_INTERNAL_CA_CERT")
+    monkeypatch.setenv("MAP_INTERNAL_CA_KEY", key_pem)
+    with pytest.raises(RuntimeError, match="MAP_INTERNAL_CA_CERT is not"):
+        internal_ca_from_environment()
+
+
+def test_both_halves_present_load_into_a_ca_that_signs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The PEM round-trips through the environment, which is how it really arrives.
+
+    Env vars carry the material as text with real newlines in it, and a loader that
+    only ever saw bytes from a file would pass while the deployed one failed.
+    """
+    key_pem, certificate_pem = _ca_environment()
+    monkeypatch.setenv("MAP_INTERNAL_CA_CERT", certificate_pem)
+    monkeypatch.setenv("MAP_INTERNAL_CA_KEY", key_pem)
+
+    ca = internal_ca_from_environment()
+
+    assert ca is not None
+    assert ca.certificate_pem.decode() == certificate_pem
+    assert ca.sign_for("a-pod.map-session.map-test.svc.cluster.local")
+
+
+def _pod_diallers() -> set[str]:
+    """Every class in `pod_channel` whose constructor can be given a dial context.
+
+    Discovered rather than listed, so a fifth dialler added later is covered the day it
+    is written instead of the day somebody remembers to add it here.
+    """
+    module = ast.parse(
+        (_SRC / "managed_agent" / "session_shim" / "pod_channel.py").read_text()
+    )
+    return {
+        node.name
+        for node in module.body
+        if isinstance(node, ast.ClassDef)
+        for item in node.body
+        if isinstance(item, ast.FunctionDef)
+        and item.name == "__init__"
+        and any(one.arg == "tls" for one in item.args.args + item.args.kwonlyargs)
+    }
+
+
+def test_every_pod_dialler_is_handed_the_one_dial_context() -> None:
+    """All four hops to a Session pod speak the scheme the pod was placed with.
+
+    One `pod_dial` is built in the composition root precisely so that they cannot
+    disagree -- and handing it to three of the four is how they disagree anyway. The
+    Turn hop, the Rollout read and the output read were given it; file placement was
+    not, so a Session with an attached file dialled `http://` at a listener that had
+    just been given a certificate. The listener drops such a connection without a TLS
+    alert, so the control plane sees `httpx.ReadError`, maps it to `pod_unreachable`,
+    and names neither TLS nor the file.
+
+    Structural because the behavioural version needs a cluster, a CA and a file: this
+    reads what is written at the wiring point, which is where the mistake is made.
+    """
+    root = ast.parse((_SRC / "managed_agent" / "composition.py").read_text())
+    diallers = _pod_diallers()
+    undialled = [
+        node.func.id
+        for node in ast.walk(root)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in diallers
+        and not any(keyword.arg == "tls" for keyword in node.keywords)
+    ]
+    assert undialled == [], (
+        f"{undialled} dial a Session pod without the composition root's dial context, "
+        "so they build a scheme the pod may not be serving"
+    )
+    assert diallers, "no pod dialler takes a dial context any more; delete this guard"

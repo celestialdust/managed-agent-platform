@@ -20,7 +20,6 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from managed_agent.adapters.s3.session_vfs import UnconfiguredSessionVfs
 from managed_agent.core.ids import SessionId, TenantId
 from managed_agent.core.session.session_token import (
     SESSION_TOKEN_HEADER_NAME,
@@ -66,9 +65,7 @@ class _StoredRollouts:
 
 
 def _app(store: _StoredRollouts) -> FastAPI:
-    return create_gateway_app(
-        cast(GatewaySessions, _no_upstreams()), KEY, UnconfiguredSessionVfs(), store
-    )
+    return create_gateway_app(cast(GatewaySessions, _no_upstreams()), KEY, store)
 
 
 class _NoUpstreams:

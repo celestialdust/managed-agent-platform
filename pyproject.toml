@@ -59,6 +59,20 @@ dependencies = [
   # parser is absent, so its absence is a start-up failure rather than a test failure.
   # Declared here with everything else because this file has one writer (invariant I14).
   "python-multipart>=0.0.18",
+  # X.509 and key handling for the platform's internal CA (ADR-044). The control plane
+  # signs a per-pod server certificate at placement and mounts it beside the bearer
+  # token it already mounts, which turns the in-cluster hops into mTLS.
+  #
+  # It arrives transitively today -- `openai-codex` and the `kubernetes-asyncio` auth
+  # path both pull it -- and a module that imports a package should declare it rather
+  # than rest on another package's graph. That matters more here than usual: this is
+  # the dependency whose absence would not fail at import in some future tree, it
+  # would fail while placing a pod.
+  #
+  # Not `pyOpenSSL`, which is a wrapper over this same library and adds a distribution
+  # to say the same thing. Not the stdlib `ssl` module, which can *use* a certificate
+  # but cannot mint one.
+  "cryptography>=45",
 ]
 
 [project.optional-dependencies]

@@ -34,7 +34,7 @@ from managed_agent.core.registration.scope_binding import (
     RegisteredTool,
     ServerRegistration,
 )
-from managed_agent.core.session.session import SessionRecord, SessionState
+from managed_agent.core.session.session import SessionRecord
 
 _CONTROL = Path(__file__).parents[2] / "src" / "managed_agent" / "control"
 
@@ -234,7 +234,7 @@ class UnusedWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         raise AssertionError("a test in this file registered a webhook")
@@ -246,9 +246,9 @@ class UnusedWebhooks:
         raise AssertionError("a test in this file deleted a webhook")
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        raise AssertionError("a test in this file asked what watches a state")
+        raise AssertionError("a test in this file asked what watches an event type")
 
 
 class UnusedEnvironmentStore:

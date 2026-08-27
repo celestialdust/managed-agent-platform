@@ -38,11 +38,19 @@ destroy a live Session to tidy up after a caller."
      during that wait.
 
 Idempotent by construction rather than by a lock, which is what lets two control-plane
-replicas run this at once. Every verdict is a function of state both replicas can read;
-handing a pod back treats an absent one as success, so a double delete is not an error;
-and the one branch that writes appends a suspension only for a Session the fold says is
-still `RUNNING`, so a second replica's fold sees `SUSPENDED` and takes the
-handback-only branch instead of appending again.
+replicas run this at once. Every verdict is a function of state both replicas can read,
+and handing a pod back treats an absent one as success, so a double delete is not an
+error.
+
+**This sweep writes nothing to any Session's log, and that is what makes the idempotence
+above the whole story.** It used to append `session.suspended` where it reclaimed, and
+that append needed an argument of its own about how far the log could grow -- two
+replicas could each write one, and a pod placed again later was a second reclamation
+that honestly deserved a second event. Under a per-Turn lease there is nothing to
+announce: every pod this sweep finds is one a control plane died holding, and reporting
+that into a tenant's Session history would be the platform describing its own crash
+(ADR-041). What is left is a deletion, and a deletion nobody records is the same
+deletion however many times it runs.
 """
 
 from __future__ import annotations
@@ -53,17 +61,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Final, Protocol, assert_never
 
-from managed_agent.control.session.lifecycle import (
-    SessionPodRelease,
-    open_turn,
-    suspend_session,
-    whole_log,
-)
+from managed_agent.control.session.lifecycle import SessionPodRelease, whole_log
 from managed_agent.control.session.placement import PlacedPods, PodPhase
 from managed_agent.core.ids import SessionId
 from managed_agent.core.ports import Clock, EventLogAppend, EventLogRange
 from managed_agent.core.session.projection import project
 from managed_agent.core.session.session import SessionState
+from managed_agent.core.session.turns import open_turn
 from managed_agent.core.vocabulary import lifecycle, turn
 
 _LOG = logging.getLogger(__name__)
@@ -75,15 +79,19 @@ One number, fixed here rather than read from the environment, because a deployme
 could choose it would be a deployment where nobody had to decide -- and this decision
 has a cost either way that somebody has to have accepted.
 
-**What it trades.** Handing a pod back ends that Session's working life, today: a
-reclaimed Session is `SUSPENDED`, which accepts no Turn, so it answers 409 to every
-later one instead of continuing. What no longer stands in the way is the pod -- the
-placement path re-places a Session that has already run, seeding its stored Rollout so
-the thread continues rather than restarting (ADR-031). The remaining blocker is the
-lifecycle transition back out of `SUSPENDED`, which nothing here performs. The number
-therefore buys the platform's ability to serve a forty-sixth Session with the abandoned
-Session's ability to be continued. Both halves of that are real, and the second is what
-makes the number large rather than small.
+**What it trades.** A pure cost dial, and nothing more. Handing a pod back leaves the
+Session `IDLE`, which is takeable: the next Turn asks for a pod, the placement path
+compiles one for a Session that has already run, and the stored Rollout is seeded so the
+thread continues rather than restarting (ADR-031). So what this number buys is an
+address freed for another Session, and what it pays is the cold start the next Turn on
+this one waits through. Lower frees addresses sooner and pays more cold starts; higher
+does the reverse.
+
+That is the whole trade now, and it was not before. This same knob used to decide
+whether a Session could ever work again, because a reclaimed Session was parked in a
+state with no exit -- which is why it could not honestly be tuned: one side of the
+scale was a cache eviction and the other was a Session's life. Both sides are now
+measured in seconds of latency (ADR-032).
 
 **Why fifteen minutes and not one, and not sixty.** The floor is the platform's own
 slowest operation: a first Turn's HTTP response was measured held for the whole
@@ -97,16 +105,16 @@ roughly forty-five slots, fifteen minutes of grace costs at most that many slots
 quarter hour, where sixty minutes would cost them for an hour and put the wedge back
 under any real burst.
 
-**When this number should change.** It is large because reclamation is currently
-destructive. The day a pod can be started from a restored Rollout, what this trades
-stops being a Session's life and becomes the latency of its next Turn -- and then it
-should come down, because a placement wait is a cost a tenant can be told about and a
-lost Session is not.
+**When this number should change.** That day has arrived, and this number has
+deliberately not moved with it -- lowering it here would have mixed a cost decision into
+a correctness one. It is now tunable against measurements rather than against a
+Session's survival: how long a cold start actually takes, and how often the platform
+runs out of addresses. Both are observable, and neither was worth measuring while the
+number also decided whether a Session lived.
 """
 
 _ACTIVITY: Final = (
     lifecycle.SESSION_CREATED,
-    lifecycle.SESSION_RESUMED,
     turn.TURN_SUBMITTED,
     turn.TURN_STARTED,
     turn.TURN_COMPLETED,
@@ -120,9 +128,15 @@ was submitted and not closed, which guard 3 catches by folding that Session's ow
 rather than by finding a recent row. Including them would make this scan return every
 token of every Turn in the window to answer a question about which Sessions exist.
 
-`session.suspended` and `session.stopped` are absent for the opposite reason. They are
-not use, they are the end of it -- and counting one as activity would hold an archived
-Session's pod for a whole extra window, which is the leak this file exists to close.
+`session.stopped` is absent for the opposite reason. It is not use, it is the end of it
+-- and counting it as activity would hold an archived Session's pod for a whole extra
+window, which is the leak this file exists to close.
+
+`session.resumed` was here and is gone with its producer. A Session no longer resumes:
+a pod is created for one Turn and destroyed with it (ADR-041), so the type is one only
+stored history holds and a scan of a recent window can only ever miss it. Leaving it
+would have cost nothing and said something false -- that a row of it could still land
+inside the window this reads.
 """
 
 
@@ -205,17 +219,23 @@ def verdict_for(state: SessionState) -> ReapVerdict | None:
     the thing they are using and idleness is expected -- the tenant can still archive
     it, which is a deliberate call, but a sweep must not decide for them.
 
-    `RUNNING` returns None rather than a verdict because the state alone does not settle
-    it. It is the *idle* end of the API this platform mirrors -- a Session at rest,
-    ready for work -- and whether its pod is still wanted is a question about Turns and
-    a clock, which the caller asks next.
+    `IDLE` and `RUNNING` both return None rather than a verdict, because neither settles
+    it and for opposite reasons. A `RUNNING` Session has a Turn executing, which the
+    open-turn guard below reads directly from the log rather than trusting a state to
+    stand in for it. An `IDLE` one is alive and merely at rest, and whether *this* rest
+    has lasted long enough to be worth a pod is a question about a clock -- which is the
+    caller's next one. Only a stop is a fact about the Session that a sweep may act on
+    alone: it is the single state a Session cannot move out of.
+
+    This function no longer decides that a Session has ended merely because its pod was
+    taken back, which is what made a fifteen-minute cost dial permanent (ADR-032).
     """
     match state:
-        case SessionState.SUSPENDED | SessionState.STOPPED:
+        case SessionState.STOPPED:
             return ReapVerdict.THE_SESSION_HAS_ENDED
         case SessionState.TAKEN_OVER:
             return ReapVerdict.A_HUMAN_HAS_TAKEN_OVER
-        case SessionState.RUNNING:
+        case SessionState.IDLE | SessionState.RUNNING:
             return None
         case _ as unreachable:
             assert_never(unreachable)
@@ -361,7 +381,28 @@ class SessionPodReaper:
             return ReapVerdict.A_TURN_IS_STILL_OPEN
         if session_id in used_recently:
             return ReapVerdict.THE_SESSION_WAS_USED_RECENTLY
-        await suspend_session(session_id, self._log, self._events, self._release)
+        # Read once more, immediately in front of the deletion, and keep the pod if a
+        # Turn opened across the decision above. Every guard so far ran against a fold
+        # taken before the recency check, and a submission landing after that fold is
+        # invisible to it -- so without this read, a sweep that decided a Session was at
+        # rest could delete the pod of a Turn a tenant is waiting on.
+        #
+        # **A narrowing and not a guarantee, which is a change from how this used to
+        # hold.** The reclamation appended an event, and the append gave a total order:
+        # a submission below its sequence was seen by the settled re-read of `1..seq`,
+        # so the store decided that half of the race outright. Nothing is appended now,
+        # so there is no sequence to compare against and this only shrinks the window to
+        # the gap between the read and the delete. That is what a silent reclamation
+        # costs, and it is named here rather than left for a reader to discover.
+        if open_turn(await whole_log(self._events, session_id)) is not None:
+            return ReapVerdict.A_TURN_IS_STILL_OPEN
+        # Handed back and not announced. The reclamation used to append
+        # `session.suspended`, which was worth saying while a pod outlived the Turn that
+        # made it; a pod leased for one Turn makes every pod this branch reaches the
+        # residue of a control plane that died holding one, and an event for that would
+        # be the platform reporting its own crash into a tenant's history once per
+        # replica that noticed (ADR-041).
+        await self._release.release(session_id)
         return ReapVerdict.THE_SESSION_WENT_IDLE
 
     async def _used_since(self, from_ms: int, to_ms: int) -> frozenset[SessionId]:

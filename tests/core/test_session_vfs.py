@@ -1,4 +1,4 @@
-"""The lane namespace: what a key composes to, and which lane a rewrite can name.
+"""The lane namespace: what a key composes to, and that nothing can rewrite one.
 
 Two properties are graded here and they are graded differently, because they hold for
 different reasons.
@@ -11,13 +11,13 @@ fall behind the module, leaving a lane added later graded by nothing. That has a
 happened once in this repo, to a set of refusal reasons in `pod_runner.py`, four of
 whose five members were reachable by no assertion at all.
 
-The **lane lifecycle** is a property of the signatures, so it is asserted against the
-signatures. `replace` naming `MutableFile` is what makes overwriting a sealed lane
-inexpressible, and `mypy --strict` over the whole tree is what enforces it at every call
-site; the cases below grade the claim those two rest on -- that the annotation really is
-the narrow type, and that a `MutableFile`'s lane field really is the one lane kind that
-permits a rewrite. An assertion that merely called `replace` with a sealed file would be
-testing Python's willingness to ignore annotations, which is not the guarantee.
+The **seal** is a property of the surface rather than of any call, so it is asserted
+against the surface. There is no method here that overwrites -- `replace` and the
+mutable lane kind it took went with the workspace mount (ADR-035) -- and what makes that
+a guarantee rather than a coincidence is that no signature admits one. So the cases
+below assert on absence: that neither the store protocol nor the blob port grew a
+rewriting method back. An assertion that called something and checked it failed would be
+grading an implementation; the guarantee is that there is nothing to call.
 """
 
 from typing import get_type_hints
@@ -28,9 +28,8 @@ import pytest
 from managed_agent.core.ids import SessionId, TenantId
 from managed_agent.core.vfs.session_vfs import (
     Lane,
+    LaneBlobs,
     LaneNameInvalid,
-    MutableFile,
-    MutableLane,
     SealedFile,
     SealedLane,
     SessionFiles,
@@ -45,46 +44,37 @@ A_TENANT = TenantId(uuid4())
 A_SESSION = SessionId(uuid4())
 
 A_SEALED_LANE = SealedLane("kept")
-A_MUTABLE_LANE = MutableLane("scratchpad")
-LANES: tuple[Lane, ...] = (A_SEALED_LANE, A_MUTABLE_LANE)
-"""Example lanes, declared here because the platform declares none.
+A_SECOND_LANE = SealedLane("scratchpad")
+LANES: tuple[Lane, ...] = (A_SEALED_LANE, A_SECOND_LANE)
+"""Example lanes, declared here because the platform declares only one.
 
-Two, and only two, because two lane *kinds* is the whole of what this module decides.
-While four named lanes lived in the module, parametrizing over them graded a taxonomy;
-now that a caller declares the set, a third example would grade nothing a second sealed
-lane does not already grade. Deliberately not `evidence`/`artifacts`/`working`: a reader
-who saw those words here would take them for a platform default, which is exactly the
-thing that was removed.
+Two, because a key composed from a lane has to be graded against more than one lane --
+a composition that ignored its argument passes every case run against a single lane. A
+third would grade nothing the second does not, now that the kinds are one kind.
+
+Declared locally rather than parametrized over `session_vfs.LANES`, which holds exactly
+one member. Deliberately not `evidence`/`artifacts`/`working`: a reader who saw those
+words here would take them for a platform default, which is exactly the thing that was
+removed.
 """
 
 
 def a_file(lane: Lane, relative: str = "a-file.txt") -> VfsFile:
-    """One file in whichever lane, under the right path type for that lane's kind.
-
-    The narrowing is what a caller does once and the type system carries afterwards. It
-    is here so the parametrized cases below can hold any lane in one variable while the
-    write cases still get a path type whose lane field is the narrow one.
-    """
-    if isinstance(lane, MutableLane):
-        return MutableFile(A_TENANT, A_SESSION, lane, relative)
+    """One file in whichever lane, for the parametrized cases below."""
     return SealedFile(A_TENANT, A_SESSION, lane, relative)
 
 
-def test_there_are_lanes_of_both_kinds_to_grade() -> None:
+def test_there_are_distinct_lanes_to_grade() -> None:
     """Guard the guard: every case below is parametrized over `LANES`, so an empty
     collection would pass all of them by running none.
 
-    Both kinds and not a count. A count was the right guard while the module declared
-    the set; now that a caller does, a count would only assert that this file's own
-    fixture list is the length this file wrote it -- which is nothing. What the cases
-    below need is that each kind is represented, because the two kinds are what the
-    module actually distinguishes.
+    Distinct, and not merely two. What the cases below need is that a key composed for
+    one lane can be told from a key composed for another -- two entries spelled the same
+    would satisfy a count and grade nothing.
     """
-    assert any(isinstance(lane, SealedLane) for lane in LANES), (
-        f"{LANES} has no sealed lane"
-    )
-    assert any(isinstance(lane, MutableLane) for lane in LANES), (
-        f"{LANES} has no mutable lane"
+    assert len(LANES) >= 2, f"{LANES} cannot grade a per-lane composition"
+    assert len({lane.directory for lane in LANES}) == len(LANES), (
+        f"{LANES} holds the same lane twice"
     )
 
 
@@ -120,11 +110,7 @@ def test_no_lane_lets_one_tenants_path_reach_another_tenants_key(lane: Lane) -> 
     """
     other = TenantId(uuid4())
     mine = a_file(lane).key
-    theirs = (
-        MutableFile(other, A_SESSION, lane, "a-file.txt").key
-        if isinstance(lane, MutableLane)
-        else SealedFile(other, A_SESSION, lane, "a-file.txt").key
-    )
+    theirs = SealedFile(other, A_SESSION, lane, "a-file.txt").key
     assert mine != theirs
     assert str(other) not in mine
     assert str(A_TENANT) not in theirs
@@ -159,11 +145,12 @@ def test_no_lane_composes_a_key_from_a_path_that_leaves_it(
 
 @pytest.mark.parametrize("relative", _ESCAPES)
 def test_the_parser_refuses_the_same_paths_the_path_types_do(relative: str) -> None:
-    """The one function both path types call, graded directly.
+    """The one function every path type calls, graded directly.
 
-    Both `SealedFile` and `MutableFile` parse in `__post_init__`, so a refusal weakened
-    here weakens both at once -- which is the point of there being one parser, and the
-    reason it is worth an assertion of its own rather than only through the types.
+    `SealedFile` parses in `__post_init__` and calls nothing else, so a refusal weakened
+    here is weakened everywhere at once -- which is the point of there being one
+    parser, and the reason it is worth an assertion of its own rather than only through
+    the type.
     """
     with pytest.raises(VfsPathInvalid) as refused:
         parse_relative_path(relative)
@@ -194,17 +181,6 @@ def test_a_path_at_the_length_limit_composes_and_one_past_it_does_not() -> None:
         parse_relative_path("a" * (MAX_RELATIVE_LEN + 1))
 
 
-@pytest.mark.parametrize("lane", LANES, ids=lambda lane: lane.directory)
-def test_every_lane_is_one_kind_or_the_other_and_never_both(lane: Lane) -> None:
-    """The kinds are the lifecycle, so each lane belongs to exactly one.
-
-    A lane that satisfied neither type would be one no write method accepts; a lane that
-    somehow satisfied both would be one `replace` accepts, which is the whole thing the
-    split prevents.
-    """
-    assert isinstance(lane, SealedLane) != isinstance(lane, MutableLane)
-
-
 _NOT_ONE_DIRECTORY = (
     "..",
     "../other-tenant",
@@ -227,11 +203,10 @@ name that is one object on S3 and one file on a case-insensitive mount.
 
 
 @pytest.mark.parametrize("directory", _NOT_ONE_DIRECTORY)
-@pytest.mark.parametrize("kind", (SealedLane, MutableLane))
-def test_neither_lane_kind_can_be_declared_under_a_name_that_is_not_one_directory(
-    kind: type[SealedLane] | type[MutableLane], directory: str
+def test_a_lane_cannot_be_declared_under_a_name_that_is_not_one_directory(
+    directory: str,
 ) -> None:
-    """Both kinds, because the validation is on each and a caller reaches for either.
+    """Asserted on the constructor, because that is where a caller declares one.
 
     This case exists because of what the platform stopped deciding. While the lane set
     was four constants in the module, an unvalidated name was safe by accident -- nobody
@@ -240,7 +215,7 @@ def test_neither_lane_kind_can_be_declared_under_a_name_that_is_not_one_director
     inside another's.
     """
     with pytest.raises(LaneNameInvalid):
-        kind(directory)
+        SealedLane(directory)
 
 
 @pytest.mark.parametrize("directory", _NOT_ONE_DIRECTORY)
@@ -264,26 +239,58 @@ def test_a_declared_lane_keeps_the_name_it_was_declared_under(lane: Lane) -> Non
     assert parse_lane_name(lane.directory) == lane.directory
 
 
-def test_replace_accepts_only_a_file_in_the_rewritable_lane() -> None:
-    """The signature is where overwriting a sealed lane becomes inexpressible.
+_A_REWRITE_BY_ANY_NAME = ("replace", "put", "overwrite", "update")
+"""Names a rewriting method would plausibly arrive under.
 
-    `mypy --strict` runs over this whole tree, so a call site passing a `SealedFile`
-    here fails the type gate. What this asserts is the claim that gate rests on: that
-    the annotation is the narrow type and not the union.
+A closed list and not a heuristic. What this guards is the *reintroduction* of an
+overwrite, and reintroduction comes with a name somebody chose -- `replace` and `put`
+are the two that were actually here, and the other two are what the same method gets
+called when it comes back under a different word. A case asserting only that `replace`
+is absent is one a rename walks straight past.
+
+Deliberately excluding `write` and `save`, which read as "create" at least as often as
+"overwrite". A name this list claims is always a rewrite has to be one, or the first
+honest rename of `place` fails a case about something else entirely.
+"""
+
+
+@pytest.mark.parametrize("name", _A_REWRITE_BY_ANY_NAME)
+def test_the_store_offers_no_way_to_overwrite_a_stored_object(name: str) -> None:
+    """The seal is the absence of a method, so absence is what is asserted.
+
+    `SessionFiles.replace` and `LaneBlobs.put` both existed while a mutable lane did.
+    Both are gone, and what makes that a guarantee rather than a gap is that nothing
+    above the adapter can express an overwrite at all: an artifact's recorded digest is
+    a claim about bytes, and it is worth exactly as much as the narrowest write surface
+    underneath it.
+
+    Asserted on both protocols, because a rewrite reintroduced at either level is a
+    rewrite. The port is where a caller would reach for one; the blob surface is where
+    one could be added without any caller changing.
     """
-    assert get_type_hints(SessionFiles.replace)["file"] is MutableFile
+    assert not hasattr(SessionFiles, name), (
+        f"SessionFiles.{name} can overwrite a stored object; the lane seal is gone"
+    )
+    assert not hasattr(LaneBlobs, name), (
+        f"LaneBlobs.{name} can overwrite a stored object; the lane seal is gone"
+    )
 
 
-def test_place_accepts_a_file_in_any_lane() -> None:
-    """Creating is legal everywhere; only rewriting is narrowed."""
+def test_the_one_write_takes_a_file_in_any_lane() -> None:
+    """`place` is the whole write surface, and it is not narrowed to a lane.
+
+    Creating is legal in every lane -- what is refused is a second write to a key that
+    already holds bytes, and the store refuses that conditionally rather than this
+    signature refusing it by type.
+    """
     assert get_type_hints(SessionFiles.place)["file"] == VfsFile
 
 
-def test_a_rewritable_file_cannot_be_typed_over_a_sealed_lane() -> None:
+def test_a_stored_file_is_typed_over_a_sealed_lane_and_nothing_else() -> None:
     """The other half of the same guarantee.
 
-    Narrowing `replace` would buy nothing if a `MutableFile` could be built over
-    `EVIDENCE`; its lane field is annotated with the mutable kind, so it cannot.
+    Removing every overwrite buys nothing if a file type could later be built over a
+    lane kind that permits one. There is one kind, and this is the assertion that fails
+    if a second is introduced and this type widened to admit it.
     """
-    assert get_type_hints(MutableFile)["lane"] is MutableLane
     assert get_type_hints(SealedFile)["lane"] is SealedLane

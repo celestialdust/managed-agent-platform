@@ -41,7 +41,6 @@ from starlette.routing import Route
 
 from managed_agent import composition
 from managed_agent.core import vocabulary
-from managed_agent.core.vfs.session_vfs import SessionFiles
 from managed_agent.core.vocabulary import tool_in_flight
 from managed_agent.gateway.tool.rollout_seed import SessionRollouts
 from managed_agent.gateway.tool.server import (
@@ -167,11 +166,10 @@ def test_the_names_the_factory_hands_the_gateway_are_the_published_ones() -> Non
     def capture(
         sessions: GatewaySessions,
         token_key: bytes,
-        files: SessionFiles,
         rollouts: SessionRollouts,
     ) -> FastAPI:
         passed.append(sessions)
-        return real(sessions, token_key, files, rollouts)
+        return real(sessions, token_key, rollouts)
 
     with (
         mock.patch.dict(os.environ, _ENVIRONMENT, clear=True),
@@ -245,6 +243,15 @@ def _probe(path: str, method: str = "GET") -> tuple[int, str]:
     The answer is parsed out of the pod's own stdout as JSON. A pod that failed to
     start, or an httpx exception, therefore fails this rather than reading as a status
     of zero.
+
+    IT WEARS `map.role: session-pod`, and that is a correctness requirement rather than
+    decoration. Since 2026-08-26 this namespace is default-deny, and the Tool Gateway's
+    ingress admits exactly one client: a Session pod. An unlabelled probe is refused
+    twice over -- by the floor, which leaves a pod no policy names with no network at
+    all, and by the gateway's own ingress -- so before the label this case measured a
+    caller production never has, and after enforcement it simply timed out. Wearing the
+    label makes the probe the client this Service actually serves, which is the thing
+    worth asserting is reachable.
     """
     image = json.loads(_kubectl("get", "deploy", "tool-gateway", "-o", "json"))["spec"][
         "template"
@@ -260,6 +267,8 @@ def _probe(path: str, method: str = "GET") -> tuple[int, str]:
         _PROBE_POD,
         "--image",
         image,
+        "--labels",
+        "map.role=session-pod",
         "--restart=Never",
         "--command",
         "--",

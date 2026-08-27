@@ -125,7 +125,7 @@ CSI_SERVICE_ACCOUNTS = {
 # bucket, two of them at every bucket in the account. Raising a number here without
 # adding the case that pins the new site re-opens exactly that.
 COPIED_ID_PATTERNS = (
-    (r"subnet-[0-9a-f]{8}", "aws_eks_node_group.map_dev_nodes.subnet_ids", 1),
+    (r"subnet-[0-9a-f]{8}", "aws_eks_node_group.map_dev_nodes_m6i.subnet_ids", 1),
     (
         r"sg-[0-9a-f]{8}",
         "aws_eks_cluster.map_dev.vpc_config[0].cluster_security_group_id",
@@ -1113,7 +1113,7 @@ def test_the_node_subnets_are_the_nodegroups_own(config: str) -> None:
     """
     assert re.search(
         r"node_subnet_ids\s*=\s*coalesce\(\s*var\.node_subnet_ids\s*,\s*"
-        r"tolist\(aws_eks_node_group\.map_dev_nodes\.subnet_ids\)\s*\)",
+        r"tolist\(aws_eks_node_group\.map_dev_nodes_m6i\.subnet_ids\)\s*\)",
         flat(one(config, "locals")),
     ), "local.node_subnet_ids is not the nodegroup's own subnets with an override"
 
@@ -1224,6 +1224,78 @@ def test_nfs_ingress_comes_from_the_node_security_group_and_nowhere_else(
 def test_the_mount_targets_carry_only_the_mount_security_group(config: str) -> None:
     mount = assigns(one(config, "resource", "aws_s3files_mount_target", "session_vfs"))
     assert mount.get("security_groups") == "[aws_security_group.session_vfs_mount.id]"
+
+
+def test_the_workspaces_access_point_roots_where_s3_files_must_create_the_directory(
+    config: str,
+) -> None:
+    """The access point's root must be a prefix the bucket does not already hold.
+
+    `creation_permissions` is applied only when S3 Files has to CREATE `path`. Point an
+    access point at a prefix that already exists and the field is ignored in silence:
+    the directory keeps whatever ownership it had, and for a prefix synthesised from
+    objects already in the bucket that is uid 0, gid 0, mode 0755.
+
+    `posix_user` then squashes every operation through the access point to 10001, which
+    cannot write a root-owned 0755 tree. The kubelet creates a volumeMount's `subPath`
+    directory at mount time, through this access point, so the failure is not a failed
+    mount -- the mount succeeds and the pod dies afterwards at
+    `CreateContainerConfigError: failed to create subPath directory`, a layer and
+    several minutes away from the cause.
+
+    So the property worth asserting is not the path's spelling. It is that the path is
+    not one of the roots this codebase composes S3 keys under, because those are exactly
+    the prefixes the bucket already holds.
+    """
+    access_point = one(
+        code(config), "resource", "aws_s3files_access_point", "session_workspaces"
+    )
+    body = "\n".join(access_point.body)
+    root = one(body, "root_directory")
+    path = assigns(root)["path"].strip('"')
+
+    assert path.startswith("/") and path.count("/") == 1, (
+        f"the root is expected to be one top-level segment, got {path!r}"
+    )
+    assert "creation_permissions" in body, (
+        "the root directory declares no creation_permissions, so S3 Files will "
+        "create it "
+        "owned by root and no pod will be able to write it"
+    )
+
+    composed = _key_roots_this_tree_composes()
+    assert path.lstrip("/") not in composed, (
+        f"the access point roots at {path!r}, which this codebase already writes "
+        "objects "
+        f"under ({sorted(composed)}). creation_permissions will be ignored and every "
+        "Session pod will fail to start."
+    )
+
+
+def _key_roots_this_tree_composes() -> frozenset[str]:
+    """The leading segment of every S3 key this codebase builds.
+
+    Read out of the source rather than listed here, so a fourth prefix added later is
+    seen by the case above instead of quietly not being. Only literals that begin a key
+    count -- an f-string opening with `{`, or a path beginning with `/`, is an HTTP
+    route or a relative path and not a bucket key.
+    """
+    roots: set[str] = set()
+    for module in (_REPO / "src" / "managed_agent").rglob("*.py"):
+        text = module.read_text()
+        # A literal that opens a key: `f"sessions/{tenant}/..."`.
+        roots.update(re.findall(r"[\"\']([a-z][a-z0-9_-]*)/", text))
+        # A named root held on its own, with the slash added at the call site:
+        # `UPLOAD_KEY_ROOT: Final[str] = "uploads"`. The name is what marks it as a
+        # key root -- the literal alone is indistinguishable from any other word.
+        roots.update(
+            re.findall(
+                r"[A-Z][A-Z0-9_]*(?:ROOT|PREFIX)[A-Za-z0-9_\[\],:. |]*"
+                r"=\s*[\"\']([a-z][a-z0-9_-]*)[\"\']",
+                text,
+            )
+        )
+    return frozenset(roots)
 
 
 def test_the_file_system_synchronises_the_platform_bucket(config: str) -> None:
@@ -1739,7 +1811,13 @@ def test_the_fast_tier_ages_out_what_a_session_leaves_behind(config: str) -> Non
 
 
 def test_the_access_point_forces_the_uid_the_session_pod_runs_as(config: str) -> None:
-    user = assigns(one(config, "posix_user"))
+    # Scoped to a named access point since `session_workspaces` arrived: both
+    # declare a `posix_user`, and an unscoped `one()` finds two and fails on the
+    # count rather than on the thing this case is about.
+    session_vfs = one(
+        code(config), "resource", "aws_s3files_access_point", "session_vfs"
+    )
+    user = assigns(one("\n".join(session_vfs.body), "posix_user"))
     assert (user.get("uid"), user.get("gid")) == (
         "local.session_uid",
         "local.session_gid",
@@ -1751,13 +1829,21 @@ def test_the_access_point_forces_the_uid_the_session_pod_runs_as(config: str) ->
 def test_the_access_point_serves_the_whole_bucket(config: str) -> None:
     """`root_directory` at `/`, because the pod's volumeMount supplies the subPath.
 
+    This is the `session_vfs` access point, and it is no longer the one a Session pod
+    mounts -- `session_workspaces` is, rooted at `/workspaces`, for the reason its own
+    case below gives. This one stays at `/` because the artifacts subtree is addressed
+    from the bucket root.
+
     `deploy/k8s/session-pod.yaml` mounts `subPath: artifacts/<id>`, which is resolved
     relative to the access point's root. Moving the root to a prefix would leave every
     mount succeeding against the wrong tree -- an agent writing to
     `<prefix>/artifacts/...` while everything reading the bucket looks under
     `artifacts/...`, with no error at any layer.
     """
-    root = assigns(one(config, "root_directory"))
+    session_vfs = one(
+        code(config), "resource", "aws_s3files_access_point", "session_vfs"
+    )
+    root = assigns(one("\n".join(session_vfs.body), "root_directory"))
     assert root.get("path") == '"/"'
 
 
@@ -2431,9 +2517,16 @@ spec:
   persistentVolumeReclaimPolicy: Retain
   csi:
     driver: efs.csi.aws.com
-    # Unverified: this is the EFS CSI access-point handle form. If S3 Files differs, the
-    # pod stays ContainerCreating and `kubectl describe pod` names the volume.
-    volumeHandle: {file_system_id}::{access_point_id}
+    # The leading `s3files:` is load-bearing and was measured, not guessed. The driver
+    # reads the file system TYPE out of the volumeHandle itself -- the form is
+    # `{{fsType}}:{{fileSystemId}}:{{mountPath}}:{{accessPointId}}` and a first
+    # token that
+    # does not parse as a type falls back to `efs` for backward compatibility
+    # (aws-efs-csi-driver v3.4.1, pkg/driver/node.go, parseVolumeId). Without it the
+    # driver builds an EFS DNS name for an S3 Files file system, whose own name is
+    # `{{az_id}}.{{fs_id}}.s3files.{{region}}.on.aws`, and the pod stays in
+    # ContainerCreating until something kills it.
+    volumeHandle: s3files:{file_system_id}::{access_point_id}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim

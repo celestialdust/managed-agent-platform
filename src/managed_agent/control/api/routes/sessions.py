@@ -99,6 +99,13 @@ wire string. It is not the source of truth; the member is.
 """
 
 REASON_GRANT_NOT_REVISABLE: Final = "grant_not_revisable"
+REASON_GRANT_NOT_REGISTERED: Final = "grant_not_registered"
+"""A Grant named a tool this tenant has no registration for.
+
+Separate from `grant_not_revisable`, which is about *when* a Grant may change. This one
+is about whether the names in it mean anything, and a caller acts on the two
+differently: one says come back with a new Session, the other says fix the spelling.
+"""
 REASON_BUDGET_NOT_REVISABLE: Final = "budget_not_revisable"
 """Why the update route refused, named in `detail` beside `ErrorCode.REQUEST_INVALID`.
 
@@ -402,6 +409,41 @@ async def create(
                 "document missing",
                 file_id=str(attached),
             )
+    # Resolved before anything is appended, for the same reason the file ids above are.
+    # A Grant is fixed for a Session's whole life -- the revision route refuses one
+    # outright -- so a name that does not resolve here is wrong until the Session is
+    # replaced, and the only moment a caller can still be told is this one. Left
+    # unresolved, the first sign was the model reporting mid-Turn that a tool was
+    # missing, on a pod already placed and paid for.
+    #
+    # Compared against the *advertised* names, which is the joined `server__tool` form,
+    # because that is the only name anything downstream matches on: the Tool Gateway
+    # narrows its offer and its calls by this field, and a bare tool name matches no row
+    # there. Refusing the bare name here is the point rather than a side effect.
+    if body.grant:
+        registered = {
+            one.advertised_name
+            for one in await platform.tool_registry.list_for_tenant(tenant_id)
+        }
+        # Sorted so a caller retrying gets a stable list, and *every* unresolved name is
+        # returned rather than the first: a caller told one at a time pays a round trip
+        # per typo, which is the shape that makes people stop reading the error.
+        unregistered = sorted(set(body.grant) - registered)
+        if unregistered:
+            # Joined into one string rather than carried as a list, because the public
+            # error envelope's `detail` is `dict[str, str | int]` and widening it would
+            # change a published schema for every consumer of every code. Every name is
+            # still here, which is the property that matters; the separator is the cost
+            # of not reshaping the envelope for one refusal.
+            return refuse(
+                ErrorCode.REQUEST_INVALID,
+                "this Grant names tools that are not registered to this tenant, so the "
+                "Session would start unable to call them and would say so only once a "
+                "pod was running; a tool is named by its server and its own name "
+                "joined, which is the form the registration route echoes back",
+                reason=REASON_GRANT_NOT_REGISTERED,
+                unregistered=", ".join(unregistered),
+            )
     session_id = new_session_id()
     seq = await platform.event_log_append.append(
         session_id,
@@ -432,7 +474,7 @@ async def create(
             retention_days=body.retention_days,
         )
     )
-    return SessionCreated(id=session_id, state=SessionState.RUNNING, seq=seq)
+    return SessionCreated(id=session_id, state=SessionState.IDLE, seq=seq)
 
 
 @router.get("/sessions/{session_id}")
@@ -546,15 +588,19 @@ async def update(
     the update verb gets a coded refusal naming the field and the reason, instead of a
     405 reading like a routing accident or a 200 that changed nothing without saying so.
 
-    The Grant is refused for two independent reasons, and either alone would settle it.
-    A revision would have to be a `session.updated` event, because the Session's own row
-    refuses UPDATE in the store itself -- the trigger raises rather than absorbing the
-    write -- and that event type is not in the published closed vocabulary, where adding
-    one is a version change (ADR-013). And a revised Grant would take effect nowhere
-    even if it were recorded: the Grant is enforced at the Tool Gateway (ADR-014), and
-    nothing in this tree reads `SessionRecord.grant` at all today, so the field is
-    written at creation and consulted by no comparison. A route that accepted a revision
-    would be promising an enforcement change that no component performs.
+    The Grant is refused because a revision would have to be a `session.updated` event:
+    the Session's own row refuses UPDATE in the store itself -- the trigger raises
+    rather than absorbing the write -- and that event type is not in the published
+    closed vocabulary, where adding one is a version change (ADR-013).
+
+    **That used to be one of two reasons and is now the only one.** The second was that
+    a revised Grant would take effect nowhere, because nothing read the field at all;
+    the Tool Gateway now narrows both its listing and its calls by it, so the
+    field decides what a Session can reach. What that changes for a caller is the weight
+    of this refusal rather than its answer: a Session created with the wrong Grant is
+    wrong for its whole life, and the remedy is a new Session. Worth knowing before you
+    create one, because `grant` defaults to empty and empty means no tools -- so a
+    create call that omits it produces a Session that can reach nothing, permanently.
 
     The Budget is refused for the same store reason and one of its own: no component
     measures a Session's spend against `budget_minor_units`, so raising or lowering a
@@ -583,8 +629,10 @@ async def update(
         return refuse(
             ErrorCode.REQUEST_INVALID,
             "a Session's Grant is fixed at creation: revising it would need an event "
-            "type the published vocabulary does not carry, and nothing here reads the "
-            "Grant, so the revision would take effect nowhere",
+            "type the published vocabulary does not carry. The Grant decides what this "
+            "Session can reach for the rest of its life, so the remedy for a wrong "
+            "one is a new Session -- and its names are resolved at creation, which is "
+            "where a Grant that names nothing real is refused",
             reason=REASON_GRANT_NOT_REVISABLE,
             session_id=str(session_id),
         )

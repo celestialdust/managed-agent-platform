@@ -390,3 +390,138 @@ def test_each_dependency_shape_is_one_the_walk_can_read(shape: str) -> None:
         "spec": {"template": {"spec": {"containers": [{shape: {field: "probe-name"}}]}}}
     }
     assert _dependencies_of(buried) == {(kind, "probe-name")}
+
+
+def _manifests_something_applies() -> set[Path]:
+    """Every file under `deploy/k8s/` that an automated path puts into the cluster.
+
+    Read off the two appliers' own public surfaces rather than listed here, for the
+    reason `_produced_by_bootstrap` gives: a list restated in a test is free to diverge
+    from the thing it names, and the way it diverges is that the guard keeps passing
+    after the applier stops applying.
+
+    A generated ConfigMap counts. `session-pod.yaml` is never `kubectl apply`d -- it is
+    the body of a ConfigMap built from the file at apply time -- but the question here
+    is whether editing the file changes the cluster, and for that one it does.
+    """
+    bootstrap = _module("_deploy_bootstrap", "deploy/bootstrap.py")
+    platform = _module("_deploy_platform", "deploy/platform.py")
+    applied: set[Path] = {(_ROOT / path).resolve() for path in bootstrap.APPLIES}
+    for workload in platform.WORKLOADS:
+        applied.add((_ROOT / workload.manifest).resolve())
+        if workload.schema_job is not None:
+            applied.add((_ROOT / workload.schema_job).resolve())
+        applied.update((_ROOT / path).resolve() for path in workload.companions)
+        applied.update(
+            (_ROOT / source).resolve() for _, source in workload.generated_config_maps
+        )
+    return applied
+
+
+def test_every_manifest_in_this_tree_is_applied_by_something() -> None:
+    """A manifest no applier names reaches the cluster only when somebody remembers.
+
+    The third instance of the class this file's header describes, and the first one
+    where the missing object is a security boundary rather than a mount. The two
+    recorded above were a ConfigMap made only by a header comment and a ServiceAccount
+    declared and never applied; both announced themselves, because a pod stuck at
+    ContainerCreating and a Deployment at 0/2 are things somebody notices.
+
+    **This shape announces nothing.** `deploy/k8s/network-policies.yaml` declares a
+    default-deny and six exceptions; absent from the cluster, every pod talks to every
+    pod and every manifest still reads as though it could not. Nothing is unready,
+    nothing restarts, and the tests that grade the file's *contents* stay green --
+    which is exactly the state this repository was in: the CNI enforcing, the policy
+    set written, and the namespace holding none of it.
+
+    So the guard is about the applier, not the cluster. `test_network_policies.py`'s
+    `test_every_policy_this_repo_declares_is_in_the_cluster` says whether the set is
+    there right now and needs a cluster to ask; this says whether anything will put it
+    back, and it runs offline on every change.
+    """
+    declared = {path.resolve() for path in _K8S.glob("*.yaml")}
+    applied = _manifests_something_applies()
+    orphaned = sorted(path.name for path in declared - applied)
+    assert not orphaned, (
+        f"{orphaned} sit in deploy/k8s/ and no applier names them, so editing one "
+        "changes nothing until a person runs kubectl by hand. Name it in "
+        "deploy/bootstrap.py's APPLIES if it stands the cluster up once, or in a "
+        "Workload's companions in deploy/platform.py if it should be re-asserted every "
+        "release."
+    )
+
+
+_MAKEFILE: Final = _ROOT / "Makefile"
+
+
+def _prerequisites(target: str) -> list[str]:
+    """The prerequisites of one Makefile target, in the order make runs them."""
+    for line in _MAKEFILE.read_text().splitlines():
+        if line.startswith(f"{target}:"):
+            return line.split(":", 1)[1].split("##")[0].split()
+    pytest.fail(f"the Makefile declares no target {target!r}")
+
+
+def _recipe(target: str) -> str:
+    """Every recipe line of one Makefile target, joined."""
+    lines: list[str] = []
+    collecting = False
+    for line in _MAKEFILE.read_text().splitlines():
+        if not collecting:
+            collecting = line.startswith(f"{target}:")
+            continue
+        if line.startswith("\t"):
+            lines.append(line)
+        elif line.strip():
+            break
+    return "\n".join(lines)
+
+
+def test_a_deploy_checks_its_inputs_before_it_spends_anything() -> None:
+    """An input the last step needs is refused at the first, not after the push.
+
+    On 2026-08-26 `make deploy` built the platform image, pushed it to three ECR
+    repositories, created the cluster objects, rolled the control plane and rolled the
+    Tool Gateway -- and then refused, because `MAP_FOUNDRY_RESOURCE` was unset and the
+    Model Gateway's routing table needs it. Nothing was wrong with the refusal: a
+    Foundry resource names one company's Azure account, so it cannot be defaulted or
+    derived, and a wrong one would send a tenant's prompts to somebody else's endpoint.
+    What was wrong was that it came last, leaving two workloads on the new image and one
+    on the old -- a half-deployed platform, which is the state a deploy exists to avoid.
+
+    So the assertion is about ORDER, not about the variable. `deploy-inputs` has to run
+    before `image`, because `image` is the first step that spends anything: everything
+    after it is a push or a rollout, and every one of those is harder to undo than a
+    refusal.
+
+    The variable is read off `deploy/platform.py`'s own constant rather than spelled
+    here, for the reason this file's header gives about restated names: spelled twice,
+    a rename leaves the Makefile checking a variable nothing reads any more while this
+    case goes on passing, which is precisely the failure both are here to prevent.
+
+    Not a test of `make`. It reads the Makefile as a document, so it runs offline and on
+    every change, including on a machine with no cluster and no Docker.
+    """
+    platform = _module("_deploy_platform", "deploy/platform.py")
+    steps = _prerequisites("deploy")
+
+    assert "deploy-inputs" in steps, (
+        f"the deploy target's prerequisites are {steps}, and none of them checks the "
+        "inputs. A deploy that discovers a missing input after the image is pushed "
+        "leaves the platform half-rolled."
+    )
+    assert "image" in steps, (
+        f"the deploy target's prerequisites are {steps} and 'image' is not among them, "
+        "so this case can no longer tell where the spending starts -- re-point it at "
+        "whatever the first irreversible step has become."
+    )
+    assert steps.index("deploy-inputs") < steps.index("image"), (
+        f"deploy runs {steps}, which checks its inputs after 'image' has already built "
+        "and pushed. Move deploy-inputs in front of it: a refusal is free until "
+        "something has been pushed or rolled."
+    )
+    assert platform.FOUNDRY_RESOURCE_VAR in _recipe("deploy-inputs"), (
+        f"deploy-inputs does not check {platform.FOUNDRY_RESOURCE_VAR}, which "
+        "deploy/platform.py's with_foundry refuses the Model Gateway without -- at the "
+        "last step of the chain. It is knowable at the first."
+    )

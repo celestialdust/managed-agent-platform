@@ -1,10 +1,28 @@
 """Put a Session's Rollout back under `CODEX_HOME` before the runtime starts.
 
-Runs as the `seed-rollout` init container, once per pod placement: after
-`restore-working-lane` has put the workspace back, and before any regular container. By
-the time the shim opens the Session, a resuming Session's runtime home holds the record
-its previous pod was writing, and a Session placed for the first time has none -- which
-is what the shim reads to decide between continuing a thread and opening one.
+Runs as the second half of the pod's one init container, once per pod placement: the
+shell half ahead of it in the same `/bin/sh -c` body creates `CODEX_HOME` and copies
+`config.toml` into it, and `exec` hands this process the container. So this runs after
+that root exists and before any regular container. By the time the shim opens the
+Session, a resuming Session's runtime home holds the record its previous pod was
+writing, and a Session placed for the first time has none -- which is what the shim
+reads to decide between continuing a thread and opening one.
+
+The two halves were two init containers until they were merged to take one serial
+container start off every placement. One container has one termination message, so each
+half names itself on the stream that becomes it: every line this module writes is
+prefixed `seed-rollout:` and every line the shell half writes is prefixed
+`seed-runtime-home:`. The prefixes are what a pod status now uses to say which of the
+two jobs refused, and `deploy/k8s/session-pod.yaml` is where that trade is recorded.
+
+**The workspace is not this module's business.** A Session's working tree lives on a
+mounted volume that outlives the pod, so there is nothing to put back and no boundary to
+cross (ADR-035). This restores the one thing a mount cannot: the runtime's own
+conversation record, which is a database rather than ordinary files and stays pod-local
+for that reason. The merge did put the workspace within this process's reach -- the
+shell half needs it and the mount is the container's, not a half's -- so "not its
+business" is now a property of this code rather than of what it was given. Nothing here
+opens a path under the workspace root, and nothing here should start.
 
 **Why a fresh thread is the failure and not the fallback.** The Rollout carries the
 runtime's compaction checkpoints, which have already folded the Session's history into
@@ -15,11 +33,11 @@ told it is resuming and handed nothing to resume from **refuses to start**. Refu
 loses a placement and says why in the pod's own status; continuing loses the property
 the whole recovery boundary exists to hold.
 
-**It asks the Tool Gateway, over the one arrow this pod already has**, for the reason
-its sibling does: this pod's egress is kube-dns and the two gateways, this VPC has no
-S3 endpoint, and the `x-map-session` token is already in the compiled document the
-`compiled` volume carries. Nothing is minted here, no volume is added, no arrow is
-opened. Which tenant and which Session is the token's to say.
+**It asks the Tool Gateway, over the one arrow this pod already has**, rather than
+reaching for storage itself: this pod's egress is kube-dns and the two gateways, this
+VPC has no S3 endpoint, and the `x-map-session` token is already in the compiled
+document the `compiled` volume carries. Nothing is minted here, no volume is added, no
+arrow is opened. Which tenant and which Session is the token's to say.
 
 **Where the file goes is a contract with two readers, and both are why it is not just
 any path.** The runtime, handed this path, keeps appending to this same file for the
@@ -52,22 +70,163 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
+import tomllib
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Final
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from managed_agent.control.pod_config.compiler import CODEX_HOME
-from managed_agent.session_shim.restore_working_lane import (
-    COMPILED_CONFIG,
-    TERMINATION_LOG,
-    Emit,
-    RestoreRefused,
-    client_for,
-    read_binding,
-)
+from managed_agent.control.pod_config.compiler import CODEX_HOME, GATEWAY_SERVER_ID
+from managed_agent.core.session.session_token import SESSION_TOKEN_HEADER_NAME
+
+COMPILED_CONFIG: Final = Path("/etc/map/compiled/config.toml")
+"""Where the `compiled` secret volume is mounted, plus the one file it carries.
+
+Both halves are `deploy/k8s/session-pod.yaml`'s -- the mount path and the Secret key --
+and the init container beside this one copies the same file out of the same place.
+Spelled here rather than passed in: a wrong value is a container that exits saying "no
+such file", which is the least dangerous way for this to be wrong.
+"""
+
+TERMINATION_LOG: Final = Path("/dev/termination-log")
+"""Where kubelet reads a container's own last word from, into the pod's status.
+
+Written on success only, so that what was seeded is legible to a reader of the pod
+rather than only to a reader of the container log. On a refusal it is deliberately left
+empty, because `terminationMessagePolicy: FallbackToLogsOnError` then promotes the log
+instead -- and the log is where the reason is.
+"""
+
+_REQUEST_TIMEOUT_SECONDS: Final = 30.0
+"""Per request, not for the seed as a whole.
+
+The whole is bounded by the pod's readiness budget, which is the bound that actually
+ends the attempt: an init container that overruns it gets the pod deleted by `ensure`'s
+own cleanup. This one is here so that a single hung connection fails its own request
+rather than hanging the placement until that outer bound.
+"""
+
+Emit = Callable[[str], None]
+"""Where this process says what it did. One line, already free of the token."""
+
+
+class RestoreRefused(Exception):
+    """The Rollout could not be put back, so this pod must not start.
+
+    One type for every reason -- an unreadable configuration, a body over the budget, a
+    Rollout whose first line names no thread, a Gateway that will not answer -- because
+    the caller does the same thing with all of them: print the reason and exit non-zero.
+    The difference between them belongs in the message, which is what a reader actually
+    gets.
+
+    Refusing is the whole point rather than a failure mode. A pod told it is resuming
+    and handed nothing to resume from must not quietly open a fresh thread; see this
+    module's docstring for what that costs.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class GatewayBinding:
+    """Where to ask, and what to present. Both read out of one compiled document.
+
+    Read from one `mcp_servers` entry rather than from two sources, so a URL and a token
+    cannot come from different Sessions or different deployments.
+    """
+
+    base_url: str
+    token: str
+
+
+def read_binding(config_toml: str) -> GatewayBinding:
+    """The Gateway's base URL and this Session's token, out of the compiled document.
+
+    Read back out of the rendered TOML rather than from an environment variable, for the
+    reason the pod holds no such variable: the token rides in this document so that the
+    pod specification needs no new Secret and no field that anyone able to read the pod
+    can read.
+
+    The base is the server's URL with its path removed, because the compiled value
+    points at the MCP endpoint (`.../mcp`) while the seed route is a sibling of it
+    rather than a child. A scheme this cannot dial, or an empty host, is refused here
+    rather than left to surface as an httpx error naming a URL and no cause.
+    """
+    document = tomllib.loads(config_toml)
+    servers = document.get("mcp_servers")
+    if not isinstance(servers, dict):
+        raise RestoreRefused(
+            "the compiled configuration declares no mcp_servers table, so it names "
+            "neither the Tool Gateway nor this Session's token"
+        )
+    server = servers.get(GATEWAY_SERVER_ID)
+    if not isinstance(server, dict):
+        raise RestoreRefused(
+            f"the compiled configuration declares no {GATEWAY_SERVER_ID!r} server, so "
+            "there is nothing here to ask for this Session's Rollout"
+        )
+    url = server.get("url")
+    if not isinstance(url, str):
+        raise RestoreRefused(
+            f"the {GATEWAY_SERVER_ID!r} server names no url to reach it at"
+        )
+    headers = server.get("http_headers")
+    token = (
+        headers.get(SESSION_TOKEN_HEADER_NAME) if isinstance(headers, dict) else None
+    )
+    if not isinstance(token, str) or not token:
+        raise RestoreRefused(
+            f"the {GATEWAY_SERVER_ID!r} server carries no {SESSION_TOKEN_HEADER_NAME} "
+            "header, so nothing here can prove which Session is asking"
+        )
+    split = urlsplit(url)
+    if split.scheme not in ("http", "https") or not split.netloc:
+        raise RestoreRefused(
+            f"the {GATEWAY_SERVER_ID!r} server's url is not one this can dial: {url!r}"
+        )
+    # Userinfo is refused rather than stripped, and the reason is downstream: the base
+    # composed below is quoted into the refusal an unreachable Gateway raises, and that
+    # refusal reaches the pod's own status. A `user:pass@` left in the authority would
+    # be a credential printed where every reader of the pod can see it. Nothing this
+    # platform writes carries one -- the value comes from MAP_TOOL_GATEWAY_URL, an
+    # in-cluster Service address -- so a url that does carry one did not come from here,
+    # and refusing is both safer and more honest than silently editing a document the
+    # pod was started with.
+    if split.username is not None or split.password is not None:
+        raise RestoreRefused(
+            f"the {GATEWAY_SERVER_ID!r} server's url embeds credentials in its "
+            "authority, which this platform does not write and which this process "
+            "would echo into the pod's status when naming what it could not reach"
+        )
+    return GatewayBinding(
+        base_url=urlunsplit((split.scheme, split.netloc, "", "", "")),
+        token=token,
+    )
+
+
+def client_for(binding: GatewayBinding) -> httpx.AsyncClient:
+    """The client every request in this process goes through, and the three decisions
+    that go into it: where it points, what it presents, and how long it waits.
+
+    The token is a DEFAULT HEADER rather than something a call site composes. A header
+    is not part of a URL, so no route string, no log line and no httpx exception repr
+    can carry the value -- which matters here because the container's message policy
+    promotes this process's output into the pod's status on a refusal.
+
+    Its own function so the three decisions are readable off the returned object. A
+    wrong header name or a base URL that kept the MCP path is a 401 or a 404 on every
+    request from every pod, answered identically to a token nobody sent.
+    """
+    return httpx.AsyncClient(
+        base_url=binding.base_url,
+        headers={SESSION_TOKEN_HEADER_NAME: binding.token},
+        timeout=_REQUEST_TIMEOUT_SECONDS,
+    )
+
 
 SEED_ROUTE: Final = "/v1/session/rollout"
 """The Tool Gateway's seed route: the whole of this Session's Rollout, or 204.
@@ -107,6 +266,17 @@ refused is not first downloaded.
 
 _META = "session_meta"
 
+_THREAD_ID: Final = re.compile(r"[A-Za-z0-9_-]{1,128}")
+"""The shape a thread id must have before anything composes a path out of it.
+
+This is a filename grammar and not a guess at the runtime's own: `seeded_path` puts this
+value INTO a filename, and `pathlib` splits an embedded `/` into components without
+normalising a `..` among them, so an id is a path fragment whether or not it was meant
+as one. The alphabet is what every id the runtime writes already satisfies -- Codex
+thread ids are UUIDs -- and `turn_complete.find_rollout` globs `rollout-*-{thread_id}*`
+over the same names, which a separator breaks too.
+"""
+
 
 def is_resuming(environ: object) -> bool:
     """Whether this placement continues a thread, read from the pod's environment.
@@ -138,9 +308,16 @@ def thread_id_in(body: bytes) -> str:
     body that does not open with one is refused here, where the message can name the
     Session, rather than inside a runtime whose failure reaches nobody.
 
-    The id is required to be a non-empty string and nothing more is asserted about its
-    shape. What it has to be is whatever the runtime wrote, and re-deriving a grammar
-    for it here would be a second opinion about a value this process only carries.
+    The id is required to be a non-empty string of `_THREAD_ID`'s alphabet, and the
+    second half of that is load-bearing rather than fussy. This value is not merely
+    carried: `seeded_path` interpolates it into a filename, `pathlib` splits an embedded
+    `/` into path components and normalises no `..` among them, and `write_seed` then
+    creates the parents and writes. An id of `a/../../..` composes a write outside
+    `CODEX_HOME` entirely -- reaching, since the two init containers were merged, the
+    mounted workspace that outlives the pod. It arrives off the first line of a body the
+    Gateway returned, so it is not a value this pod controls. Refusing the shape here is
+    a parse and not a second opinion: every id the runtime writes already satisfies it,
+    so a body that fails this is not a Rollout worth writing anywhere.
     """
     first = next((line for line in body.split(b"\n") if line.strip()), None)
     if first is None:
@@ -166,6 +343,12 @@ def thread_id_in(body: bytes) -> str:
         raise RestoreRefused(
             f"the stored Rollout's {_META} line names no thread id, so nothing here "
             "can say which conversation these bytes are"
+        )
+    if not _THREAD_ID.fullmatch(found):
+        raise RestoreRefused(
+            f"the stored Rollout's {_META} line names a thread id that is not a bare "
+            "identifier, and this value becomes part of the path these bytes would be "
+            "written to -- so it is refused here rather than resolved by the kernel"
         )
     return found
 

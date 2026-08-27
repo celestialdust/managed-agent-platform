@@ -57,16 +57,26 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
-from cluster_access import NAMESPACE, forwarded
+from cluster_access import (
+    NAMESPACE,
+    forwarded,
+    internal_ca_of_the_cluster,
+    shim_dial,
+)
 
 from managed_agent.adapters.kubernetes.pod_runner import KubernetesPodRunner
+from managed_agent.control.api.request.tenancy import TENANT_HEADER
 from managed_agent.control.pod_config import compiler as config_compiler
 from managed_agent.control.session.placement import pod_name_for
-from managed_agent.core.ids import TenantId, new_definition_id, new_session_id
+from managed_agent.core.ids import (
+    SessionId,
+    TenantId,
+    new_definition_id,
+)
 from managed_agent.core.registration.definition import AgentDefinition, SkillsRevision
 from managed_agent.core.registration.environment import Environment, new_environment_id
 from managed_agent.core.session.session import SessionRecord
@@ -140,7 +150,62 @@ def _session_token_key() -> bytes:
     return base64.b64decode(encoded)
 
 
-def _compiled(image: str, token_key: bytes) -> config_compiler.CompiledConfig:
+_CONTROL_PLANE: Final = "deploy/control-plane"
+_CONTROL_PLANE_PORT: Final = 8080
+
+
+def _register_a_session(base: str, image: str) -> tuple[SessionId, TenantId]:
+    """An environment, a definition and a Session through the API, and their ids.
+
+    This file places its own pod and does not need the control plane to do it -- but
+    the pod's runtime dials the Tool Gateway during start-up, and the Gateway reads the
+    Session's row to learn its Grant. A Session id this file invented has no row, the
+    Gateway answers the MCP handshake with an error, and the runtime treats that server
+    as required: `Failed to create session: required MCP servers failed to initialize`,
+    and the pod exits 3 before it serves anything.
+
+    So the Session is real and the placement is still this file's own. An empty Grant is
+    correct here and is not what used to break it: the control plane's own cases create
+    Sessions with `grant: []` and their pods start. What the Gateway refuses is a
+    Session it has never heard of, which is the right refusal and the wrong input.
+    """
+    headers = {TENANT_HEADER: str(TenantId(uuid4()))}
+    with httpx.Client(base_url=base, timeout=60.0, headers=headers) as caller:
+        environment = caller.post(
+            "/v1/environments",
+            json={"name": f"placement-{uuid4().hex[:8]}", "runtime_image": image},
+        )
+        assert environment.status_code == 201, environment.text
+        definition = caller.post(
+            "/v1/agents",
+            json={
+                "name": f"placement-{uuid4().hex[:8]}",
+                "instructions": "Reply with exactly: ok",
+                "model": "gsds-claude-opus-4-6",
+                "skills_repository": "git@github.com:acme/skills.git",
+                "skills_revision": "0" * 39 + "a",
+            },
+        )
+        assert definition.status_code == 201, definition.text
+        session = caller.post(
+            "/v1/sessions",
+            json={
+                "definition_id": definition.json()["id"],
+                "environment_id": environment.json()["id"],
+                "grant": [],
+                "scope": {},
+                "budget_minor_units": 500,
+                "budget_currency": "USD",
+                "retention_days": 30,
+            },
+        )
+        assert session.status_code == 201, session.text
+    return SessionId(UUID(session.json()["id"])), TenantId(UUID(headers[TENANT_HEADER]))
+
+
+def _compiled(
+    image: str, token_key: bytes, session_id: SessionId, tenant_id: TenantId
+) -> config_compiler.CompiledConfig:
     """Documents from the production compiler, never hand-written.
 
     Hand-written TOML was tried and the runtime refused it with `thread/start failed
@@ -149,8 +214,8 @@ def _compiled(image: str, token_key: bytes) -> config_compiler.CompiledConfig:
     difference is what the runtime rejects.
     """
     record = SessionRecord(
-        id=new_session_id(),
-        tenant_id=TenantId(uuid4()),
+        id=session_id,
+        tenant_id=tenant_id,
         definition_id=new_definition_id(),
         definition_revision="rev-1",
         grant=frozenset(),
@@ -195,11 +260,22 @@ def _placed() -> Iterator[tuple[str, config_compiler.CompiledConfig, str]]:
     reported. Deletion is in a `finally` and removes the pod only: `_create` makes the
     pod own its three Secrets, so they go with it -- which is itself checked below
     rather than assumed.
+
+    The runner signs with the cluster's own CA, from the same expression `shim_dial`
+    reads to decide how to dial. Left to its default the runner holds no CA, places a
+    pod serving plain HTTP, and the dial -- reading the deployed Secret, which does hold
+    one -- speaks TLS at it. That mismatch surfaces as `record layer failure`, which
+    names neither side of it.
     """
     image = _session_image()
-    compiled = _compiled(image, _session_token_key())
+    with forwarded(_CONTROL_PLANE, _CONTROL_PLANE_PORT) as base:
+        session_id, tenant_id = _register_a_session(base, image)
+    compiled = _compiled(image, _session_token_key(), session_id, tenant_id)
     runner = KubernetesPodRunner.from_manifest_file(
-        _MANIFEST, namespace=NAMESPACE, token_key=os.urandom(32)
+        _MANIFEST,
+        namespace=NAMESPACE,
+        token_key=os.urandom(32),
+        internal_ca=internal_ca_of_the_cluster(),
     )
     pod_name = pod_name_for(compiled.session_id)
     try:
@@ -304,7 +380,14 @@ def test_a_turn_is_accepted_and_streams_to_a_terminal_line() -> None:
     """
     with _placed() as (pod_name, compiled, phase):
         assert phase == "running", phase
-        with forwarded(f"pod/{pod_name}", _SHIM_PORT) as base:
+        # The dial is decided from the cluster's own Secret, so this case follows the
+        # platform into and out of mTLS instead of pinning a scheme. A forward lands on
+        # `127.0.0.1` and the pod's certificate names it by its in-cluster address, so
+        # the SNI name `shim_dial` carries is what makes verification pass -- against
+        # the real name, not by turning the check off.
+        dial = shim_dial(pod_name)
+        with forwarded(f"pod/{pod_name}", _SHIM_PORT) as forward:
+            base = dial.base(forward)
             token = _bearer(pod_name)
             body = {
                 "session_id": str(compiled.session_id),
@@ -313,12 +396,13 @@ def test_a_turn_is_accepted_and_streams_to_a_terminal_line() -> None:
             }
             lines: list[dict[str, Any]] = []
             with (
-                httpx.Client(timeout=180.0) as client,
+                httpx.Client(timeout=180.0, verify=dial.verify) as client,
                 client.stream(
                     "POST",
                     f"{base}/session/turn",
                     json=body,
                     headers={"Authorization": f"Bearer {token}"},
+                    extensions=dial.extensions,
                 ) as response,
             ):
                 assert response.status_code == 200, (

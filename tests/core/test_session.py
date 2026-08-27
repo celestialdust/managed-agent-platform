@@ -113,7 +113,13 @@ def test_the_record_holds_no_state_and_no_pod() -> None:
     assert not any("pod" in name for name in names)
 
 
-def test_only_a_running_session_accepts_a_turn() -> None:
-    """One answer to "may this Session take a Turn now", so callers cannot differ."""
+def test_only_an_idle_session_accepts_a_turn() -> None:
+    """One answer to "may this Session take a Turn now", so callers cannot differ.
+
+    Exactly one member, and `RUNNING` is deliberately not it. A Session with a Turn
+    executing refuses a second concurrent submission, because the runtime behind it
+    serves one thread of work and two Turns admitted at once would interleave into it
+    with nothing in the log saying which output answered which prompt.
+    """
     accepting = {state for state in SessionState if state.accepts_a_turn()}
-    assert accepting == {SessionState.RUNNING}
+    assert accepting == {SessionState.IDLE}

@@ -189,16 +189,24 @@ class Wired:
     session_id: SessionId
 
 
-def _wire(*activities: ThreadActivity, stopped: bool = False) -> Wired:
+def _wire(
+    *activities: ThreadActivity, stopped: bool = False, suspended: bool = False
+) -> Wired:
     """The real app over one owned Session whose log holds a creation event.
 
     A creation event is not decoration: `project` raises on a log without one, and the
     thread status depends on that fold, so a Session with an empty log would fail every
     route here with a 500 rather than answering.
+
+    `stopped` and `suspended` are separate because the two say different things about
+    what may still be appended. A stop is the end of the log; a suspension is the pod
+    being handed back, and the Session keeps taking events after it.
     """
     session_id = new_session_id()
     log = Log()
     log.add(session_id, lifecycle.SESSION_CREATED)
+    if suspended:
+        log.add(session_id, lifecycle.SESSION_SUSPENDED)
     if stopped:
         log.add(session_id, lifecycle.SESSION_STOPPED)
     index = Index(*activities)
@@ -397,6 +405,38 @@ async def test_every_thread_of_a_stopped_session_reads_as_terminated() -> None:
     async with _client(wired) as client:
         answer = await client.get(f"/v1/sessions/{wired.session_id}/threads/{_ROOT}")
     assert answer.json()["status"] == "terminated"
+
+
+async def test_a_thread_of_a_suspended_session_is_not_terminated() -> None:
+    """A suspension takes the pod back; it does not close the log.
+
+    The Session can still be archived, and every event that archive writes carries this
+    thread's identifier -- so telling a consumer the thread is terminated would tell it
+    to stop reading a log that is still being written.
+    """
+    wired = _wire(_activity(_ROOT, turn_ended=True), suspended=True)
+    async with _client(wired) as client:
+        answer = await client.get(f"/v1/sessions/{wired.session_id}/threads/{_ROOT}")
+    assert answer.json()["status"] == "idle"
+
+
+async def test_archiving_a_thread_of_a_suspended_session_records_it() -> None:
+    """The archive is a real retirement here, so it has to reach the log.
+
+    A Session that is merely parked is one whose threads a tenant can still retire. If
+    the route reads it as closed it answers 200 with a terminated view and writes
+    nothing, and the retirement the tenant asked for is silently not recorded -- so a
+    later read, once the Session is running again, reports the thread as live.
+    """
+    wired = _wire(_activity(_ROOT, turn_ended=True), suspended=True)
+    async with _client(wired) as client:
+        answer = await client.post(
+            f"/v1/sessions/{wired.session_id}/threads/{_ROOT}/archive"
+        )
+    assert answer.status_code == 200, answer.text
+    assert wired.appends.written == [
+        (thread_events.THREAD_ARCHIVED, {"thread_id": _ROOT})
+    ]
 
 
 async def test_archiving_an_idle_thread_records_it_and_answers_the_new_state() -> None:

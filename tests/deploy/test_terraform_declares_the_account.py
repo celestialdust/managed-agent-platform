@@ -91,7 +91,7 @@ _MUST_NOT_BE_DESTROYED = frozenset(
         "aws_eip.nat",
         "aws_nat_gateway.map",
         "aws_eks_cluster.map_dev",
-        "aws_eks_node_group.map_dev_nodes",
+        "aws_eks_node_group.map_dev_nodes_m6i",
         "aws_db_instance.map_dev",
         "aws_iam_openid_connect_provider.cluster",
         "aws_iam_policy.provisioning",

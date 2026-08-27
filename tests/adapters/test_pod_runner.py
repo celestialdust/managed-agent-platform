@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
 import os
 import re
-from collections.abc import AsyncIterator, Iterator
+import sys
+from collections.abc import AsyncIterator, Iterator, Mapping
 from dataclasses import fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -39,6 +41,8 @@ from uuid import uuid4
 import kubernetes_asyncio.config.kube_config as kube_config
 import pytest
 import yaml
+from cryptography import x509
+from cryptography.hazmat.primitives import serialization
 from fake_kubernetes_api import (
     FakeCluster,
     fake_kubernetes_api,
@@ -59,6 +63,7 @@ from kubernetes_asyncio.client.models import (
     V1PodSpec,
     V1PodStatus,
 )
+from workspace_volume import documents_for
 
 import managed_agent.adapters.kubernetes.pod_runner as pod_runner_module
 from managed_agent.adapters.kubernetes.pod_runner import (
@@ -71,6 +76,7 @@ from managed_agent.adapters.kubernetes.pod_runner import (
     _SHIM_CONTAINER,
     _SHIM_ENV,
     _SKILL_VOLUME,
+    _SUBTREE_VOLUME,
     _WILL_NOT_START,
     KubernetesPodRunner,
     _claims_this_session,
@@ -103,10 +109,35 @@ from managed_agent.core.registration.definition import AgentDefinition, SkillsRe
 from managed_agent.core.registration.environment import Environment, new_environment_id
 from managed_agent.core.registration.skill import SkillFile, ValidatedSkill, skill_files
 from managed_agent.core.session.session import SessionRecord
-from managed_agent.session_shim.pod_channel import shim_token_for, shim_url_for
+from managed_agent.core.tls.session_certificate import InternalCa, new_internal_ca
+from managed_agent.session_shim.pod_channel import (
+    shim_host,
+    shim_token_for,
+    shim_url_for,
+)
 
-MANIFEST = Path(__file__).resolve().parents[2] / "deploy" / "k8s" / "session-pod.yaml"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+MANIFEST = _REPO_ROOT / "deploy" / "k8s" / "session-pod.yaml"
 A_KEY = b"a signing key for tests only"
+A_NAMESPACE = "map-test"
+
+
+def _ca_pem() -> tuple[bytes, bytes]:
+    """A throwaway CA as the two PEM blobs a deployment would supply from its Secret.
+
+    Generated per call rather than shared, so a case needing two distinct CAs gets them
+    from the same helper instead of a second fixture that could drift from this one.
+    """
+    key, certificate = new_internal_ca()
+    return (
+        key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        ),
+        certificate.public_bytes(serialization.Encoding.PEM),
+    )
+
 
 # Where a Session pod reaches the Model Gateway. The `/v1` is load-bearing at both ends:
 # the Agent Runtime POSTs `{base_url}/responses`, and the Gateway's router mounts
@@ -420,7 +451,7 @@ def test_the_shim_starts_its_thread_with_the_model_the_configuration_names() -> 
     ), environment
 
 
-def test_nothing_but_those_seven_fields_differs_from_the_manifest_on_disk() -> None:
+def test_nothing_but_those_eight_fields_differs_from_the_manifest_on_disk() -> None:
     """Everything the manifest decides about confinement is copied through untouched.
 
     The security contexts, the probes, the node selector and the deny-rule ordering the
@@ -438,6 +469,12 @@ def test_nothing_but_those_seven_fields_differs_from_the_manifest_on_disk() -> N
     this drives a RESUMING Session, where the substituted value and the manifest's
     differ, and blanks both tables. A version of this reading `_SHIM_ENV` alone passes
     against a seed container filled with anything at all.
+
+    The eighth is the `subPath` on every mount of the shared workspace volume, and it
+    behaved like the sixth: the blanking did not cover it, so this failed rather than
+    letting the substitution in unnoticed. It is blanked by VOLUME NAME rather than by
+    matching the token text, so a subPath left unsubstituted shows up as a difference
+    here instead of being quietly normalised away with the ones that were filled in.
     """
     compiled = replace(_compiled(), resuming=True)
     pod_name = pod_name_for(compiled.session_id)
@@ -453,6 +490,9 @@ def test_nothing_but_those_seven_fields_differs_from_the_manifest_on_disk() -> N
             for entry in container.get("env", ()):
                 if entry["name"] in substituted_names:
                     entry["value"] = "<substituted>"
+            for mount in container.get("volumeMounts", ()):
+                if mount["name"] == _SUBTREE_VOLUME:
+                    mount["subPath"] = "<subtree>"
         for volume in spec["volumes"]:
             if "secret" in volume:
                 volume["secret"]["secretName"] = "<secret>"
@@ -527,7 +567,12 @@ def test_each_compiled_document_lands_under_the_filename_the_runtime_reads() -> 
     compiled = _compiled()
     pod_name = pod_name_for(compiled.session_id)
     secrets = _secrets_for(
-        pod_name, ("compiled", "requirements", "shim-token"), compiled, A_KEY
+        pod_name,
+        ("compiled", "requirements", "shim-token"),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=None,
     )
     by_name = {secret.metadata.name: secret.string_data for secret in secrets}
     assert by_name[f"{pod_name}-compiled"] == {"config.toml": compiled.config_toml}
@@ -548,7 +593,14 @@ def test_the_shim_token_is_the_one_the_control_plane_will_present() -> None:
     """
     compiled = _compiled()
     pod_name = pod_name_for(compiled.session_id)
-    (secret,) = _secrets_for(pod_name, ("shim-token",), compiled, A_KEY)
+    (secret,) = _secrets_for(
+        pod_name,
+        ("shim-token",),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=None,
+    )
     assert secret.string_data["token"] == shim_token_for(compiled.session_id, A_KEY)
     assert secret.string_data["token"] != shim_token_for(
         compiled.session_id, b"another key"
@@ -565,7 +617,14 @@ def test_each_skill_rides_in_the_secret_that_already_mounts_the_config_root() ->
     """
     compiled = _compiled_with_skills()
     pod_name = pod_name_for(compiled.session_id)
-    (secret,) = _secrets_for(pod_name, (_SKILL_VOLUME,), compiled, A_KEY)
+    (secret,) = _secrets_for(
+        pod_name,
+        (_SKILL_VOLUME,),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=None,
+    )
     assert secret.string_data == {
         "requirements.toml": compiled.requirements_toml,
         "skill.skills_pdf_SKILL.md": _TWO_SKILLS[1].text,
@@ -583,7 +642,14 @@ def test_a_session_with_no_skills_carries_exactly_what_it_carried_before() -> No
     compiled = _compiled()
     assert compiled.skill_files == ()
     pod_name = pod_name_for(compiled.session_id)
-    (secret,) = _secrets_for(pod_name, (_SKILL_VOLUME,), compiled, A_KEY)
+    (secret,) = _secrets_for(
+        pod_name,
+        (_SKILL_VOLUME,),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=None,
+    )
     assert secret.string_data == {"requirements.toml": compiled.requirements_toml}
 
 
@@ -628,7 +694,14 @@ def test_every_key_the_secret_holds_is_a_key_the_projection_names() -> None:
     """
     compiled = _compiled_with_skills()
     pod_name = pod_name_for(compiled.session_id)
-    (secret,) = _secrets_for(pod_name, (_SKILL_VOLUME,), compiled, A_KEY)
+    (secret,) = _secrets_for(
+        pod_name,
+        (_SKILL_VOLUME,),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=None,
+    )
     pod = _pod_for(_manifest(), pod_name, compiled)
     volume = next(one for one in pod["spec"]["volumes"] if one["name"] == _SKILL_VOLUME)
     assert {item["key"] for item in volume["secret"]["items"]} == set(
@@ -763,7 +836,14 @@ def test_a_multi_file_skill_keeps_the_base_file_in_the_secret() -> None:
     """
     compiled = _compiled_with_skills(_A_SKILL_OF_SEVERAL_FILES)
     pod_name = pod_name_for(compiled.session_id)
-    (secret,) = _secrets_for(pod_name, (_SKILL_VOLUME,), compiled, A_KEY)
+    (secret,) = _secrets_for(
+        pod_name,
+        (_SKILL_VOLUME,),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=None,
+    )
     assert set(secret.string_data) == {
         "requirements.toml",
         _skill_secret_key("skills/pdf/SKILL.md"),
@@ -782,7 +862,14 @@ def test_no_path_a_skill_can_hold_produces_a_key_kubernetes_refuses() -> None:
     """
     compiled = _compiled_with_skills(_A_SKILL_OF_SEVERAL_FILES)
     pod_name = pod_name_for(compiled.session_id)
-    (secret,) = _secrets_for(pod_name, (_SKILL_VOLUME,), compiled, A_KEY)
+    (secret,) = _secrets_for(
+        pod_name,
+        (_SKILL_VOLUME,),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=None,
+    )
     assert len(secret.string_data) == 4
     for key in secret.string_data:
         assert _LEGAL_SECRET_KEY.match(key), key
@@ -820,7 +907,12 @@ def test_a_colliding_pair_is_refused_before_any_secret_is_written() -> None:
     compiled = _compiled_with_skills(_A_COLLIDING_PAIR)
     with pytest.raises(PodNotStarted) as refusal:
         _secrets_for(
-            pod_name_for(compiled.session_id), (_SKILL_VOLUME,), compiled, A_KEY
+            pod_name_for(compiled.session_id),
+            (_SKILL_VOLUME,),
+            compiled,
+            A_KEY,
+            namespace=A_NAMESPACE,
+            internal_ca=None,
         )
     assert "skills/pdf/ref/forms.md" in str(refusal.value)
 
@@ -1142,7 +1234,7 @@ def test_a_reason_longer_than_the_cap_is_truncated_rather_than_logged_whole() ->
     assert scheduling.count("y") == _REASON_CAP
 
 
-def _a_runner(namespace: str = "map-test") -> KubernetesPodRunner:
+def _a_runner(namespace: str = A_NAMESPACE) -> KubernetesPodRunner:
     return KubernetesPodRunner.from_manifest_file(
         MANIFEST, namespace=namespace, token_key=A_KEY
     )
@@ -1616,6 +1708,200 @@ async def test_remove_takes_the_pod_and_every_secret_and_is_safe_to_repeat(
     await runner.remove(pod_name)
 
 
+# The four cases below are about one window: the seconds between a Turn releasing its
+# pod and that pod's object actually leaving the cluster. ADR-041 leased a pod to a
+# single Turn, which made that window part of the ordinary path rather than a rarity --
+# every Turn now ends by deleting a pod, and the next Turn of the same Session arrives
+# while the last one is still going. The pod's name is derived from the Session, so the
+# two cannot coexist and the second Turn has to wait the first one out.
+
+
+async def test_a_turn_arriving_while_the_last_turns_pod_terminates_is_given_a_pod(
+    a_fake_cluster: FakeCluster,
+) -> None:
+    """The defect this window cost, measured on `map-dev` before it was fixed.
+
+    Deletion is asynchronous: the API server stamps `deletionTimestamp` and answers,
+    and the object stays addressable for its grace period. `_phase_of` reads a stamped
+    pod as GONE -- correctly, since a pod being torn down must never be dispatched into
+    -- and `ensure` used to hand that GONE straight back, which the transport turns into
+    `TurnUndeliverable` and the route into a 502. The live control plane's own words:
+
+        turn 968d51f1... for session e6ec2127... is undeliverable:
+        the pod for session e6ec2127... is gone
+
+    Before the lease that was right: a stamped pod at a Session's name meant somebody
+    had deleted it out from under a live Session, and refusing was the honest answer.
+    After it, the commonest way to find one is that this platform deleted it itself one
+    Turn ago, and refusing makes every second Turn inside the grace window fail -- which
+    is the ordinary interactive case, not an edge.
+
+    The wait is what makes it correct, so the teardown is finished by a task rather
+    than up front: an implementation that skipped the wait and created immediately
+    would get a 409 off the still-present object and fail differently.
+    """
+    compiled = _compiled()
+    pod_name = pod_name_for(compiled.session_id)
+    a_fake_cluster.status_of[pod_name] = running("agent-runtime", "session-shim")
+    a_fake_cluster.lingering.add(pod_name)
+    runner = _a_runner()
+
+    await runner.ensure(pod_name, compiled)
+    await runner.remove(pod_name)
+    assert pod_name in a_fake_cluster.pods, "the fake is not modelling a grace period"
+
+    async def kubelet_finishes_the_teardown() -> None:
+        await asyncio.sleep(0.05)
+        a_fake_cluster.lingering.discard(pod_name)
+        a_fake_cluster.finish_deletion(pod_name)
+        # The scripted status went with the object it described, so the replacement
+        # starts from Pending and has to be brought up in its own right -- which is the
+        # honest shape: the next pod is a new pod, not the old one keeping its readiness
+        # across a delete.
+        while pod_name not in a_fake_cluster.pods:
+            await asyncio.sleep(0.01)
+        a_fake_cluster.status_of[pod_name] = running("agent-runtime", "session-shim")
+
+    finishing = asyncio.create_task(kubelet_finishes_the_teardown())
+    try:
+        phase = await runner.ensure(pod_name, compiled)
+    finally:
+        await finishing
+
+    assert phase is PodPhase.RUNNING, (
+        "a Turn that arrived while the previous Turn's pod was still terminating was "
+        "refused, so any two Turns inside one grace period fail on the second"
+    )
+    assert a_fake_cluster.pods[pod_name]["metadata"].get("deletionTimestamp") is None, (
+        "the pod the Turn was given is the one that was on its way out"
+    )
+
+
+async def test_a_pod_that_never_finishes_terminating_refuses_rather_than_hanging(
+    a_fake_cluster: FakeCluster, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The wait is bounded, because the thing being waited on can fail to happen.
+
+    A node that stops reporting leaves a pod stamped for deletion and never collected,
+    and a wait with no deadline would hold the Turn's request open for as long as that
+    lasts -- which is worse than a refusal, since the tenant learns nothing and the
+    connection is spent. The refusal names the pod so the reason is not guessed at.
+    """
+    monkeypatch.setattr(pod_runner_module, "_TERMINATION_TIMEOUT_SECONDS", 0.2)
+    compiled = _compiled()
+    pod_name = pod_name_for(compiled.session_id)
+    a_fake_cluster.status_of[pod_name] = running("agent-runtime", "session-shim")
+    a_fake_cluster.lingering.add(pod_name)
+    runner = _a_runner()
+    await runner.ensure(pod_name, compiled)
+    await runner.remove(pod_name)
+
+    with pytest.raises(PodNotStarted) as refused:
+        await runner.ensure(pod_name, compiled)
+
+    assert pod_name in str(refused.value)
+
+
+async def test_a_pod_left_terminal_by_a_crashed_control_plane_is_replaced(
+    a_fake_cluster: FakeCluster,
+) -> None:
+    """A Turn whose process died leaves a finished pod that no `finally` will collect.
+
+    The lease releases a pod in a `finally`, and nothing runs after a control plane is
+    killed -- so the pod completes on its own and its object sits at the Session's name
+    in `Succeeded`. `_phase_of` calls that GONE too, and handing it back would make the
+    Session unplaceable until the reaper's sweep came round, which is a quarter of an
+    hour of a Session that answers every Turn with a 502 for a reason no tenant can see.
+
+    A terminal pod is safe to replace rather than adopt: `restartPolicy: Never` means it
+    will not run again, its Turn is over, and ADR-035 put the workspace on a volume that
+    outlives it -- so nothing the next pod needs is inside this one.
+    """
+    compiled = _compiled()
+    pod_name = pod_name_for(compiled.session_id)
+    a_fake_cluster.status_of[pod_name] = running("agent-runtime", "session-shim")
+    runner = _a_runner()
+    await runner.ensure(pod_name, compiled)
+    first_uid = a_fake_cluster.pods[pod_name]["metadata"]["uid"]
+    # The Turn finished and nothing released the pod, so its object is left in a
+    # terminal phase at the Session's name. The status is scripted per name, so it has
+    # to be cleared once the replacement is created or the new pod would read Succeeded
+    # too -- which is kubelet's job and is what the task below stands in for.
+    a_fake_cluster.status_of[pod_name] = {"phase": "Succeeded"}
+
+    async def kubelet_starts_the_replacement() -> None:
+        while a_fake_cluster.pods.get(pod_name, {}).get("metadata", {}).get("uid") in (
+            first_uid,
+            None,
+        ):
+            await asyncio.sleep(0.01)
+        a_fake_cluster.status_of[pod_name] = running("agent-runtime", "session-shim")
+
+    starting = asyncio.create_task(kubelet_starts_the_replacement())
+    try:
+        replaced = await runner.ensure(pod_name, compiled)
+    finally:
+        starting.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await starting
+
+    assert replaced is PodPhase.RUNNING
+    assert a_fake_cluster.pods[pod_name]["metadata"]["uid"] != first_uid, (
+        "the finished pod was adopted rather than replaced, so the Turn was dispatched "
+        "into a pod that had already exited"
+    )
+
+
+async def test_the_next_pods_secrets_are_owned_by_the_next_pod(
+    a_fake_cluster: FakeCluster,
+) -> None:
+    """Why the wait has to finish before the create, and not merely before the dispatch.
+
+    The three Secrets are owned by the pod they were minted for, so that anything which
+    deletes the pod collects them. Minting the next Turn's Secrets while the last Turn's
+    pod is still present would put objects the new pod needs in the path of the old
+    pod's garbage collection -- and the collection happens when the old object finally
+    goes, which is precisely the moment the new pod is starting up. The failure would be
+    a pod whose secret volumes have nothing behind them, which kubelet retries for ever.
+    """
+    compiled = _compiled()
+    pod_name = pod_name_for(compiled.session_id)
+    a_fake_cluster.status_of[pod_name] = running("agent-runtime", "session-shim")
+    a_fake_cluster.lingering.add(pod_name)
+    runner = _a_runner()
+    await runner.ensure(pod_name, compiled)
+    first_uid = a_fake_cluster.pods[pod_name]["metadata"]["uid"]
+    await runner.remove(pod_name)
+
+    async def kubelet_finishes_the_teardown() -> None:
+        await asyncio.sleep(0.05)
+        a_fake_cluster.lingering.discard(pod_name)
+        a_fake_cluster.finish_deletion(pod_name)
+        # The scripted status went with the object it described, so the replacement
+        # starts from Pending and has to be brought up in its own right -- which is the
+        # honest shape: the next pod is a new pod, not the old one keeping its readiness
+        # across a delete.
+        while pod_name not in a_fake_cluster.pods:
+            await asyncio.sleep(0.01)
+        a_fake_cluster.status_of[pod_name] = running("agent-runtime", "session-shim")
+
+    finishing = asyncio.create_task(kubelet_finishes_the_teardown())
+    try:
+        await runner.ensure(pod_name, compiled)
+    finally:
+        await finishing
+
+    owners = {
+        secret["metadata"]["ownerReferences"][0]["uid"]
+        for secret in a_fake_cluster.secrets.values()
+    }
+    assert owners == {a_fake_cluster.pods[pod_name]["metadata"]["uid"]}
+    assert first_uid not in owners, (
+        "a Secret the new pod mounts is owned by the pod that was being deleted, so "
+        "collecting the old pod takes the new pod's secret volume with it"
+    )
+
+
 async def test_an_existing_secret_is_left_alone_rather_than_replaced(
     a_fake_cluster: FakeCluster,
 ) -> None:
@@ -1836,6 +2122,50 @@ async def _make_the_namespace_and_its_service(namespace: str) -> None:
                 raise
 
 
+async def _make_the_workspace_volume(namespace: str) -> None:
+    """Give this namespace its own claim on the shared file system, idempotently.
+
+    A claim is namespaced and a Session pod can only mount one in its own namespace,
+    so a tier running anywhere but `map-dev` needs its own -- without it every pod this
+    file places sits Pending on a claim that does not exist, and the failure reads as
+    the scheduler refusing the pod rather than as a missing object.
+
+    Both creates tolerate 409, so a namespace left by an interrupted run is reused.
+    """
+    volume, claim = documents_for(namespace)
+    async with _core_api() as core:
+        for create in (
+            lambda: core.create_persistent_volume(body=volume),
+            lambda: core.create_namespaced_persistent_volume_claim(
+                namespace=namespace, body=claim
+            ),
+        ):
+            try:
+                await create()
+            except ApiException as err:
+                if err.status != _ALREADY_EXISTS:
+                    raise
+
+
+async def _drop_the_workspace_volume(namespace: str) -> None:
+    """Delete this namespace's volume, which `Retain` will not do on its own.
+
+    Deleting the namespace takes the claim with it and leaves the PersistentVolume in
+    `Released` forever, because the manifest's reclaim policy is `Retain` -- correct for
+    the real volume and pure accretion here, one dead object per distinct namespace a
+    run has ever used.
+
+    It deletes the name `documents_for` derived, never the manifest's own:
+    that name always carries this namespace as a suffix, and the namespace has already
+    been refused if it is the platform's. Swallowed like its sibling, because a teardown
+    that raises replaces a real failure with a story about cleanup.
+    """
+    volume, _ = documents_for(namespace)
+    async with _core_api() as core:
+        with contextlib.suppress(ApiException):
+            await core.delete_persistent_volume(name=volume["metadata"]["name"])
+
+
 async def _drop_the_namespace(namespace: str) -> None:
     """Delete the namespace, which takes the Service and anything else in it.
 
@@ -1847,6 +2177,88 @@ async def _drop_the_namespace(namespace: str) -> None:
     async with _core_api() as core:
         with contextlib.suppress(ApiException):
             await core.delete_namespace(name=namespace)
+
+
+def _a_namespace_this_tier_may_delete(environ: Mapping[str, str]) -> str:
+    """Read `MAP_NAMESPACE`, refusing any name whose namespace this must not destroy.
+
+    The fixture below deletes the namespace it is handed, whole, in its teardown. That
+    is correct for a scratch namespace and catastrophic for the one the platform runs
+    in: `map-dev` holds the control plane, both gateways, the signing Secret and the
+    workspace claim every Session mounts, and a namespace delete takes all of them with
+    no confirmation and no undo. Nothing else stands between an operator who exports
+    `MAP_NAMESPACE=map-dev` -- the value every other tool in this repository wants --
+    and losing the environment to a test run.
+
+    So the refusal is on the way IN, not on the way out. Checked at teardown it would
+    fire after the tests had already placed pods in the platform's namespace; checked
+    here, the tier never starts. The name is read from `deploy/bootstrap.py` rather than
+    written twice, because a second copy is free to disagree with the first one exactly
+    when it matters.
+    """
+    namespace = environ["MAP_NAMESPACE"]
+    if namespace == _platform_namespace():
+        raise RuntimeError(
+            f"MAP_NAMESPACE={namespace!r} is the namespace the platform runs in, and "
+            f"this tier deletes the namespace it is given. Name a scratch namespace "
+            f"instead -- `make test-live` sets one."
+        )
+    return namespace
+
+
+def _platform_namespace() -> str:
+    """The namespace `deploy/bootstrap.py` puts the platform in.
+
+    Loaded from the file rather than imported, because `deploy/` is a script directory
+    outside the installed package and is on no import path.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "map_bootstrap_for_pod_runner_tests", _REPO_ROOT / "deploy" / "bootstrap.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    namespace = module.NAMESPACE
+    assert isinstance(namespace, str)
+    return namespace
+
+
+def test_the_live_tier_refuses_to_run_in_the_namespace_it_would_delete() -> None:
+    """The guard fires on the one value an operator is most likely to already have set.
+
+    `map-dev` is what `AWS_PROFILE=map-dev-agent make bootstrap` creates and what every
+    manifest in `deploy/k8s/` names, so it is the value already in a working shell. This
+    asserts the tier refuses it rather than deleting the platform.
+    """
+    with pytest.raises(RuntimeError, match="the namespace the platform runs in"):
+        _a_namespace_this_tier_may_delete({"MAP_NAMESPACE": _platform_namespace()})
+
+
+def test_the_live_tier_accepts_a_scratch_namespace() -> None:
+    """A name that is not the platform's passes through unchanged.
+
+    Paired with the refusal above so the guard cannot be satisfied by rejecting
+    everything, which would read as passing and leave the tier unrunnable.
+    """
+    assert _a_namespace_this_tier_may_delete({"MAP_NAMESPACE": "map-live-tests"}) == (
+        "map-live-tests"
+    )
+
+
+def test_the_namespace_make_test_live_names_is_not_the_platforms() -> None:
+    """The value wired into `make test-live` must survive the guard above.
+
+    The guard and the Makefile are edited in different files by different people, and
+    the failure mode of their disagreeing is that the live tier cannot run at all --
+    which surfaces as a refusal an operator reads as a bug in the guard.
+    """
+    makefile = (_REPO_ROOT / "Makefile").read_text()
+    named = re.findall(r"MAP_NAMESPACE=(\S+)", makefile)
+    assert named, "make test-live must set MAP_NAMESPACE; the live tier requires it"
+    for value in named:
+        assert value != _platform_namespace()
+        assert _a_namespace_this_tier_may_delete({"MAP_NAMESPACE": value}) == value
 
 
 @pytest.fixture(scope="module")
@@ -1865,12 +2277,14 @@ def a_namespace_of_our_own() -> Iterator[str]:
     to agree with pytest-asyncio about which event loop it belongs to and this has no
     reason to care: the API client is built inside each call and outlives nothing.
     """
-    namespace = os.environ["MAP_NAMESPACE"]
+    namespace = _a_namespace_this_tier_may_delete(os.environ)
     asyncio.run(_make_the_namespace_and_its_service(namespace))
+    asyncio.run(_make_the_workspace_volume(namespace))
     try:
         yield namespace
     finally:
         asyncio.run(_drop_the_namespace(namespace))
+        asyncio.run(_drop_the_workspace_volume(namespace))
 
 
 @pytest.fixture
@@ -2079,7 +2493,9 @@ def test_a_manifest_whose_seed_container_declares_no_resume_variable_is_refused(
     manifest = _manifest()
     compiled = _compiled()
     seed = [
-        c for c in manifest["spec"]["initContainers"] if c["name"] == "seed-rollout"
+        c
+        for c in manifest["spec"]["initContainers"]
+        if c["name"] == "seed-runtime-home"
     ][0]
     seed["env"] = [e for e in seed["env"] if e["name"] != "MAP_RESUMING"]
     with pytest.raises(PodNotStarted, match="MAP_RESUMING"):
@@ -2089,7 +2505,8 @@ def test_a_manifest_whose_seed_container_declares_no_resume_variable_is_refused(
 def test_a_manifest_with_no_seed_container_at_all_is_refused() -> None:
     """Removing the container is how the refusal above would be routed around.
 
-    Without this, a manifest that simply dropped `seed-rollout` would compile cleanly
+    Without this, a manifest that simply dropped the seed container would compile
+    cleanly
     and place a pod that opens a fresh thread for a Session holding a Rollout -- the
     exact outcome the variable above exists to prevent, reached by deleting its reader
     rather than its value.
@@ -2097,12 +2514,109 @@ def test_a_manifest_with_no_seed_container_at_all_is_refused() -> None:
     manifest = _manifest()
     compiled = _compiled()
     manifest["spec"]["initContainers"] = [
-        c for c in manifest["spec"]["initContainers"] if c["name"] != "seed-rollout"
+        c
+        for c in manifest["spec"]["initContainers"]
+        if c["name"] != "seed-runtime-home"
     ]
-    with pytest.raises(PodNotStarted, match="seed-rollout"):
+    with pytest.raises(PodNotStarted, match="seed-runtime-home"):
         _pod_for(manifest, pod_name_for(compiled.session_id), compiled)
 
 
 def _seed_env(pod: dict[str, Any]) -> dict[str, str]:
-    seed = [c for c in pod["spec"]["initContainers"] if c["name"] == "seed-rollout"][0]
+    seed = [
+        c for c in pod["spec"]["initContainers"] if c["name"] == "seed-runtime-home"
+    ][0]
     return {entry["name"]: entry["value"] for entry in seed["env"]}
+
+
+def test_a_pod_is_handed_a_certificate_for_the_name_the_control_plane_will_dial() -> (
+    None
+):
+    """The SAN is built by the same expression that builds the URL, not a copy of it.
+
+    A certificate signed for a name the dialer does not use verifies in no client, and
+    the failure arrives as a handshake error at dispatch time with nothing pointing back
+    at the signing. Asserted against `shim_host` rather than a literal, so the two
+    cannot drift apart without this failing.
+    """
+    ca = InternalCa.from_pem(*_ca_pem())
+    compiled = _compiled()
+    pod_name = pod_name_for(compiled.session_id)
+
+    (secret,) = _secrets_for(
+        pod_name,
+        ("shim-token",),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=ca,
+    )
+
+    issued = x509.load_pem_x509_certificate(secret.string_data["tls.crt"].encode())
+    names = issued.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.DNSName)
+    assert names == [shim_host(pod_name, A_NAMESPACE)]
+
+
+def test_the_pods_trust_bundle_is_the_ca_that_signed_its_certificate() -> None:
+    """All three files land together, and the bundle matches the signer.
+
+    A pod handed a certificate but no bundle cannot verify the control plane, and one
+    handed a bundle from a different CA fails every dial while looking configured. Both
+    halves are written in the same place, so this is where they are checked to agree.
+    """
+    ca = InternalCa.from_pem(*_ca_pem())
+    compiled = _compiled()
+    pod_name = pod_name_for(compiled.session_id)
+
+    (secret,) = _secrets_for(
+        pod_name,
+        ("shim-token",),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=ca,
+    )
+
+    assert set(secret.string_data) == {"token", "tls.crt", "tls.key", "ca.crt"}
+    assert secret.string_data["ca.crt"].encode() == ca.certificate_pem
+    issued = x509.load_pem_x509_certificate(secret.string_data["tls.crt"].encode())
+    assert issued.issuer == ca.certificate.subject
+
+
+def test_without_ca_material_a_pod_gets_exactly_what_it_got_before() -> None:
+    """No CA configured means the token alone, not an empty or placeholder certificate.
+
+    The material arrives by a Secret an operator has to create, so a control plane
+    without one is the state every deployment is in before that happens. What it must
+    not do is mount files that look like a certificate and are not -- a pod would come
+    up serving TLS nothing can verify, which is harder to diagnose than plain HTTP.
+    """
+    compiled = _compiled()
+    pod_name = pod_name_for(compiled.session_id)
+
+    (secret,) = _secrets_for(
+        pod_name,
+        ("shim-token",),
+        compiled,
+        A_KEY,
+        namespace=A_NAMESPACE,
+        internal_ca=None,
+    )
+
+    assert set(secret.string_data) == {"token"}
+
+
+def test_a_ca_certificate_that_does_not_match_its_key_is_refused_at_load() -> None:
+    """Two separately valid halves that do not go together are the realistic mistake.
+
+    A key rotated in the Secret without its certificate leaves both files parseable, and
+    every signature made with the pair verifies against nothing. Refused where the pair
+    is loaded, so the process does not start rather than placing pods that cannot talk.
+    """
+    key_pem, _ = _ca_pem()
+    _, other_certificate_pem = _ca_pem()
+
+    with pytest.raises(ValueError, match="not issued for this private key"):
+        InternalCa.from_pem(key_pem, other_certificate_pem)

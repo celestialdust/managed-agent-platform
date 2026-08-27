@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Collection, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,7 +64,7 @@ from managed_agent.control.webhooks.dispatcher import (
     WebhookDispatcher,
 )
 from managed_agent.core.ids import Seq, SessionId, TenantId, new_session_id
-from managed_agent.core.session.session import SessionState
+from managed_agent.core.vocabulary import lifecycle
 
 _NOW_MS = 1_800_000_000_000
 _A_TICK_S: Final = 0.01
@@ -86,6 +86,7 @@ _CONTROL_PLANE: Final = (
 _THE_WIRED_SWEEPS: Final = (
     ("webhook-delivery", True),
     ("session-pods", False),
+    ("abandoned-turns", False),
 )
 """Every pass the control plane is supposed to run, and whether it takes a lease.
 
@@ -101,6 +102,11 @@ because every verdict there is a function of state both replicas read, a handbac
 an absent pod as success, and the one branch that writes goes through
 `lifecycle._end_and_release`, whose own docstring records the redundant ending event as
 reachable, bounded and accepted.
+
+`False` for the abandoned Turns on the same grounds, plus one this sweep has alone: its
+pod-gone grace is counted in each sweeper's own memory, so a lease would hand the count
+to whichever replica won the tick and restart it whenever the winner changed. A lease
+there would make the sweep slower to act rather than safer.
 """
 
 
@@ -743,7 +749,7 @@ class Owed:
     url: str
     secret_ref: str
     session_id: SessionId
-    state: SessionState
+    event_type: str
     seq: Seq
 
 
@@ -764,13 +770,13 @@ class Ledger:
     have to wait for it.
     """
 
-    owed: dict[tuple[UUID, SessionId, str], Owed] = field(default_factory=dict)
-    attempts: dict[tuple[UUID, SessionId, str], int] = field(default_factory=dict)
-    delivered: dict[tuple[UUID, SessionId, str], int] = field(default_factory=dict)
+    owed: dict[tuple[UUID, SessionId, Seq], Owed] = field(default_factory=dict)
+    attempts: dict[tuple[UUID, SessionId, Seq], int] = field(default_factory=dict)
+    delivered: dict[tuple[UUID, SessionId, Seq], int] = field(default_factory=dict)
     watermark: int = _NOW_MS * 2
 
     def already_claimed(self, row: Owed) -> None:
-        key = (row.webhook_id, row.session_id, row.state.value)
+        key = (row.webhook_id, row.session_id, row.seq)
         self.owed[key] = row
         self.attempts[key] = 1
 
@@ -784,20 +790,20 @@ class Ledger:
         self,
         webhook_id: UUID,
         session_id: SessionId,
-        state: SessionState,
+        event_type: str,
         seq: Seq,
         max_attempts: int,
     ) -> int | None:
-        key = (webhook_id, session_id, state.value)
+        key = (webhook_id, session_id, seq)
         if key in self.delivered or self.attempts.get(key, 0) >= max_attempts:
             return None
         self.attempts[key] = self.attempts.get(key, 0) + 1
         return self.attempts[key]
 
     async def mark_delivered(
-        self, webhook_id: UUID, session_id: SessionId, state: SessionState, status: int
+        self, webhook_id: UUID, session_id: SessionId, seq: Seq, status: int
     ) -> None:
-        key = (webhook_id, session_id, state.value)
+        key = (webhook_id, session_id, seq)
         self.delivered[key] = status
         self.owed.pop(key, None)
 
@@ -818,14 +824,9 @@ class UnreadScan:
     """
 
     async def lifecycle_events_between(
-        self, types: Sequence[str], from_ms: int, to_ms: int
+        self, types: Collection[str], from_ms: int, to_ms: int
     ) -> Sequence[Any]:
         raise AssertionError("the sweep read the tail over a closed window")
-
-    async def read(
-        self, session_id: SessionId, start: Seq, end: Seq, limit: int = 500
-    ) -> Sequence[Any]:
-        raise AssertionError("the sweep folded a Session it had no candidate for")
 
 
 @dataclass(frozen=True, slots=True)
@@ -869,7 +870,7 @@ class UnwatchedRegistrations:
     be able to tell "nothing was owed" from "nothing was found".
     """
 
-    async def watching(self, tenant_id: TenantId, state: SessionState) -> Sequence[Any]:
+    async def watching(self, tenant_id: TenantId, event_type: str) -> Sequence[Any]:
         raise AssertionError("the sweep matched registrations over a closed window")
 
 
@@ -880,7 +881,7 @@ def _an_owed_callback() -> Owed:
         url="https://hooks.example.com/a-tenants-endpoint",
         secret_ref="signing-a",
         session_id=new_session_id(),
-        state=SessionState.STOPPED,
+        event_type=lifecycle.SESSION_STOPPED,
         seq=Seq(7),
     )
 
@@ -893,12 +894,12 @@ async def test_the_fake_ledger_stops_granting_a_claim_once_it_is_delivered() -> 
     """
     ledger = Ledger()
     row = _an_owed_callback()
-    key = (row.webhook_id, row.session_id, row.state.value)
+    key = (row.webhook_id, row.session_id, row.seq)
     ledger.already_claimed(row)
 
-    assert await ledger.claim(*key[:2], row.state, row.seq, 5) == 2
-    await ledger.mark_delivered(row.webhook_id, row.session_id, row.state, 200)
-    assert await ledger.claim(*key[:2], row.state, row.seq, 5) is None
+    assert await ledger.claim(*key[:2], row.event_type, row.seq, 5) == 2
+    await ledger.mark_delivered(row.webhook_id, row.session_id, row.seq, 200)
+    assert await ledger.claim(*key[:2], row.event_type, row.seq, 5) is None
     assert await ledger.undelivered(5, 100) == []
 
 
@@ -932,7 +933,7 @@ async def test_a_running_scheduler_delivers_the_callback_a_tenant_registered_for
         hashlib.sha256,
     ).hexdigest()
     assert posted.headers[SIGNATURE_HEADER] == f"v1={digest}"
-    assert ledger.delivered == {(row.webhook_id, row.session_id, row.state.value): 200}
+    assert ledger.delivered == {(row.webhook_id, row.session_id, row.seq): 200}
 
 
 async def test_a_delivered_callback_is_not_posted_again_on_the_next_tick() -> None:

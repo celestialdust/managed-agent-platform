@@ -39,6 +39,7 @@ from managed_agent.control.api.request.tenancy import TENANT_HEADER
 from managed_agent.control.api.routes.agents_lifecycle import (
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
+    AgentUpdate,
     Cursor,
 )
 from managed_agent.control.catalog.definitions import AgentRecord
@@ -939,3 +940,82 @@ async def test_archiving_another_tenants_agent_refuses_and_retires_nothing(
     assert answered.status_code == STATUS_FOR[ErrorCode.DEFINITION_NOT_FOUND]
     still_live = await harness.stranger.get(f"/v1/agents/{theirs}")
     assert still_live.json()["archived_at"] is None
+
+
+# -- definitions that attach a skill -----------------------------------------
+
+
+def _attaching(skill_id: uuid.UUID, name: str = "reviewer") -> AgentDefinition:
+    """A definition carrying one attached skill.
+
+    Every other definition in this file attaches none, and that is what kept the whole
+    file green while both read routes answered 500 against a real catalogue: `skills` is
+    a `frozenset[SkillAttachment]`, and an empty one serialises without ever hashing an
+    element. One attachment is the smallest input that exercises the set at all.
+    """
+    return AgentDefinition.model_validate(
+        a_definition(name) | {"skills": [{"type": "custom", "skill_id": str(skill_id)}]}
+    )
+
+
+def _tenant_of(client: AsyncClient) -> TenantId:
+    return TenantId(uuid.UUID(client.headers[TENANT_HEADER]))
+
+
+async def test_an_agent_that_attaches_a_skill_reads_back(harness: Harness) -> None:
+    """The single-agent read, seeded past the register route on purpose.
+
+    Registering through the API would resolve the attachment against the skill store,
+    which this harness does not hold -- and the defect is downstream of that anyway. A
+    catalogue reaches this state through the ordinary write path: `POST /v1/agents`
+    accepts the body and Sessions built from it run, so the agent is only unreadable,
+    which stays invisible until somebody reads it back.
+    """
+    attached = uuid.uuid4()
+    minted = DefinitionId(uuid.uuid4())
+    await harness.store.register(
+        minted, _tenant_of(harness.owner), _attaching(attached)
+    )
+
+    read = await harness.owner.get(f"/v1/agents/{minted}")
+
+    assert read.status_code == 200, read.text
+    assert [held["skill_id"] for held in read.json()["skills"]] == [str(attached)]
+
+
+async def test_one_agent_attaching_a_skill_does_not_take_the_listing_down(
+    harness: Harness,
+) -> None:
+    """The listing fails whole rather than per row, which is the part that matters.
+
+    A tenant whose catalogue holds one such agent cannot read any of them -- including
+    the ones that would serialise perfectly on their own.
+    """
+    await harness.create("plain")
+    await harness.store.register(
+        DefinitionId(uuid.uuid4()),
+        _tenant_of(harness.owner),
+        _attaching(uuid.uuid4(), "attaching"),
+    )
+
+    listed = await harness.owner.get("/v1/agents")
+
+    assert listed.status_code == 200, listed.text
+    assert {row["name"] for row in listed.json()["data"]} == {"plain", "attaching"}
+
+
+def test_an_update_that_attaches_a_skill_converts_to_a_definition() -> None:
+    """`AgentUpdate` inherits `skills`, so the write path carries the same set.
+
+    It is a second entrance to one defect: the conversion that drops the concurrency
+    token round-trips the whole body, so a fix that only repaired the read routes would
+    leave every update attaching a skill answering 500.
+    """
+    attached = uuid.uuid4()
+    update = AgentUpdate.model_validate(
+        a_definition() | {"skills": [{"type": "custom", "skill_id": str(attached)}]}
+    )
+
+    converted = update.as_definition()
+
+    assert [held.skill_id for held in converted.skills] == [attached]

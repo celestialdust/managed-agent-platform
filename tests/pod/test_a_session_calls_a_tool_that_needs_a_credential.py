@@ -54,6 +54,7 @@ from cluster_access import NAMESPACE, forwarded, kubectl
 from managed_agent.control.api.request.tenancy import TENANT_HEADER
 from managed_agent.control.session.placement import pod_name_for
 from managed_agent.core.ids import SessionId, TenantId
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.gateway.tool.credential_broker import vault_name
 
 _GATE: Final = "MAP_CLUSTER_TESTS"
@@ -192,7 +193,31 @@ class _Run:
         )
 
 
-def _prompt() -> str:
+def _servers(run: str) -> tuple[str, str, str]:
+    """The three MCP servers this run registers, in live / wrong / unscoped order."""
+    return (f"tavily-live-{run}", f"tavily-wrong-{run}", f"tavily-unscoped-{run}")
+
+
+def _advertised(run: str) -> tuple[str, str, str]:
+    """What the model is shown for each of the three tools, in the same order.
+
+    A tool's identity is the pair `(server, tool)`, and the runtime has one namespace to
+    put it in, so the pair is joined before the model ever sees it. The Grant names that
+    joined form too -- both sides must, or they name different things.
+
+    Joined with the platform's own function rather than an f-string here. A second
+    spelling of the join is a spelling that can agree with a broken one, and the failure
+    it produces says only that the model called a tool that is not available.
+    """
+    live, wrong, unscoped = _servers(run)
+    return (
+        advertised_name_for(live, _LIVE_TOOL),
+        advertised_name_for(wrong, _WRONG_TOOL),
+        advertised_name_for(unscoped, _UNSCOPED_TOOL),
+    )
+
+
+def _prompt(run: str) -> str:
     """Three calls and three marker lines, because each arm is graded separately.
 
     Explicit about not retrying and not substituting, because two of the three arms
@@ -205,14 +230,15 @@ def _prompt() -> str:
     registered against a Scope dimension this Session does not carry -- and it names
     the working key, so a platform that did not clamp would report it OK.
     """
+    live, wrong, unscoped = _advertised(run)
     return (
         "You have three search tools. Call each one exactly once, do not retry any of "
         "them, and do not use one in place of another.\n"
-        f"1. Call {_LIVE_TOOL} with query 'capital city of France' and topic "
+        f"1. Call {live} with query 'capital city of France' and topic "
         "'general'.\n"
-        f"2. Call {_WRONG_TOOL} with query 'capital city of France' and topic "
+        f"2. Call {wrong} with query 'capital city of France' and topic "
         "'general'.\n"
-        f"3. Call {_UNSCOPED_TOOL} with query 'capital city of France' and topic "
+        f"3. Call {unscoped} with query 'capital city of France' and topic "
         "'general'.\n"
         "Then reply with exactly these three lines and nothing after them:\n"
         f"LIVE: <OK followed by one fact from the results, or FAILED followed by the "
@@ -330,11 +356,12 @@ def _register(base: str, tenant_id: str, image: str, run: str) -> tuple[SessionI
         assert live["ref"] == f"{vault['name']}/live", live
         assert wrong["ref"] == f"{vault['name']}/wrong", wrong
 
+        live_server, wrong_server, unscoped_server = _servers(run)
         for registration in (
-            _server(f"tavily-live-{run}", _LIVE_TOOL, live["ref"]),
-            _server(f"tavily-wrong-{run}", _WRONG_TOOL, wrong["ref"]),
+            _server(live_server, _LIVE_TOOL, live["ref"]),
+            _server(wrong_server, _WRONG_TOOL, wrong["ref"]),
             _server(
-                f"tavily-unscoped-{run}",
+                unscoped_server,
                 _UNSCOPED_TOOL,
                 live["ref"],
                 dimension=_DIMENSION_NOBODY_SCOPED,
@@ -363,9 +390,9 @@ def _register(base: str, tenant_id: str, image: str, run: str) -> tuple[SessionI
                     "skills_revision": "0" * 39 + "a",
                     "skills": [],
                     "tool_servers": [
-                        f"tavily-live-{run}",
-                        f"tavily-wrong-{run}",
-                        f"tavily-unscoped-{run}",
+                        live_server,
+                        wrong_server,
+                        unscoped_server,
                     ],
                 },
             )
@@ -376,7 +403,7 @@ def _register(base: str, tenant_id: str, image: str, run: str) -> tuple[SessionI
                 json={
                     "definition_id": definition["id"],
                     "environment_id": environment["id"],
-                    "grant": [_LIVE_TOOL, _WRONG_TOOL, _UNSCOPED_TOOL],
+                    "grant": list(_advertised(run)),
                     "scope": {"topic": _TOPIC_IN_SCOPE},
                     "budget_minor_units": 500_000,
                     "budget_currency": "USD",
@@ -538,7 +565,7 @@ def run() -> Iterator[_Run]:
         session_id, vault = _register(base, tenant_id, image, stamp)
         tenant = TenantId(UUID(tenant_id))
         try:
-            _submit(base, tenant_id, session_id, _prompt())
+            _submit(base, tenant_id, session_id, _prompt(stamp))
             events = _await_terminal(base, tenant_id, session_id)
             yield _Run(
                 session_id=session_id,

@@ -82,16 +82,15 @@ from managed_agent.control.files.store import (
     UploadedFileStorage,
     upload_limit_from_env,
 )
-from managed_agent.control.files.workspace_sync import (
-    SyncWorkingLaneAtTurnCompletion,
-)
 from managed_agent.control.reviewers.token import (
     HmacReviewerTokens,
     NoReviewerKey,
     ReviewerAuthenticator,
 )
+from managed_agent.control.session.abandoned_turns import AbandonedTurnSweeper
 from managed_agent.control.session.lifecycle import NoSessionPods, SessionPodRelease
 from managed_agent.control.session.placement import PlacedPods, Placement, PodRunner
+from managed_agent.control.session.pod_tls import dial_context
 from managed_agent.control.session.pods import FirstTurnPlacement
 from managed_agent.control.session.reaper import SessionPodReaper
 from managed_agent.control.session.threads import (
@@ -99,6 +98,7 @@ from managed_agent.control.session.threads import (
     SessionThreadIndex,
 )
 from managed_agent.control.session.turn_dispatch import NoPodTransport, TurnDispatch
+from managed_agent.control.session.turn_execution import BackgroundTurns
 from managed_agent.control.skills.inventory import (
     NoSkillInventory,
     SkillInventory,
@@ -117,6 +117,7 @@ from managed_agent.core.ports import (
     ToolRegistry,
     VaultCatalogue,
 )
+from managed_agent.core.tls.session_certificate import InternalCa
 from managed_agent.core.vault_catalogue import (
     UnconfiguredCredentialWriter,
     UnconfiguredVaultCatalogue,
@@ -273,6 +274,7 @@ silently adopt as the place every tenant's resume state goes.
 
 _WEBHOOK_SWEEP: Final = "webhook-delivery"
 _SESSION_POD_SWEEP: Final = "session-pods"
+_ABANDONED_TURN_SWEEP: Final = "abandoned-turns"
 """What each periodic pass is called, in a task name and in every log line about it.
 
 Constants because the names are also the advisory-lock keys the lease is taken under, so
@@ -430,6 +432,21 @@ class Platform:
     Narrow on purpose. `Placement` satisfies it by having `release`, and this field's
     type names only that method, so the archive path cannot reach `place` -- which would
     make every end-of-life route a place a Session could be revived by accident.
+    """
+
+    background_turns: BackgroundTurns = field(default_factory=BackgroundTurns)
+    """The tasks carrying Turns that have already been answered with a 202.
+
+    Wiring only, and it holds no collaborators: what a task does arrives as a coroutine
+    the route builds, so this field needs nothing from `build` and can be defaulted
+    without the two dozen callers that construct a `Platform` having to say anything.
+
+    Defaulted to a real one rather than to a refusing double, which is the opposite of
+    the stores above and the difference is the point. A process with no store genuinely
+    cannot serve that surface; a process always can run a Turn it admitted, and a
+    refusing default here would turn every submission into a 500. What the default does
+    risk is a process whose lifespan never calls `aclose`, so `asgi.py` is graded on
+    doing it.
     """
 
     sweeps: tuple[Sweep, ...] = ()
@@ -704,6 +721,16 @@ def build(
         release = placement
         namespace = os.environ.get(_NAMESPACE_ENV, _DEFAULT_NAMESPACE)
         token_key = os.environ["MAP_SHIM_TOKEN_KEY"].encode()
+        # The same CA the pod runner signs pods with, on the dialling side. Read once
+        # here rather than per dialler so the scheme every one of them builds and the
+        # credentials every one of them presents come from a single decision -- two
+        # diallers that disagreed about the scheme would fail half the routes and leave
+        # the other half working, which is the hardest shape of this to diagnose.
+        #
+        # `None` when no CA is configured, which is what keeps a deployment with no
+        # material on plain HTTP exactly as before (ADR-044).
+        internal_ca = internal_ca_from_environment()
+        pod_dial = None if internal_ca is None else dial_context(internal_ca)
         # `.encode()` and `int()` here rather than inside `FirstTurnPlacement`: parse at
         # the boundary and let the type carry the proof inward. An unparseable lifetime
         # raises `ValueError` at start-up naming the variable, which reaches an operator
@@ -718,7 +745,11 @@ def build(
         # would be two byte budgets for one pod's disk.
         attachments = AttachedFiles(
             uploads,
-            PodFilePlacement(placement, namespace, token_key),
+            # `tls=pod_dial` like every other hop to a pod. Left off, this one dialled
+            # `http://` at a listener holding a certificate, which drops the connection
+            # without a TLS alert -- so a Session with an attached file failed
+            # `pod_unreachable` at placement and the error named neither TLS nor files.
+            PodFilePlacement(placement, namespace, token_key, tls=pod_dial),
         )
         session_attachments = attachments
         pods = FirstTurnPlacement(
@@ -747,12 +778,21 @@ def build(
         # ship-out then fails at the AWS call, after the Turn is already appended, where
         # the unset case fails visibly at the seam instead.
         rollouts = (rollout_bucket or os.environ.get(_BUCKET_ENV) or "").strip()
-        on_completed: TurnCompleted = _RolloutNotYetShipped()
+        # Held under its own name, and that is the whole point of the extra binding.
+        # `on_completed` below becomes a COMPOSITE of this seam and the output
+        # ship-out, and the two owe a Turn different things depending on how it ended.
+        # The Rollout is the Session's ability to run again, which a Turn owes whether
+        # it succeeded or failed; the produced files are a claim about output, which a
+        # failed Turn has not made. A caller holding only the composite cannot ask for
+        # one without the other, so it either loses a failed Turn's conversation or
+        # appends `output.produced` for a Turn that produced nothing.
+        rollout_seam: TurnCompleted = _RolloutNotYetShipped()
         if rollouts:
-            on_completed = ShipOutAtTurnCompletion(
-                PodRolloutFetch(placement, namespace, token_key),
+            rollout_seam = ShipOutAtTurnCompletion(
+                PodRolloutFetch(placement, namespace, token_key, tls=pod_dial),
                 RolloutSync(S3RolloutStore(aioboto3.Session(), rollouts)),
             )
+        on_completed: TurnCompleted = rollout_seam
         # The second seam a completed Turn owes: the files the agent wrote. Conditional
         # on the object bucket, because `uploads` is the refusing `NoUploadBucket` store
         # without one -- wired unconditionally, every Turn that produced a file would be
@@ -763,17 +803,20 @@ def build(
         # it, so a failure to ship one document must not also cost the Session its
         # ability to run again.
         if bucket is not None:
-            # The third seam, behind both: the tree the agent was working IN. Last
-            # because a seam that raises stops the ones behind it, and this is the one
-            # whose loss costs least -- the Rollout is the Session's ability to run
-            # again, a produced file is the tenant's document, and this is what would
-            # make a future resume better. It is also the only one of the three that
-            # nothing reads back yet; `control/files/workspace_sync.py` says why.
-            outputs = PodOutputFetch(placement, namespace, token_key)
+            # Two seams, not three. A third used to copy the agent's working tree
+            # out at every completed Turn. The workspace is a mounted volume now, so
+            # there is nothing to copy -- but the seam had to go rather than merely
+            # having nothing to do, because it wrote the same bytes the mount holds
+            # to the same file system through a different door. S3 Files settles a
+            # bucket-versus-file-system conflict in the bucket's favour and moves the
+            # file system's copy to `.s3files-lost+found-<fs-id>`, which sits above
+            # the access point root and is therefore invisible to the pod and to the
+            # browse route both. Left in, it would silently discard the agent's live
+            # workspace. ADR-035.
+            outputs = PodOutputFetch(placement, namespace, token_key, tls=pod_dial)
             on_completed = EachAtTurnCompletion(
                 on_completed,
-                ShipOutOutputsAtTurnCompletion(outputs, artifacts, sessions, log),
-                SyncWorkingLaneAtTurnCompletion(
+                ShipOutOutputsAtTurnCompletion(
                     outputs, artifacts, sessions, log, events
                 ),
             )
@@ -782,8 +825,15 @@ def build(
             pods=pods,
             log=log,
             on_completed=on_completed,
+            # The same object as `on_completed`'s first member, deliberately. A Turn
+            # owes its Rollout however it ended -- that is the Session's ability to
+            # run again -- but only a completed Turn owes the files it produced, and
+            # a failed one declared none. Handing the composite to both would publish
+            # a half-written tree under a name that reads as delivered.
+            on_terminal=rollout_seam,
             namespace=namespace,
             token_key=token_key,
+            tls=pod_dial,
         )
         # The pod sweep, from the same branch as the release above and for the same
         # reason: a process that places no pod has none to reclaim, and a sweep that
@@ -824,6 +874,34 @@ def build(
                     # Session that was being suspended anyway, with no call leaving the
                     # cluster -- where the webhook sweep's duplicate is an HTTP request
                     # a tenant sees.
+                    lease=None,
+                )
+            )
+            # From the same branch as the pod sweep, and it has to be: the pod-gone
+            # signal is a question only a cluster can answer, so a control plane that
+            # places no pods has no way to ask it.
+            sweeps.append(
+                Sweep(
+                    name=_ABANDONED_TURN_SWEEP,
+                    run=AbandonedTurnSweeper(
+                        pods=pod_runner,
+                        scan=events,
+                        events=events,
+                        log=log,
+                        clock=clock,
+                    ).sweep,
+                    # No lease, on the same reasoning as the pod sweep above and one
+                    # more of its own. Every input is state both replicas read, and the
+                    # one branch that writes goes through `lifecycle.close_abandoned_
+                    # turn`, which folds the Turn first and appends nothing to a Turn
+                    # already closed -- so the worst a second replica costs is one extra
+                    # `turn.failed` on a Turn that was ending anyway, which changes no
+                    # fold because `open_turn` matches terminal events by `turn_id`.
+                    #
+                    # A lease would also be actively wrong here rather than merely
+                    # wasteful: the pod-gone grace is counted in each sweeper's own
+                    # memory, so a leased sweep would hand the count to whichever
+                    # replica won the tick and restart it every time the winner changed.
                     lease=None,
                 )
             )
@@ -959,7 +1037,46 @@ def pod_runner_from_environment() -> PodRunner | None:
         Path(manifest),
         namespace=os.environ[_NAMESPACE_ENV],
         token_key=os.environ["MAP_SHIM_TOKEN_KEY"].encode(),
+        internal_ca=internal_ca_from_environment(),
     )
+
+
+_CA_CERTIFICATE_ENV: Final = "MAP_INTERNAL_CA_CERT"
+_CA_KEY_ENV: Final = "MAP_INTERNAL_CA_KEY"
+
+
+def internal_ca_from_environment() -> InternalCa | None:
+    """The CA this process signs Session-pod certificates with, where it has one.
+
+    Both variables absent is not an error. It is the state every deployment is in until
+    an operator creates the CA material, and the platform in that state behaves exactly
+    as it did before this existed -- a pod gets its bearer token and no certificate,
+    and the hops stay plain HTTP inside the namespace.
+
+    **Exactly one present is refused.** That is not a partial configuration to work
+    around, it is somebody halfway through creating the material, and both ways it can
+    happen are silent: a certificate with no key signs nothing, and a key with no
+    certificate signs chains no pod can verify. Refusing here means the process does not
+    start, which is a deploy that fails visibly rather than a fleet of pods that come up
+    and cannot be dialled.
+    """
+    certificate_pem = os.environ.get(_CA_CERTIFICATE_ENV)
+    key_pem = os.environ.get(_CA_KEY_ENV)
+    if certificate_pem is None and key_pem is None:
+        return None
+    if certificate_pem is None or key_pem is None:
+        present, missing = (
+            (_CA_KEY_ENV, _CA_CERTIFICATE_ENV)
+            if certificate_pem is None
+            else (_CA_CERTIFICATE_ENV, _CA_KEY_ENV)
+        )
+        raise RuntimeError(
+            f"{present} is set but {missing} is not, so this process holds half of an "
+            "internal CA. Either half alone produces Session pods that cannot be "
+            f"dialled. Set both, or unset {present} to keep the namespace on plain "
+            "HTTP."
+        )
+    return InternalCa.from_pem(key_pem.encode(), certificate_pem.encode())
 
 
 class _SystemClock:
@@ -1163,7 +1280,6 @@ def tool_gateway_app() -> FastAPI:
     return create_gateway_app(
         sessions,
         os.environ[_SESSION_TOKEN_KEY_ENV].encode(),
-        platform.session_artifacts,
         # Where a resuming pod reads its Session's conversation back from.
         #
         # `os.environ[...]` and NOT `.get` with a default, and a reader tempted to

@@ -30,6 +30,7 @@ from managed_agent.adapters.postgres.tool_registry import PostgresToolRegistry
 from managed_agent.composition import build
 from managed_agent.core.ids import TenantId
 from managed_agent.core.ports import ToolRegistry
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.scope_binding import (
     NameAlreadyRegistered,
     ParameterType,
@@ -39,6 +40,7 @@ from managed_agent.core.registration.scope_binding import (
     StreamableHttpServer,
     UnknownTool,
 )
+from managed_agent.core.registration.tool_names import ServerName, ToolName
 
 _OVER_HTTP: dict[str, object] = {
     "transport": "streamable_http",
@@ -80,6 +82,16 @@ def _registration(
 
 def _tenant() -> TenantId:
     return TenantId(uuid.uuid4())
+
+
+def _advertised(server_name: str, tool_name: str) -> str:
+    """What `lookup` is keyed on: the pair, joined.
+
+    Every call below goes through this rather than through a literal, so a case reads
+    as "the `ask_question` behind `deepwiki`" and not as a string somebody has to parse
+    back into a pair. It is also the one place a change to the join would land.
+    """
+    return advertised_name_for(ServerName(server_name), ToolName(tool_name))
 
 
 @pytest.fixture
@@ -128,7 +140,9 @@ async def test_the_composition_root_wires_a_tool_registry_that_really_writes(
         await platform.tool_registry.register(
             tenant, _registration("deepwiki", ["ask_question"])
         )
-        found = await platform.tool_registry.lookup(tenant, "ask_question")
+        found = await platform.tool_registry.lookup(
+            tenant, _advertised("deepwiki", "ask_question")
+        )
     finally:
         await engine.dispose()
 
@@ -177,8 +191,10 @@ async def test_lookup_returns_the_endpoint_and_bindings_that_were_registered(
         _registration("deepwiki-local", ["read_wiki_contents"], endpoint=_OVER_STDIO),
     )
 
-    over_http = await registry.lookup(tenant, "ask_question")
-    over_stdio = await registry.lookup(tenant, "read_wiki_contents")
+    over_http = await registry.lookup(tenant, _advertised("deepwiki", "ask_question"))
+    over_stdio = await registry.lookup(
+        tenant, _advertised("deepwiki-local", "read_wiki_contents")
+    )
 
     assert over_http.server_name == "deepwiki"
     assert isinstance(over_http.endpoint, StreamableHttpServer)
@@ -223,21 +239,59 @@ async def test_a_tool_keeps_the_remote_name_the_server_behind_it_uses(
         ),
     )
 
-    found = await registry.lookup(tenant, "ask_question")
+    found = await registry.lookup(tenant, _advertised("deepwiki", "ask_question"))
 
     assert found.name == "ask_question"
     assert found.remote_name == "askQuestionV2"
 
 
-async def test_a_second_server_claiming_a_registered_tool_name_is_refused_whole(
+async def test_a_second_server_may_offer_a_tool_name_the_first_already_uses(
     registry: PostgresToolRegistry, engine: AsyncEngine
 ) -> None:
-    """Refused rather than disambiguated, and its server row is not left behind.
+    """The rule this revision changed, asserted from the tenant's side.
 
-    A Grant naming `ask_question` cannot say which server it meant, so a second one
-    offering that name is a collision and not a variant. The count is the important
-    half: a registration that wrote its server row before discovering the collision
-    would leave a server nothing can reach and a name the tenant cannot re-use.
+    Until `0032` the tenant-facing name was the key, so one tenant could hold exactly
+    one `ask_question` however many servers it registered. That is not how tool names
+    are distributed in the world -- `search`, `list_issues` and `get_file` are named the
+    same by everybody -- and with no route that renames or removes a registered tool,
+    the second server's only way forward was a permanent `ask_question_2`.
+
+    A tool is the pair now, so both rows exist and each resolves to its own server. The
+    endpoints are asserted rather than the names, because equal names proving nothing is
+    exactly the failure this replaces: two rows that both resolved to the first server
+    would satisfy any assertion about names.
+    """
+    tenant = _tenant()
+    await registry.register(tenant, _registration("deepwiki", ["ask_question"]))
+
+    await registry.register(
+        tenant,
+        _registration("acme-wiki", ["ask_question"], endpoint=_OVER_STDIO),
+    )
+
+    assert await _server_rows(engine, tenant) == 2
+    theirs = await registry.lookup(tenant, _advertised("deepwiki", "ask_question"))
+    ours = await registry.lookup(tenant, _advertised("acme-wiki", "ask_question"))
+    assert theirs.name == ours.name == "ask_question"
+    assert isinstance(theirs.endpoint, StreamableHttpServer)
+    assert isinstance(ours.endpoint, StdioServer)
+
+
+async def test_a_second_server_of_the_same_name_still_collides_on_every_tool(
+    registry: PostgresToolRegistry, engine: AsyncEngine
+) -> None:
+    """What per-server scoping did *not* loosen, and why it must not.
+
+    The guarantee the Agent Runtime depends on is over the *advertised* name, not the
+    bare one: it appends a SHA1-derived suffix when two names it is handed would
+    sanitize to one, and a Grant written against the original then resolves to nothing.
+    So `deepwiki__ask_question` must still be unique within the tenant. Here the server
+    name is what repeats, which makes every joined name repeat with it.
+
+    Reported as a *server* collision rather than a tool one, and the order of the two
+    checks in `register` is what decides that. Both kinds of name are taken, and "this
+    server is already registered" is the true reading; "this tool name is taken" would
+    send the caller hunting for a second server offering it.
     """
     tenant = _tenant()
     await registry.register(tenant, _registration("deepwiki", ["ask_question"]))
@@ -245,44 +299,48 @@ async def test_a_second_server_claiming_a_registered_tool_name_is_refused_whole(
     with pytest.raises(NameAlreadyRegistered) as refused:
         await registry.register(
             tenant,
-            _registration("acme-wiki", ["ask_question", "read_wiki_contents"]),
+            _registration("deepwiki", ["ask_question", "read_wiki_contents"]),
         )
 
-    assert refused.value.kind == "tool"
-    assert refused.value.names == ("ask_question",)
+    assert refused.value.kind == "server"
+    assert refused.value.names == ("deepwiki",)
     assert await _server_rows(engine, tenant) == 1, (
         "the refused registration left its server row behind"
     )
     with pytest.raises(UnknownTool):
-        await registry.lookup(tenant, "read_wiki_contents")
+        await registry.lookup(tenant, _advertised("deepwiki", "read_wiki_contents"))
 
 
-async def test_every_colliding_tool_name_is_named_and_not_only_the_first(
-    registry: PostgresToolRegistry,
+async def test_two_pairs_that_advertise_one_name_are_refused_by_the_joined_name(
+    registry: PostgresToolRegistry, engine: AsyncEngine
 ) -> None:
-    """Two names taken, both reported -- one round trip rather than three.
+    """The guarantee per-server scoping had to keep, and the refusal that keeps it.
 
-    The store refuses each colliding insert on its own, so an adapter that let the
-    constraint do the reporting would name whichever tool it happened to insert first
-    and stop there. A tenant re-submitting a fixed catalog would then discover the
-    second collision only on the next attempt, and the third on the one after.
+    `ServerName` admits `_`, so the join is not injective by shape: server `a` offering
+    `b__c` and server `a__b` offering `c` both advertise `a__b__c`. Nothing about the
+    patterns prevents that and nothing should -- forbidding `_` in a server name would
+    refuse names tenants legitimately use. What must not happen is both rows existing,
+    because the Agent Runtime would then be handed one name for two tools and its
+    collision suffix would start rewriting names Grants were written against.
+
+    So the second registration is refused, and refused by the *advertised* name. Told
+    `c is already registered`, a tenant that holds no other `c` has been sent looking
+    for something that does not exist; told `a__b__c`, they can see which pair took it.
+
+    The server row is asserted absent as well, because the refusal happens before the
+    server insert and a partial write here would leave a server nothing can reach.
     """
     tenant = _tenant()
-    await registry.register(
-        tenant, _registration("deepwiki", ["ask_question", "read_wiki_contents"])
-    )
+    await registry.register(tenant, _registration("a", ["b__c"]))
 
     with pytest.raises(NameAlreadyRegistered) as refused:
-        await registry.register(
-            tenant,
-            _registration(
-                "acme-wiki",
-                ["read_wiki_contents", "read_wiki_structure", "ask_question"],
-            ),
-        )
+        await registry.register(tenant, _registration("a__b", ["c"]))
 
     assert refused.value.kind == "tool"
-    assert refused.value.names == ("ask_question", "read_wiki_contents")
+    assert refused.value.names == ("a__b__c",)
+    assert await _server_rows(engine, tenant) == 1, (
+        "the refused registration left its server row behind"
+    )
 
 
 async def test_a_repeat_of_an_identical_registration_names_the_server_not_a_tool(
@@ -328,7 +386,7 @@ async def test_re_registering_a_server_name_is_refused_as_a_server_collision(
     assert refused.value.names == ("deepwiki",)
     assert await _server_rows(engine, tenant) == 1
     with pytest.raises(UnknownTool):
-        await registry.lookup(tenant, "ask_question_v2")
+        await registry.lookup(tenant, _advertised("deepwiki", "ask_question_v2"))
 
 
 async def test_one_tenants_registration_is_invisible_to_another(
@@ -349,10 +407,16 @@ async def test_one_tenants_registration_is_invisible_to_another(
         "ask_question"
     ]
     assert isinstance(
-        (await registry.lookup(owner, "ask_question")).endpoint, StreamableHttpServer
+        (
+            await registry.lookup(owner, _advertised("deepwiki", "ask_question"))
+        ).endpoint,
+        StreamableHttpServer,
     )
     assert isinstance(
-        (await registry.lookup(stranger, "ask_question")).endpoint, StdioServer
+        (
+            await registry.lookup(stranger, _advertised("deepwiki", "ask_question"))
+        ).endpoint,
+        StdioServer,
     )
 
 

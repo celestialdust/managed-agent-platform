@@ -60,6 +60,7 @@ from managed_agent.core.pod.permission_profile import (
     nested_deny_pairs,
     path_spelling_error,
 )
+from managed_agent.core.pod.workspace_contract import SCRATCH_ROOT
 from managed_agent.core.registration.definition import AgentDefinition
 from managed_agent.core.registration.environment import Environment
 from managed_agent.core.registration.skill import SkillFile
@@ -910,10 +911,15 @@ def _render_config(
             # to ask, a call needing approval is simply refused.
             #
             # So the per-server override is the only door that does not cost the
-            # sandbox, and it is not a widening: every tool behind this Gateway was
-            # already named by a Grant and clamped to the Session's Scope before the
-            # Gateway would forward it. Approving here re-states a decision the platform
-            # already made one layer out, rather than making a new one.
+            # sandbox, and what it approves is bounded on one axis rather than two.
+            # Every call the Gateway forwards is narrowed to the Session's Scope first,
+            # and a call whose Scope cannot narrow it is refused there rather than made.
+            # The Session's Grant is not the second bound: `call_tool` resolves a tool
+            # against the tenant the Session token names, and nothing under
+            # `gateway/tool/` reads `SessionRecord.grant`, so what this approves is
+            # every tool the *tenant* registered rather than the subset this Session was
+            # granted. Approving here re-states the Scope decision the platform already
+            # made one layer out; it does not stand in for a Grant check nothing makes.
             'default_tools_approval_mode = "approve"',
             "http_headers = { "
             f"{_toml_string(SESSION_TOKEN_HEADER_NAME)} = "
@@ -1067,8 +1073,26 @@ def session_profile() -> PermissionProfile:
     """The filesystem rules every Session's pod runs under.
 
     The parent is `:read-only` rather than `:workspace`, so what is writable is the
-    one prefix named here and not whatever the runtime counts as a workspace root on
+    two prefixes named here and not whatever the runtime counts as a workspace root on
     the day.
+
+    Those two are writable for opposite reasons, and the split is the whole of ADR-037.
+    `WORKSPACE_ROOT` is a network mount whose bytes survive the pod, so it is where a
+    deliverable belongs and every write to it is a round trip. `SCRATCH_ROOT` is an
+    `emptyDir` on the node's own disk that dies with the pod, so it is where a build
+    tree, a package cache or an unpacked archive belongs -- bytes whose defining
+    property is that nobody needs them afterwards. Without this second rule the
+    `:read-only` parent leaves scratch unwritable, and the image's `CARGO_TARGET_DIR`,
+    `npm_config_cache` and the rest would each name a real directory that refuses every
+    write: a tool failing on a path this platform chose, which is worse than a tool
+    writing slowly to the mount.
+
+    Scratch carries no deny rule beneath it and does not need the `mkdir` the workspace
+    dot-paths get from the init container. That pairing is only fatal when the platform
+    ALSO denies a protected basename: the runtime's protected-metadata mask creates a
+    missing `.codex`/`.agents`/`.git` under any writable root as a DIRECTORY, while a
+    deny rule over the same missing path binds an empty FILE, and bwrap dies between
+    the two. With the mask alone there is one operation and no conflict.
 
     The two configuration directories are treated differently, and the difference is
     what each one holds. `$CODEX_HOME` holds the compiled `config.toml`, and that
@@ -1124,6 +1148,7 @@ def session_profile() -> PermissionProfile:
         extends=":read-only",
         rules=(
             FsRule(path=WORKSPACE_ROOT, access=FsAccess.WRITE),
+            FsRule(path=SCRATCH_ROOT, access=FsAccess.WRITE),
             FsRule(path=f"{WORKSPACE_ROOT}/.codex", access=FsAccess.DENY),
             FsRule(path=f"{WORKSPACE_ROOT}/.agents", access=FsAccess.DENY),
             FsRule(path=CONTROL_SOCKET_DIR, access=FsAccess.DENY),

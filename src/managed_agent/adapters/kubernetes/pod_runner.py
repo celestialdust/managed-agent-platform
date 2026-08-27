@@ -70,7 +70,8 @@ from managed_agent.control.session.placement import (
 )
 from managed_agent.core.ids import SessionId
 from managed_agent.core.registration.skill import SkillFile
-from managed_agent.session_shim.pod_channel import shim_token_for
+from managed_agent.core.tls.session_certificate import InternalCa
+from managed_agent.session_shim.pod_channel import shim_host, shim_token_for
 
 _NOT_FOUND: Final = 404
 _ALREADY_EXISTS: Final = 409
@@ -98,18 +99,83 @@ entries -- the flag, then the number -- does not match, and not matching is the 
 answer for a spelling this cannot prove it understands.
 """
 _SESSION_LABEL: Final = "map.session-id"
+
+
+def _session_id(compiled: CompiledConfig) -> str:
+    """This Session's id as the manifest spells it.
+
+    A named function rather than a lambda in one of the tables below because two of them
+    want it, and they want it for the same reason: the directory the pod mounts and the
+    id the shim reports must name one Session. A second spelling would be free to
+    disagree, and the way it disagrees is a shim serving one Session out of another
+    Session's tree.
+    """
+    return str(compiled.session_id)
+
+
+def _tenant_id(compiled: CompiledConfig) -> str:
+    return str(compiled.tenant_id)
+
+
 _SHIM_CONTAINER: Final = "session-shim"
 # What the shim reads out of its environment before it opens the Session's thread, and
 # where each value comes from. Keyed by the variable the manifest declares, so a
 # variable the manifest stops declaring is simply not substituted rather than invented,
 # and one it adds is refused below until this table knows a value for it.
 _SHIM_ENV: Final[Mapping[str, Callable[[CompiledConfig], str]]] = {
-    "MAP_SESSION_ID": lambda compiled: str(compiled.session_id),
+    "MAP_SESSION_ID": _session_id,
     "MAP_MODEL": lambda compiled: compiled.model,
     "MAP_MODEL_PROVIDER": lambda compiled: compiled.model_provider,
 }
 
-_SEED_CONTAINER: Final = "seed-rollout"
+_SUBTREE_VOLUME: Final = "workspace"
+"""The volume whose mounts address one Session's own subtree and nobody else's.
+
+One PersistentVolumeClaim over one S3 Files file system is shared by every Session pod
+on the cluster, so what separates two tenants is the `subPath` on each mount of it
+rather than the volume. `deploy/k8s/session-vfs.yaml` argues that shape; this constant
+is the half of it that has to be enforced in code, because a mount of this volume with
+no subPath maps EVERY tenant's workspace into the pod and reads as a working Session.
+"""
+
+_SUBTREE_ROOT: Final = "MAP_TENANT_ID/MAP_SESSION_ID"
+"""What every `_SUBTREE_VOLUME` mount's `subPath` must begin with, verbatim.
+
+Both tokens, in this order, and checked as a prefix rather than merely substituted
+wherever they happen to appear. Substitution alone would fill in a `subPath` of
+`MAP_SESSION_ID` and produce a real, working, single-segment path under the volume root
+-- a Session's tree living beside every tenant's rather than inside its own, with
+nothing failing. The prefix is the isolation, so the prefix is what is asserted.
+"""
+
+_PATH_TOKENS: Final[Mapping[str, Callable[[CompiledConfig], str]]] = {
+    "MAP_TENANT_ID": _tenant_id,
+    "MAP_SESSION_ID": _session_id,
+}
+"""The placeholders a `subPath` in the manifest carries, and what each resolves to.
+
+Spelled like the shim's environment variables on purpose -- one vocabulary for "the
+manifest says this, the adapter fills it in" -- but a separate table, because these are
+templated into a PATH and those are set in an ENVIRONMENT, and the two are refused for
+different reasons when they go missing.
+
+Both values are UUIDs rendered by `str`, which is the canonical 36-character hyphenated
+form: no separator, no `.` segment, nothing a path can be traversed with. So this
+composes a subtree rather than accepting one, and there is no id that escapes its own
+directory. That is a property of the id TYPE and it is the reason no sanitising happens
+here -- a `str`-able value that is not a UUID would need this revisited.
+"""
+
+_SEED_CONTAINER: Final = "seed-runtime-home"
+"""The init container that reads `_SEED_ENV`, which is the pod's only init container.
+
+It was `seed-rollout` while the pod had two of them. They were merged to take one serial
+container start off every placement, and the surviving name is the one that describes
+what the container does: both halves of its body write the runtime's home, and putting
+the Rollout back is the second and conditional one. `deploy/k8s/session-pod.yaml` says
+what that merge cost.
+"""
+
 # What the init container that seeds a restored Rollout reads, on the same terms as the
 # shim's table above: keyed by the variable the manifest declares, and refused below
 # when the manifest declares fewer than this knows values for.
@@ -152,17 +218,18 @@ _SECRET_FILES: Final[Mapping[str, str]] = {
 # nothing is wrong with. A further 60 s is the image pull. Polled every second: finer
 # than the 2 s probe period, so no readiness transition is seen more than a second late.
 #
-# The last 120 s is the `restore-working-lane` init container, and it is why this number
-# moved from 180. That container fetches everything the Session's working lane holds
-# before any regular container starts, and the ceiling it fetches under is 2048 objects
-# -- serialized at ~20 ms a round trip that is ~41 s on its own, against a budget the
-# pull and the two probes had already spent. It fetches concurrently for that reason,
-# and this bound is the other half of the same arithmetic: either alone is a coin flip,
-# and an init container that overruns gets its pod deleted by `ensure`'s own cleanup
-# path -- which reads as a Session that would not start rather than as a restore that
-# ran out of time. Raising it costs nothing on the common path, because a pod that is
-# ready answers the poll a second later either way, and `_why_it_will_not_start` still
-# refuses a doomed pod in seconds rather than at the end of this.
+# The remaining 120 s used to be a workspace-restore init container, which fetched the
+# whole of a Session's working tree before any regular container started. That container
+# is gone: the workspace is a mounted volume now and there is nothing to refill
+# (ADR-035). What replaces it is far cheaper -- the CSI mount itself, measured at about
+# 4 s on pod start.
+#
+# The number is deliberately NOT cut back to 180 along with the work it was raised for.
+# Raising this costs nothing on the common path, because a pod that is ready answers the
+# poll a second later either way, and `_why_it_will_not_start` still refuses a doomed
+# pod in seconds rather than at the end of this. What a cut WOULD buy is a tighter
+# refusal on a pod that is merely slow, which is the case worth being generous about.
+# So the headroom stays, now as headroom rather than as a budget with a claimant.
 _READY_TIMEOUT_SECONDS: Final = 300.0
 
 # How long a pod may sit unscheduled before the wait gives up on a node arriving.
@@ -180,6 +247,29 @@ _READY_TIMEOUT_SECONDS: Final = 300.0
 _SCHEDULING_TIMEOUT_SECONDS: Final = 420.0
 
 _POLL_SECONDS: Final = 1.0
+
+# How long to wait for a pod that is on its way out to actually leave the cluster.
+#
+# A pod's name is derived from its Session, so the next pod for that Session cannot be
+# created while the last one's object is still present -- the API server answers 409.
+# ADR-041 leased a pod to one Turn, which put that collision on the ordinary path: every
+# Turn now ends by deleting a pod, and the next Turn of the same Session arrives while
+# the last is still terminating.
+#
+# Sized against the pod's own grace period rather than guessed.
+# `deploy/k8s/session-pod.yaml` sets `terminationGracePeriodSeconds`, kubelet sends
+# SIGKILL when it expires, and the
+# object goes shortly after -- so this has to be that number plus the slack for kubelet
+# to notice and the API server to reap. It is bounded at all because the thing being
+# waited on can simply not happen: a node that stops reporting leaves a pod stamped for
+# deletion and never collected, and a wait with no deadline would hold the tenant's
+# request open for as long as that lasts.
+_TERMINATION_TIMEOUT_SECONDS: Final = 60.0
+
+# Polled faster than `_POLL_SECONDS` because this wait is on the Turn's critical path
+# and the thing it waits for takes seconds, not minutes. A whole second of granularity
+# on a five-second teardown would add an average half-second to every Turn.
+_TERMINATION_POLL_SECONDS: Final = 0.25
 
 # The cluster's failure messages are for a log line, not for a parser, and an image pull
 # error carries a whole containerd trace.
@@ -289,14 +379,15 @@ def _secret_volumes(manifest: Mapping[str, Any]) -> tuple[str, ...]:
 def _pod_for(
     manifest: Mapping[str, Any], pod_name: str, compiled: CompiledConfig
 ) -> dict[str, Any]:
-    """This Session's pod: the repository's manifest with six things substituted.
+    """This Session's pod: the repository's manifest with seven things substituted.
 
-    The six are the pod's name, the Session label that `_claims_this_session` reads
+    The seven are the pod's name, the Session label that `_claims_this_session` reads
     back for both `ensure` and `phase_of`, the image on every container, the Secret name
     behind every secret volume, the skill files this Session projects out of that
-    volume, and the shim's environment entries that `_SHIM_ENV` names. Everything else
-    -- the security contexts, the probes, the deny-rule ordering the init container
-    enforces, the node selector -- is the manifest's and is copied through untouched.
+    volume, the shim's environment entries that `_SHIM_ENV` names, and the `subPath` on
+    every mount of the shared workspace volume. Everything else -- the security
+    contexts, the probes, the deny-rule ordering the init container enforces, the node
+    selector -- is the manifest's and is copied through untouched.
 
     Substituted by container and volume *name* rather than by position, so a manifest
     whose containers are reordered still has the right one rewritten. A missing name is
@@ -360,6 +451,14 @@ def _pod_for(
             "placement"
         ),
     )
+    if not _fill_sub_paths(
+        list(spec.get("initContainers", ())) + list(spec["containers"]), compiled
+    ):
+        raise PodNotStarted(
+            f"the pod manifest mounts {_SUBTREE_VOLUME!r} in no container, so this pod "
+            "would run with no workspace at all -- the agent's first command would "
+            "write to the container's own read-only root"
+        )
     return body
 
 
@@ -406,6 +505,85 @@ def _fill_env(
             f"the pod manifest's {name!r} container declares no {missing} for this "
             f"adapter to substitute, so {unfilled}"
         )
+
+
+def _a_bare_id(value: str, token: str) -> str:
+    """The substituted value, once it is known to be a canonical UUID and nothing else.
+
+    The header above argues that no id can escape its own directory because the ids are
+    UUIDs. That is true of the values this adapter is handed today -- there is one
+    construction site and it reads them off a stored record -- but it is a claim about a
+    TYPE, and `SessionId` is a `NewType`, which is erased before any of this runs. So
+    the isolation between two tenants' trees would rest on a type checker having been
+    run, and on nobody ever adding a second construction site that takes a `str`.
+
+    Parsed rather than pattern-matched, and compared back against its canonical spelling
+    so that the braced and `urn:uuid:` forms `UUID()` also accepts cannot get through:
+    what has to be true is not "parses as a UUID" but "is 36 characters that contain no
+    separator and no `.`". Cheap, and it is the one place worth spending it -- this
+    value becomes the directory a pod mounts.
+    """
+    try:
+        canonical = str(UUID(value))
+    except (AttributeError, TypeError, ValueError) as malformed:
+        raise PodNotStarted(
+            f"the id substituted for {token} in a {_SUBTREE_VOLUME!r} mount is not a "
+            "UUID, and that value names the subtree this pod would mount out of a "
+            f"volume every Session shares ({type(malformed).__name__})"
+        ) from malformed
+    if canonical != value:
+        raise PodNotStarted(
+            f"the id substituted for {token} in a {_SUBTREE_VOLUME!r} mount parses as "
+            "a UUID but is not spelled as one, and only the canonical spelling is "
+            "known to hold no path separator"
+        )
+    return value
+
+
+def _fill_sub_paths(
+    containers: Iterable[Mapping[str, Any]], compiled: CompiledConfig
+) -> int:
+    """Point every shared-volume mount at this Session's own subtree, or refuse.
+
+    Walks every container's `volumeMounts`, and for each one naming `_SUBTREE_VOLUME`
+    replaces the `MAP_TENANT_ID` and `MAP_SESSION_ID` tokens in its `subPath` with this
+    Session's ids. Returns how many mounts were rewritten, so the caller can refuse a
+    manifest in which that number is zero.
+
+    A mount whose `subPath` does not begin with `_SUBTREE_ROOT` is refused rather than
+    left alone, and that asymmetry with `_fill_env` above is deliberate: an environment
+    entry this adapter has no value for is the manifest's own business, while a mount of
+    this volume that does not name a subtree is every tenant's workspace inside one
+    Session's pod. The two failures are not comparable, so they do not get the same
+    default. A missing `subPath` key fails the same way and for the same reason -- the
+    absent case is the volume ROOT, which is the worst of the two.
+
+    Rewritten in place on the deep copy `_pod_for` already made, so the manifest on disk
+    keeps its placeholders and stays a complete description of a Session pod. Matched by
+    volume NAME rather than by mount path, because this volume is mounted four times
+    across three paths -- two containers share one of them, and one path is nested
+    inside another.
+    """
+    filled = 0
+    for container in containers:
+        for mount in container.get("volumeMounts", ()):
+            if mount["name"] != _SUBTREE_VOLUME:
+                continue
+            sub_path = str(mount.get("subPath", ""))
+            if not sub_path.startswith(_SUBTREE_ROOT):
+                raise PodNotStarted(
+                    f"the pod manifest mounts {_SUBTREE_VOLUME!r} at "
+                    f"{mount.get('mountPath')!r} in container "
+                    f"{container['name']!r} with subPath {mount.get('subPath')!r}, "
+                    f"which does not begin with {_SUBTREE_ROOT!r}. That volume is one "
+                    "claim shared by every Session on the cluster, so this pod would "
+                    "mount another tenant's workspace and run"
+                )
+            for token, value in _PATH_TOKENS.items():
+                sub_path = sub_path.replace(token, _a_bare_id(value(compiled), token))
+            mount["subPath"] = sub_path
+            filled += 1
+    return filled
 
 
 # The volume a skill rides in on. Named once because two places have to agree: the
@@ -539,8 +717,51 @@ def _skill_volume_items(compiled: CompiledConfig) -> list[dict[str, str]]:
     ]
 
 
+# The three TLS files a pod mounts beside its bearer token, under the same directory the
+# token already arrives in. Named for what every TLS implementation calls them, because
+# these are read by the shim's server and by whatever the runtime dials with -- neither
+# of which is ours to rename.
+_TLS_FILES: Final[Mapping[str, str]] = {
+    "certificate": "tls.crt",
+    "private_key": "tls.key",
+    "trust_bundle": "ca.crt",
+}
+
+
+def _tls_entries(
+    pod_name: str, namespace: str, internal_ca: InternalCa | None
+) -> dict[str, str]:
+    """The pod's certificate, its key and the CA bundle -- or nothing at all.
+
+    Nothing at all is the state every deployment is in until an operator creates the CA
+    material, and it has to stay indistinguishable from the platform before this
+    existed. The alternative -- writing placeholder files -- produces a pod that comes
+    up serving TLS nothing can verify, which is a worse failure than plain HTTP because
+    it looks configured.
+
+    The name signed for comes from `shim_host`, the same expression the control plane
+    builds its URL with. A certificate whose SAN and whose URL are two separate string
+    literals verifies until one of them moves, and then fails at dispatch as a handshake
+    error with nothing pointing back here.
+    """
+    if internal_ca is None:
+        return {}
+    issued = internal_ca.sign_for(shim_host(pod_name, namespace))
+    return {
+        _TLS_FILES["certificate"]: issued.certificate_pem.decode(),
+        _TLS_FILES["private_key"]: issued.private_key_pem.decode(),
+        _TLS_FILES["trust_bundle"]: internal_ca.certificate_pem.decode(),
+    }
+
+
 def _secrets_for(
-    pod_name: str, volumes: tuple[str, ...], compiled: CompiledConfig, key: bytes
+    pod_name: str,
+    volumes: tuple[str, ...],
+    compiled: CompiledConfig,
+    key: bytes,
+    *,
+    namespace: str,
+    internal_ca: InternalCa | None,
 ) -> tuple[V1Secret, ...]:
     """One Secret per secret volume, holding the file that volume mounts.
 
@@ -552,6 +773,13 @@ def _secrets_for(
     it with, so the two cannot disagree. It is written into its own Secret -- mounted,
     per the manifest, into the shim container alone -- and not beside the compiled
     documents, which the runtime container also mounts.
+
+    The pod's TLS material rides in that same Secret rather than a fourth volume, for
+    the reason the skills ride in `requirements`: the files belong in a directory the
+    pod already mounts, and a second mount inside that path would shadow the file the
+    first one is there to deliver. It is also the right blast radius -- the key that
+    proves a pod's identity sits with the token that proves its Session, in the one
+    volume the runtime container cannot see.
     """
     contents: dict[str, dict[str, str]] = {
         "compiled": {_SECRET_FILES["compiled"]: compiled.config_toml},
@@ -564,7 +792,8 @@ def _secrets_for(
             **{key: file.text for key, file in _skill_secret_entries(compiled)},
         },
         "shim-token": {
-            _SECRET_FILES["shim-token"]: shim_token_for(compiled.session_id, key)
+            _SECRET_FILES["shim-token"]: shim_token_for(compiled.session_id, key),
+            **_tls_entries(pod_name, namespace, internal_ca),
         },
     }
     return tuple(
@@ -905,10 +1134,16 @@ class KubernetesPodRunner:
     namespace: str
     token_key: bytes = field(repr=False)
     manifest: Mapping[str, Any]
+    internal_ca: InternalCa | None = None
 
     @classmethod
     def from_manifest_file(
-        cls, path: Path, *, namespace: str, token_key: bytes
+        cls,
+        path: Path,
+        *,
+        namespace: str,
+        token_key: bytes,
+        internal_ca: InternalCa | None = None,
     ) -> KubernetesPodRunner:
         """Read the Session-pod manifest from disk and build a runner around it.
 
@@ -929,7 +1164,12 @@ class KubernetesPodRunner:
         parsed = yaml.safe_load(path.read_text())
         if not isinstance(parsed, dict):
             raise PodNotStarted(f"{path} does not parse as a Kubernetes manifest")
-        return cls(namespace=namespace, token_key=token_key, manifest=parsed)
+        return cls(
+            namespace=namespace,
+            token_key=token_key,
+            manifest=parsed,
+            internal_ca=internal_ca,
+        )
 
     async def ensure(self, pod_name: str, compiled: CompiledConfig) -> PodPhase:
         """Bring this Session's pod up if it is absent, and report where it got to.
@@ -981,9 +1221,9 @@ class KubernetesPodRunner:
                         f"does not carry this Session's {_SESSION_LABEL} label, so it "
                         "is not this platform's to adopt or to replace"
                     )
-                if _phase_of(existing) is PodPhase.GONE:
-                    return PodPhase.GONE
-                return await self._wait_for_both_halves(core, pod_name)
+                if _phase_of(existing) is not PodPhase.GONE:
+                    return await self._wait_for_both_halves(core, pod_name)
+                await self._make_way_for_the_next_pod(core, pod_name)
             await self._create(core, pod_name, compiled)
             try:
                 return await self._wait_for_both_halves(core, pod_name)
@@ -994,6 +1234,50 @@ class KubernetesPodRunner:
                 # with a story about the cleanup.
                 await self._delete_pod_and_secrets(core, pod_name)
                 raise
+
+    async def _make_way_for_the_next_pod(
+        self, core: client.CoreV1Api, pod_name: str
+    ) -> None:
+        """Clear a pod that is GONE out of the way, and return once its name is free.
+
+        GONE covers the two ways a pod can be finished with while its object is still
+        addressable, and both now belong to the ordinary path rather than to accidents.
+        A pod stamped with a deletion timestamp is one this platform deleted itself when
+        the last Turn released it, and it stays for its grace period while kubelet stops
+        the containers. A pod in Succeeded or Failed is the residue of a Turn whose
+        control plane died: the lease releases in a `finally`, nothing runs after a
+        process is killed, so the pod finished on its own and nobody collected it.
+
+        Both used to be handed straight back to the caller as GONE, which the transport
+        turns into `TurnUndeliverable` and the route into a 502. That was right when a
+        Session held one pod for its whole life -- a stamped pod then meant somebody had
+        deleted it out from under a live Session. Under a per-Turn lease it means the
+        opposite, and refusing failed every second Turn inside a grace window, which is
+        the ordinary interactive case.
+
+        The delete is issued unconditionally because it is idempotent and because the
+        two cases need it differently: the terminating pod has already had one and
+        tolerates a second, while the terminal pod has had none and would otherwise sit
+        at this name until the reaper's sweep came round. It takes the Secrets with it,
+        which is what makes the wait below load-bearing rather than merely tidy -- the
+        next pod's Secrets must not be minted until the old pod is gone, or the garbage
+        collection that follows the old pod out would take them with it, leaving a new
+        pod whose secret volumes have nothing behind them for kubelet to retry for ever.
+
+        Waiting for the object to be absent rather than for a phase, because absent is
+        the only state in which the API server will accept a create at this name.
+        """
+        await self._delete_pod_and_secrets(core, pod_name)
+        deadline = time.monotonic() + _TERMINATION_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            if await self._read(core, pod_name) is None:
+                return
+            await asyncio.sleep(_TERMINATION_POLL_SECONDS)
+        raise PodNotStarted(
+            f"the previous pod {pod_name} was deleted but is still in "
+            f"{self.namespace} after {_TERMINATION_TIMEOUT_SECONDS:.0f}s, so this "
+            "Session's next pod cannot be created at that name"
+        )
 
     async def phase_of(self, pod_name: str) -> PodPhase:
         """Where this Session's pod is, asked of the cluster.
@@ -1224,7 +1508,14 @@ class KubernetesPodRunner:
         secrets to those explicit deletes, which is why both mechanisms are here.
         """
         volumes = _secret_volumes(self.manifest)
-        for secret in _secrets_for(pod_name, volumes, compiled, self.token_key):
+        for secret in _secrets_for(
+            pod_name,
+            volumes,
+            compiled,
+            self.token_key,
+            namespace=self.namespace,
+            internal_ca=self.internal_ca,
+        ):
             try:
                 await core.create_namespaced_secret(
                     namespace=self.namespace, body=secret

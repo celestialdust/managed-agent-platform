@@ -4,10 +4,13 @@ This is the projection that replaces a `manifest.json`. The facts such a file wo
 about one produced thing — its path, the digest taken over its bytes, what it was
 derived from and the digest each source had at the time, and whether it has been
 rewritten since — are all appended to the log by `core/vocabulary/vfs.py`'s two events,
-and this folds them back into one view per object. Nothing writes those facts down a
-second time, so there is no second copy free to disagree with the record, and no state a
-writer can assert into existence that the log does not already support.
+and this folds them back into one view per object. Only one of the two is still
+written; the rewrite event is read here for Sessions that ran while a mutable lane
+existed, and dropping that branch would silently under-report their revisions.
 
+Nothing writes those facts down a second time, so there is no second copy free to
+disagree with the record, and no state a writer can assert into existence that the log
+does not already support.
 The fold is total over event types it does not know: an unrecognised type advances the
 sequence and changes nothing. That is what lets a delivery or approval act become a
 third event type later without this function being edited to stay correct — the same

@@ -41,8 +41,6 @@ from managed_agent.core.ports import EventLogAppend
 from managed_agent.core.vfs.session_vfs import (
     Lane,
     LaneBlobs,
-    MutableFile,
-    MutableLane,
     ObjectAlreadyPresent,
     SealedFile,
     SealedLane,
@@ -53,20 +51,21 @@ from managed_agent.core.vfs.session_vfs import (
     lane_prefix,
 )
 from managed_agent.core.vfs.vfs_provenance import provenance
-from managed_agent.core.vocabulary.vfs import OBJECT_PLACED, OBJECT_REPLACED
+from managed_agent.core.vocabulary.vfs import OBJECT_PLACED
 
 A_TENANT = TenantId(uuid4())
 A_SESSION = SessionId(uuid4())
 
 ARTIFACTS = SealedLane("kept")
-WORKING = MutableLane("scratchpad")
-LANES: tuple[Lane, ...] = (ARTIFACTS, WORKING)
-"""Example lanes, declared here because the platform declares none.
+A_SECOND_LANE = SealedLane("scratchpad")
+LANES: tuple[Lane, ...] = (ARTIFACTS, A_SECOND_LANE)
+"""Example lanes, declared here rather than taken from the platform's own.
 
-The store's behaviour splits exactly two ways -- a conditional write for a sealed lane
-and an unconditional one for a mutable lane -- so two examples exercise every branch
-this adapter has. A third would add a case and no coverage. These names are local
-fixtures and not a platform default; the module deliberately names no lane."""
+Two, because the per-lane cases below grade that a key and a listing are composed from
+the lane they were given -- an adapter that read one segment too high returns the whole
+Session in every lane, and a single-lane case cannot see that. The platform declares one
+lane now (ADR-035 took the other), so parametrizing over `session_vfs.LANES` would
+silently stop grading it. These names are local fixtures and not a platform default."""
 
 
 class _ClientError(Exception):
@@ -211,9 +210,6 @@ class JournallingBlobs:
     async def put_new(self, key: str, body: bytes) -> None:
         self._journal.append("bytes")
 
-    async def put(self, key: str, body: bytes) -> None:
-        self._journal.append("bytes")
-
     async def get(self, key: str) -> bytes | None:
         return None
 
@@ -225,9 +221,6 @@ class RefusingBlobs:
     """A `LaneBlobs` whose writes fail, to prove no event is appended when they do."""
 
     async def put_new(self, key: str, body: bytes) -> None:
-        raise RuntimeError("the bucket refused")
-
-    async def put(self, key: str, body: bytes) -> None:
         raise RuntimeError("the bucket refused")
 
     async def get(self, key: str) -> bytes | None:
@@ -247,8 +240,9 @@ def shipped_blobs() -> LaneBlobs:
     """The real S3 adapter under the port's type.
 
     Annotated as the port rather than as its own class, so `mypy --strict` grades the
-    whole of `S3LaneBlobs` against the interface the store actually drives. That is the
-    only grading its four methods get here beyond the fake; the bucket is never dialled.
+    whole of `S3LaneBlobs` against the interface the store actually drives. That is
+    the only grading its three methods get here beyond the fake; the bucket is never
+    dialled.
     """
     return S3LaneBlobs(aioboto3.Session(), "no-bucket-is-reached-here")
 
@@ -259,16 +253,17 @@ def a_store(fake: FakeS3Session, log: EventLogAppend) -> SessionFiles:
 
 
 def a_file(lane: Lane, relative: str = "a-file.txt") -> VfsFile:
-    if isinstance(lane, MutableLane):
-        return MutableFile(A_TENANT, A_SESSION, lane, relative)
     return SealedFile(A_TENANT, A_SESSION, lane, relative)
 
 
-def test_there_are_lanes_to_grade() -> None:
-    """Guard the guard: the per-lane cases below are parametrized over `LANES`."""
+def test_there_are_distinct_lanes_to_grade() -> None:
+    """Guard the guard: the per-lane cases below are parametrized over `LANES`.
+
+    Distinct, not merely two: two entries spelled the same would satisfy a count while
+    grading nothing about composing a key from the lane it was handed.
+    """
     assert len(LANES) >= 2
-    assert any(isinstance(lane, MutableLane) for lane in LANES)
-    assert any(isinstance(lane, SealedLane) for lane in LANES)
+    assert len({lane.directory for lane in LANES}) == len(LANES)
 
 
 @pytest.mark.parametrize("lane", LANES, ids=lambda lane: lane.directory)
@@ -319,21 +314,6 @@ async def test_place_sends_the_condition_that_makes_the_refusal_the_stores(
     assert fake.puts == [{"Key": a_file(lane).key, "IfNoneMatch": "*"}]
 
 
-async def test_replace_overwrites_and_sends_no_condition() -> None:
-    """The mutable lane's write is unconditional; that is what makes it the mutable
-    lane."""
-    fake = FakeS3Session()
-    store = a_store(fake, RecordingLog())
-    file = MutableFile(A_TENANT, A_SESSION, WORKING, "draft.md")
-    await store.place(file, b"first")
-
-    stored = await store.replace(file, b"second")
-
-    assert fake.objects[file.key] == b"second"
-    assert stored.key == file.key
-    assert fake.puts[-1] == {"Key": file.key, "IfNoneMatch": None}
-
-
 async def test_the_bytes_are_written_before_the_event_that_claims_they_exist() -> None:
     journal: list[str] = []
     store = SessionVfsStore(JournallingBlobs(journal), RecordingLog(journal))
@@ -341,15 +321,6 @@ async def test_the_bytes_are_written_before_the_event_that_claims_they_exist() -
     await store.place(a_file(ARTIFACTS), b"the report")
 
     assert journal == ["bytes", f"event:{OBJECT_PLACED}"]
-
-
-async def test_a_replace_orders_its_two_writes_the_same_way() -> None:
-    journal: list[str] = []
-    store = SessionVfsStore(JournallingBlobs(journal), RecordingLog(journal))
-
-    await store.replace(MutableFile(A_TENANT, A_SESSION, WORKING, "d.md"), b"x")
-
-    assert journal == ["bytes", f"event:{OBJECT_REPLACED}"]
 
 
 async def test_a_write_that_never_landed_appends_no_event() -> None:
@@ -438,9 +409,9 @@ async def test_a_listing_longer_than_one_page_returns_every_object() -> None:
     fake = FakeS3Session(page_size=2)
     store = a_store(fake, RecordingLog())
     for n in range(5):
-        await store.place(a_file(WORKING, f"file-{n}.txt"), b"x")
+        await store.place(a_file(A_SECOND_LANE, f"file-{n}.txt"), b"x")
 
-    entries = await store.list_lane(A_TENANT, A_SESSION, WORKING)
+    entries = await store.list_lane(A_TENANT, A_SESSION, A_SECOND_LANE)
 
     assert sorted(entry.relative for entry in entries) == [
         f"file-{n}.txt" for n in range(5)
@@ -450,11 +421,11 @@ async def test_a_listing_longer_than_one_page_returns_every_object() -> None:
 async def test_a_zero_byte_object_naming_the_prefix_itself_is_not_an_entry() -> None:
     """Some tools write one to make a prefix look like a directory."""
     fake = FakeS3Session()
-    prefix = lane_prefix(A_TENANT, A_SESSION, WORKING)
+    prefix = lane_prefix(A_TENANT, A_SESSION, A_SECOND_LANE)
     fake.objects[prefix] = b""
     store = a_store(fake, RecordingLog())
 
-    assert await store.list_lane(A_TENANT, A_SESSION, WORKING) == []
+    assert await store.list_lane(A_TENANT, A_SESSION, A_SECOND_LANE) == []
 
 
 @pytest.mark.parametrize("code", sorted(_ALREADY_THERE))
@@ -480,7 +451,7 @@ async def test_a_service_error_that_is_not_about_the_key_is_not_swallowed() -> N
         await blobs.put_new("sessions/t/s/evidence/a.txt", b"x")
 
 
-_UNCONFIGURED_CALLS: tuple[str, ...] = ("place", "replace", "read", "list_lane")
+_UNCONFIGURED_CALLS: tuple[str, ...] = ("place", "read", "list_lane")
 """Every method of the refusing default, so each is graded rather than the first.
 
 Each one encodes the same decision -- that an unwired VFS refuses instead of answering
@@ -492,12 +463,11 @@ Session with no durable store look like one that produced nothing.
 @pytest.mark.parametrize("call", _UNCONFIGURED_CALLS)
 async def test_the_unconfigured_vfs_refuses_every_call(call: str) -> None:
     vfs: SessionFiles = UnconfiguredSessionVfs()
-    file = MutableFile(A_TENANT, A_SESSION, WORKING, "a.txt")
+    file = SealedFile(A_TENANT, A_SESSION, A_SECOND_LANE, "a.txt")
     attempts: dict[str, Callable[[], Awaitable[object]]] = {
         "place": lambda: vfs.place(file, b"x"),
-        "replace": lambda: vfs.replace(file, b"x"),
         "read": lambda: vfs.read(file),
-        "list_lane": lambda: vfs.list_lane(A_TENANT, A_SESSION, WORKING),
+        "list_lane": lambda: vfs.list_lane(A_TENANT, A_SESSION, A_SECOND_LANE),
     }
 
     with pytest.raises(VfsUnconfigured):
@@ -506,13 +476,10 @@ async def test_the_unconfigured_vfs_refuses_every_call(call: str) -> None:
 
 def test_the_unconfigured_default_covers_every_method_of_the_port() -> None:
     """The list above is complete against the port, not against what was remembered."""
-    declared = {name for name in vars(SessionFiles) if not name.startswith("_")} - {
-        "place",
-        "replace",
-        "read",
-        "list_lane",
-    }
-    assert declared == set(), f"{declared} is on the port and ungraded above"
+    declared = {name for name in vars(SessionFiles) if not name.startswith("_")}
+    assert declared == set(_UNCONFIGURED_CALLS), (
+        f"{declared ^ set(_UNCONFIGURED_CALLS)} is on one side and not the other"
+    )
 
 
 def test_the_shipped_adapter_satisfies_the_port() -> None:

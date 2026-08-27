@@ -27,7 +27,6 @@ import yaml
 from starlette.routing import Route
 
 from managed_agent import composition
-from managed_agent.adapters.s3.session_vfs import UnconfiguredSessionVfs
 from managed_agent.core.ids import SessionId
 from managed_agent.gateway.tool.mcp_proxy import ToolEventTypes
 from managed_agent.gateway.tool.server import (
@@ -162,9 +161,7 @@ def test_both_probes_name_a_path_the_app_actually_serves_without_a_token() -> No
     """
     served = {
         route.path
-        for route in create_gateway_app(
-            _no_sessions(), b"unused", UnconfiguredSessionVfs(), _NoRollouts()
-        ).routes
+        for route in create_gateway_app(_no_sessions(), b"unused", _NoRollouts()).routes
         if isinstance(route, Route)
         and not isinstance(route.endpoint, SessionTokenMiddleware)
     }

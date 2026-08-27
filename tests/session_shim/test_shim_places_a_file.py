@@ -114,20 +114,27 @@ async def test_a_second_file_does_not_disturb_the_first(
     ]
 
 
-async def test_a_re_placed_file_is_replaced_rather_than_appended_to(
+async def test_a_re_placed_file_leaves_what_is_already_there_alone(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The second body, not the two concatenated and not a refusal.
+    """The first body, not the second, not the two concatenated, and not a refusal.
 
-    A placement has to be idempotent: a Turn that retried its placement must not leave
-    the agent reading a document twice over, and must not fail because the name is
-    already there. What makes it so is the rename -- `Path.replace` overwrites an
-    existing target rather than raising, and the scratch file is fresh each time because
-    the previous one was renamed away.
+    A placement has to be idempotent -- a repeated one must not leave the agent reading
+    a document twice over and must not fail because the name is already there -- and
+    both halves of that still hold. What changed on 2026-08-26 is which bytes win, and
+    the second write is now the one that does nothing.
 
-    Measured, so the claim is the right size: opening the scratch file `ab` instead of
-    `wb` does NOT break this, because there is no scratch file left to append to. The
-    open mode is therefore not what this grades; the rename's overwrite is.
+    Until then the rename overwrote, which was harmless while a placement happened once
+    per Session. ADR-041 leases a pod for one Turn, so every Turn is a placement and
+    every placement re-pushes the Session's whole attachment set; ADR-035 puts the
+    workspace on a volume that outlives the pod. Together those made this route
+    overwrite, at the start of every Turn, a file the agent had spent the previous Turn
+    editing -- silently, with the Turn reporting success.
+
+    Different bytes on the second call, because identical ones could not tell the two
+    behaviours apart. Production never sends different bytes under one name: a
+    re-delivery is the same stored object, and a genuinely new document under a name the
+    workspace holds is refused upstream at `control/api/routes/resources.py`.
     """
     session_id = new_session_id()
     app = _app(monkeypatch, tmp_path / "files", session_id)
@@ -139,7 +146,38 @@ async def test_a_re_placed_file_is_replaced_rather_than_appended_to(
                 headers=_bearer(session_id),
             )
             assert answer.status_code == 204
-    assert (tmp_path / "files" / "brief.md").read_bytes() == b"second"
+    assert (tmp_path / "files" / "brief.md").read_bytes() == b"first"
+
+
+async def test_what_the_agent_wrote_into_an_attached_file_survives_the_next_placement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The defect the case above is the mechanism of, stated as the agent would meet it.
+
+    Turn one places the document and the agent edits it. Turn two is a fresh pod on the
+    same durable workspace, and its placement re-pushes the same attachment. The agent's
+    work has to still be there -- it is the Session's output, the tenant paid for it,
+    and nothing in the platform records that it was ever taken away.
+    """
+    session_id = new_session_id()
+    files = tmp_path / "files"
+    app = _app(monkeypatch, files, session_id)
+    async with _client(app) as client:
+        await client.put(
+            _path_for(session_id, "brief.md"),
+            content=b"# Brief\n",
+            headers=_bearer(session_id),
+        )
+        (files / "brief.md").write_bytes(
+            b"# Brief\n\n## Findings\n\nThe agent's work.\n"
+        )
+        answer = await client.put(
+            _path_for(session_id, "brief.md"),
+            content=b"# Brief\n",
+            headers=_bearer(session_id),
+        )
+    assert answer.status_code == 204
+    assert b"The agent's work." in (files / "brief.md").read_bytes()
 
 
 async def test_no_scratch_file_is_left_behind(

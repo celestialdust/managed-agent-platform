@@ -60,14 +60,21 @@ MANIFEST: Final[Path] = (
 )
 CONTAINERS: Final[tuple[str, ...]] = (
     "seed-runtime-home",
-    "restore-working-lane",
-    "seed-rollout",
     "agent-runtime",
     "session-shim",
 )
 DISCARDED_WITH_THE_POD: Final[frozenset[str]] = frozenset(
-    {"codex-home", "control", "workspace", "scratch"}
+    {"agent-scratch", "codex-home", "control", "scratch"}
 )
+KEPT_BEYOND_THE_POD: Final[frozenset[str]] = frozenset({"workspace"})
+"""The volumes backed by storage that outlives this pod, which is exactly one.
+
+Its own set rather than a line in the one above, because the two are graded for
+opposite reasons. A volume in that set must hold nothing durable, since it goes away
+with the pod. A volume in THIS one is the durable copy of a tenant's tree, so what
+matters about it is the reverse -- that a pod reaches only its own Session's subtree of
+it, which is the `subPath` on every mount and not a property of the volume.
+"""
 PLATFORM_DOCUMENTS: Final[frozenset[str]] = frozenset(
     {"compiled", "requirements", "shim-token"}
 )
@@ -236,7 +243,7 @@ def test_the_manifest_is_the_real_pod() -> None:
     assert _POD["kind"] == "Pod"
     assert [c["name"] for c in _every_container()] == list(CONTAINERS)
     assert {v["name"] for v in _POD["spec"]["volumes"]} == (
-        DISCARDED_WITH_THE_POD | PLATFORM_DOCUMENTS
+        DISCARDED_WITH_THE_POD | KEPT_BEYOND_THE_POD | PLATFORM_DOCUMENTS
     )
 
 
@@ -365,9 +372,17 @@ def test_the_secret_volumes_are_a_closed_set_of_platform_documents() -> None:
     """The other route a credential could take in. Each of these three is written by
     the control plane for this Session; a fourth would be something else.
 
-    The `emptyDir` half is the durability question read off the same artifact: a volume
-    backed by nothing outside the pod goes away with it, so nothing durable lives only
-    inside -- and a claim on persistent storage would appear here as a third backing.
+    The other two halves are the durability question read off the same artifact. An
+    `emptyDir` is backed by nothing outside the pod and goes away with it; a
+    `persistentVolumeClaim` is the opposite and is what makes a Session's workspace
+    survive its pod (ADR-035). Both are enumerated by name because the interesting
+    failure is a volume moving between them: a workspace that quietly became an
+    `emptyDir` again would lose a tenant's tree at every pod death, and an `emptyDir`
+    that quietly became a claim would put scratch on the hot path and bill it.
+
+    A backing this file does not name at all -- `hostPath`, a projected token -- fails
+    here rather than being skipped, which is the whole reason this compares whole sets
+    rather than checking each volume it knows about.
     """
     by_backing: dict[str, set[str]] = {}
     for volume in _POD["spec"]["volumes"]:
@@ -376,6 +391,7 @@ def test_the_secret_volumes_are_a_closed_set_of_platform_documents() -> None:
 
     assert by_backing == {
         "emptyDir": set(DISCARDED_WITH_THE_POD),
+        "persistentVolumeClaim": set(KEPT_BEYOND_THE_POD),
         "secret": set(PLATFORM_DOCUMENTS),
     }
 

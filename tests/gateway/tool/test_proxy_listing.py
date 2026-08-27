@@ -46,6 +46,7 @@ from tool_gateway_harness import (
 )
 
 from managed_agent.core.ids import SessionId, TenantId
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.scope_binding import (
     ParameterType,
     RegisteredTool,
@@ -150,9 +151,20 @@ async def _decline(params: ElicitRequestParams) -> ElicitResult:
     return ElicitResult(action="decline")
 
 
+def _advertised(server: str, name: str) -> str:
+    """The name a tool is offered under: the pair, joined.
+
+    Every case here asserts through this rather than through a literal, because the join
+    is the contract under test -- a literal would keep passing if the separator changed
+    under it, and the model would start being shown a name no Grant matches.
+    """
+    return advertised_name_for(server, name)
+
+
 def _tool(name: str, server: str, remote: str | None = None) -> RegisteredTool:
     return RegisteredTool(
         name=name,
+        advertised_name=advertised_name_for(server, name),
         remote_name=remote or name,
         parameters={"query": ParameterType.STRING},
         scope_bindings=(ScopeBinding(dimension="account", argument="query"),),
@@ -166,17 +178,39 @@ def _remote(
     description: str = "the server's own words",
     output_schema: dict[str, object] | None = None,
 ) -> Tool:
+    """A tool as the server offers it: one Scope-bound argument and one free one.
+
+    `query` is what every registration in this file binds, so a listing that forwarded
+    the upstream's schema unchanged is visible here rather than only in the module that
+    strips it. Both are declared `required`, which is the entry that has to move with
+    the property it names -- a schema requiring an argument it no longer declares is
+    one no call can satisfy.
+    """
     return Tool(
         name=name,
         description=description,
-        input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "question": {"type": "string"},
+            },
+            "required": ["query", "question"],
+        },
         output_schema=output_schema,
     )
 
 
 def _proxy(registry: ListingRegistry, upstreams: ScriptedUpstreams) -> McpProxy:
+    """A proxy granted every tool the registry holds.
+
+    The Grant is enforced now, so a proxy built without one is offered nothing -- and no
+    case in this module is about the Grant. Granting exactly what the registry was built
+    with keeps each case about listing, and keeps the Grant from silently becoming the
+    thing that made an assertion pass.
+    """
     return McpProxy(
-        scopes=FixedScope(),
+        scopes=FixedScope(*(tool.advertised_name for tool in registry.tools)),
         tenant_id=TENANT,
         session_id=SessionId(uuid4()),
         registry=registry,
@@ -202,7 +236,7 @@ async def test_a_server_that_cannot_be_opened_neither_empties_nor_speaks_in_tool
 
     offered = await _proxy(registry, upstreams).list_tools()
 
-    assert [tool.name for tool in offered] == ["healthy_tool"]
+    assert [tool.name for tool in offered] == [_advertised("up", "healthy_tool")]
     assert LEAKY not in repr(offered)
     assert "internal-host-7.corp" not in repr(offered)
 
@@ -262,7 +296,9 @@ async def test_a_listing_follows_the_cursor_to_the_end() -> None:
 
     offered = await _proxy(registry, upstreams).list_tools()
 
-    assert sorted(tool.name for tool in offered) == ["one", "three", "two"]
+    assert sorted(tool.name for tool in offered) == [
+        _advertised("up", name) for name in ("one", "three", "two")
+    ]
 
 
 async def test_a_server_cursoring_forever_is_stopped_and_said_so(
@@ -279,7 +315,7 @@ async def test_a_server_cursoring_forever_is_stopped_and_said_so(
         offered = await _proxy(registry, upstreams).list_tools()
 
     assert endless.pages_drawn == _MAX_LIST_PAGES
-    assert [tool.name for tool in offered] == ["one"]
+    assert [tool.name for tool in offered] == [_advertised("up", "one")]
     assert "page cap" in caplog.text
 
 
@@ -301,13 +337,16 @@ async def test_a_registered_tool_the_server_no_longer_offers_is_not_advertised(
     assert "renamed_away" in caplog.text
 
 
-async def test_a_tool_is_offered_under_its_registered_name_and_the_servers_schema() -> (
+async def test_a_tool_is_offered_under_its_registered_name_and_the_servers_shape() -> (
     None
 ):
     """The registry decides the name; the server decides the rest of what is offered.
 
-    Bar one exception, which the case below pins: the upstream's output schema is not
-    forwarded.
+    Bar two exceptions, each pinned by a case below: the upstream's output schema is
+    not forwarded, and the Scope-bound argument is not offered at all. What this holds
+    is the majority case they are exceptions to -- the description and the arguments
+    the model really does choose arrive as the server wrote them, so a Gateway that
+    started composing schemas of its own is visible here.
     """
     registry = ListingRegistry([_tool("invoice_lookup", "up", remote="lookup")])
     upstreams = ScriptedUpstreams(
@@ -316,9 +355,62 @@ async def test_a_tool_is_offered_under_its_registered_name_and_the_servers_schem
 
     offered = await _proxy(registry, upstreams).list_tools()
 
-    assert [tool.name for tool in offered] == ["invoice_lookup"]
+    assert [tool.name for tool in offered] == [_advertised("up", "invoice_lookup")]
     assert offered[0].description == "find an invoice"
-    assert offered[0].input_schema == _remote("lookup").input_schema
+    assert offered[0].input_schema["properties"] == {"question": {"type": "string"}}
+    assert offered[0].input_schema["required"] == ["question"]
+
+
+async def test_the_scope_bound_argument_is_not_in_the_schema_the_listing_carries() -> (
+    None
+):
+    """The listing is where the stripping has to happen, and it is not free of it.
+
+    `test_advertised_schema.py` grades the removal itself. This grades the wire: the
+    Gateway proxies the listing, so a removal nothing calls on the way out leaves the
+    bound argument in front of the model on every tool the tenant registered, and every
+    case in that file stays green while it does. The `required` entry is asserted with
+    it because forwarding half the edit advertises a tool no call can satisfy.
+    """
+    registry = ListingRegistry([_tool("invoice_lookup", "up", remote="lookup")])
+    upstreams = ScriptedUpstreams(
+        {"up": FakeSession(tool_pages=[([_remote("lookup")], None)])}
+    )
+
+    offered = await _proxy(registry, upstreams).list_tools()
+
+    assert "query" not in offered[0].input_schema["properties"]
+    assert "query" not in offered[0].input_schema["required"]
+
+
+async def test_a_tool_whose_every_argument_is_bound_is_still_offered() -> None:
+    """Narrowed to nothing the model chooses is still a tool it can call.
+
+    The failure this closes is a listing that decided an emptied schema meant an
+    emptied tool. A tool binding its only argument is the ordinary case for a tenant
+    whose Scope is the whole of what the tool does -- `repo_map` over one repository
+    takes no other input -- and dropping it would hand that Session an empty catalogue
+    while every removal test still passed.
+    """
+    registry = ListingRegistry([_tool("only_bound", "up")])
+    only_query = Tool(
+        name="only_bound",
+        description="takes the bound argument and nothing else",
+        input_schema={
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    )
+    upstreams = ScriptedUpstreams(
+        {"up": FakeSession(tool_pages=[([only_query], None)])}
+    )
+
+    offered = await _proxy(registry, upstreams).list_tools()
+
+    assert [tool.name for tool in offered] == [_advertised("up", "only_bound")]
+    assert offered[0].input_schema["properties"] == {}
+    assert "required" not in offered[0].input_schema
 
 
 async def test_the_upstreams_output_schema_is_not_offered_to_the_runtime() -> None:
@@ -346,7 +438,7 @@ async def test_the_upstreams_output_schema_is_not_offered_to_the_runtime() -> No
     offered = await _proxy(registry, upstreams).list_tools()
 
     assert [tool.output_schema for tool in offered] == [None]
-    assert offered[0].input_schema == _remote("lookup").input_schema
+    assert offered[0].input_schema["properties"] == {"question": {"type": "string"}}
 
 
 async def test_a_uri_matching_a_template_routes_to_that_templates_server() -> None:

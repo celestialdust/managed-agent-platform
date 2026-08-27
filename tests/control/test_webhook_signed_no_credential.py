@@ -1,9 +1,9 @@
-"""What leaves the platform when a Session reaches a state somebody registered for.
+"""What leaves the platform when a Session appends an event somebody registered for.
 
-The Event Log below is a real fold's input: the fake stores rows and the
-dispatcher folds them through `core.projection`, so the state in the delivered
-payload is produced the same way the state on the tenant's own read is, rather
-than asserted into place by the fixture.
+A registration names event types, and the tail hands the dispatcher the event's own
+type, so what a callback says about what happened is what the log said -- not a state
+reconstructed from it. Two events that would fold to one state are two callbacks here,
+which is the whole point of the key beneath them.
 
 The credential fixtures are what make "no credential on the wire" checkable rather than
 merely assertable: the Session's events carry a tool credential and an upstream
@@ -28,7 +28,7 @@ import hashlib
 import hmac
 import json
 import secrets
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID, uuid4
@@ -52,7 +52,6 @@ from managed_agent.control.api.request.tenancy import TENANT_HEADER
 from managed_agent.control.files.store import unconfigured_file_store
 from managed_agent.control.session.turn_dispatch import NoPodTransport
 from managed_agent.control.webhooks.dispatcher import (
-    LIFECYCLE_TYPES,
     MAX_ATTEMPTS,
     MAX_WINDOW_MS,
     SAFETY_LAG_MS,
@@ -67,6 +66,7 @@ from managed_agent.control.webhooks.dispatcher import (
     signed_callback,
 )
 from managed_agent.control.webhooks.registry import (
+    MAX_EVENT_TYPE_LEN,
     CallbackUrl,
     RegisterWebhook,
     WebhookInvalid,
@@ -85,8 +85,8 @@ from managed_agent.core.ids import (
 )
 from managed_agent.core.registration.environment import Environment, EnvironmentId
 from managed_agent.core.session.projection import _TRANSITIONS
-from managed_agent.core.session.session import SessionRecord, SessionState
-from managed_agent.core.vocabulary import lifecycle
+from managed_agent.core.session.session import SessionRecord
+from managed_agent.core.vocabulary import WEBHOOK_ELIGIBLE, lifecycle, turn
 
 TOOL_CREDENTIAL = "tool-cred-" + secrets.token_hex(8)
 UPSTREAM_TOKEN = "sk-upstream-" + secrets.token_hex(8)
@@ -121,22 +121,20 @@ class FakeCandidate:
     tenant_id: TenantId
     session_id: SessionId
     seq: Seq
+    type: str
 
 
 @dataclass
 class FakeLog:
-    """One Event Log per Session, plus the cross-Session tail the dispatcher reads."""
+    """One Event Log per Session, plus the cross-Session tail the dispatcher reads.
+
+    There is no per-Session read on it, because the dispatcher has no reason to make
+    one: the tail carries the event's type and its sequence, which is everything a
+    callback says.
+    """
 
     tenant: TenantId
     rows: dict[SessionId, list[FakeRow]] = field(default_factory=dict)
-    reads: list[tuple[SessionId, int, int, int]] = field(default_factory=list)
-    swept: set[SessionId] = field(default_factory=set)
-    """Sessions the retention sweep emptied after the tail had already named them.
-
-    The real race: the cross-Session tail reads a window, and by the time the fold goes
-    back for that Session's own log there is nothing left in it. Modelled here because
-    it is the only way the fold can be handed a range with no transition in it.
-    """
 
     def append(
         self, session_id: SessionId, type_: str, payload: dict[str, object]
@@ -146,49 +144,26 @@ class FakeLog:
         rows.append(FakeRow(session_id, seq, type_, payload))
         return seq
 
-    async def read(
-        self, session_id: SessionId, start: Seq, end: Seq, limit: int = 500
-    ) -> Sequence[FakeRow]:
-        """Honours `limit`, because the real adapter does and a fake that did not could
-        not fail the way the real one fails."""
-        self.reads.append((session_id, start, end, limit))
-        if session_id in self.swept:
-            return []
-        held = [r for r in self.rows.get(session_id, []) if start <= r.seq <= end]
-        return held[:limit]
-
     async def lifecycle_events_between(
-        self, types: Sequence[str], from_ms: int, to_ms: int
+        self, types: Collection[str], from_ms: int, to_ms: int
     ) -> Sequence[FakeCandidate]:
         # The window is ignored here on purpose: the adapter's half-open behaviour is
         # pinned against a real Postgres below, and mixing time into this fake would let
         # a delivery case fail for a reason that has nothing to do with delivery.
         return [
-            FakeCandidate(self.tenant, row.session_id, row.seq)
+            FakeCandidate(self.tenant, row.session_id, row.seq, row.type)
             for rows in self.rows.values()
             for row in rows
             if row.type in types
         ]
 
 
-@dataclass
-class CappedLog(FakeLog):
-    """A log whose per-Session read defaults to two rows, like an adapter that pages.
+Claim = tuple[UUID, SessionId, Seq]
+"""What identifies one delivery: a registration, a Session, and where in its log.
 
-    The real `PostgresEventLogRange.read` caps at 500 and documents a short result as
-    "page for the rest". A fake that always returned everything it held could not fail
-    the way the real one fails, so a caller taking the default would look correct here
-    and fold one page in production. Two rather than 500 only so the test's log can be
-    three events instead of six hundred.
-    """
-
-    async def read(
-        self, session_id: SessionId, start: Seq, end: Seq, limit: int = 2
-    ) -> Sequence[FakeRow]:
-        return await super().read(session_id, start, end, limit)
-
-
-Claim = tuple[UUID, SessionId, str]
+Not the event's type. A Session is suspended and resumed as often as it likes, so a key
+naming what happened rather than where would put two of those onto one row.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +179,7 @@ class FakePending:
     url: str
     secret_ref: str
     session_id: SessionId
-    state: SessionState
+    event_type: str
     seq: Seq
 
 
@@ -225,9 +200,13 @@ class FakeStore:
     watermark: int = 0
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        return [h for h in self.hooks if h.tenant_id == tenant_id and state in h.states]
+        return [
+            h
+            for h in self.hooks
+            if h.tenant_id == tenant_id and event_type in h.event_types
+        ]
 
     async def scanned_through_ms(self) -> int:
         return self.watermark
@@ -239,11 +218,11 @@ class FakeStore:
         self,
         webhook_id: UUID,
         session_id: SessionId,
-        state: SessionState,
+        event_type: str,
         seq: Seq,
         max_attempts: int,
     ) -> int | None:
-        key: Claim = (webhook_id, session_id, state.value)
+        key: Claim = (webhook_id, session_id, seq)
         if key in self.delivered or self.attempts.get(key, 0) >= max_attempts:
             return None
         self.attempts[key] = self.attempts.get(key, 0) + 1
@@ -254,15 +233,15 @@ class FakeStore:
             hook.url,
             hook.secret_ref,
             session_id,
-            state,
+            event_type,
             seq,
         )
         return self.attempts[key]
 
     async def mark_delivered(
-        self, webhook_id: UUID, session_id: SessionId, state: SessionState, status: int
+        self, webhook_id: UUID, session_id: SessionId, seq: Seq, status: int
     ) -> None:
-        key: Claim = (webhook_id, session_id, state.value)
+        key: Claim = (webhook_id, session_id, seq)
         self.delivered[key] = status
         self.pending.pop(key, None)
 
@@ -299,14 +278,14 @@ class ExplodingVault:
 
 def _hook(
     tenant: TenantId,
-    states: frozenset[SessionState],
+    event_types: frozenset[str],
     url: str = "https://hooks.example.com/map",
 ) -> WebhookRecord:
     return WebhookRecord(
         id=uuid4(),
         tenant_id=tenant,
         url=CallbackUrl(url),
-        states=states,
+        event_types=event_types,
         secret_ref="webhook/1",
         created_at_ms=0,
     )
@@ -321,6 +300,23 @@ def _stopped_session(log: FakeLog) -> SessionId:
         "tool.called",
         {"credential": TOOL_CREDENTIAL, "upstream_token": UPSTREAM_TOKEN},
     )
+    log.append(session_id, lifecycle.SESSION_STOPPED, {})
+    return session_id
+
+
+def _twice_stopped_session(log: FakeLog) -> SessionId:
+    """A Session created once and stopped twice: three events, one Session.
+
+    The two stops are the reachable shape of "one state arrived at twice", and they are
+    reachable rather than contrived: `control/session/lifecycle.py` documents the race
+    that produces them, where two archive callers each fold before either appends and
+    the second stop lands behind the first. Both fold to `STOPPED`, so a delivery keyed
+    on the state a fold named can hold only one of them -- which is what this shape
+    grades, and it grades the key rather than the tail.
+    """
+    session_id = new_session_id()
+    log.append(session_id, lifecycle.SESSION_CREATED, {"definition_id": str(uuid4())})
+    log.append(session_id, lifecycle.SESSION_STOPPED, {})
     log.append(session_id, lifecycle.SESSION_STOPPED, {})
     return session_id
 
@@ -366,26 +362,11 @@ def test_the_fake_log_numbers_each_session_independently_from_one() -> None:
     assert log.append(second, "a", {}) == 1
 
 
-async def test_the_fake_log_reads_the_range_it_is_asked_for_and_honours_the_limit() -> (
-    None
-):
-    log = FakeLog(tenant=TenantId(uuid4()))
-    session_id = new_session_id()
-    for name in ("a", "b", "c"):
-        log.append(session_id, name, {})
-
-    assert [r.seq for r in await log.read(session_id, Seq(1), Seq(2))] == [1, 2]
-    assert [r.seq for r in await log.read(session_id, Seq(1), Seq(3), limit=2)] == [
-        1,
-        2,
-    ]
-
-
 async def test_the_fake_tail_returns_only_the_types_it_is_asked_for() -> None:
     log = FakeLog(tenant=TenantId(uuid4()))
     session_id = _stopped_session(log)
 
-    found = await log.lifecycle_events_between(LIFECYCLE_TYPES, 0, _A_MOMENT)
+    found = await log.lifecycle_events_between(WEBHOOK_ELIGIBLE, 0, _A_MOMENT)
 
     assert [c.seq for c in found] == [1, 3], (
         "the tail returned the tool.called row, so a delivery test could pass for the "
@@ -396,28 +377,50 @@ async def test_the_fake_tail_returns_only_the_types_it_is_asked_for() -> None:
 
 async def test_the_fake_claim_counts_up_and_stops_at_delivered_and_at_the_cap() -> None:
     tenant = TenantId(uuid4())
-    hook = _hook(tenant, frozenset({SessionState.STOPPED}))
+    hook = _hook(tenant, frozenset({lifecycle.SESSION_STOPPED}))
     store = FakeStore(hooks=[hook])
     session_id = new_session_id()
 
     async def take() -> int | None:
         return await store.claim(
-            hook.id, session_id, SessionState.STOPPED, Seq(3), MAX_ATTEMPTS
+            hook.id, session_id, lifecycle.SESSION_STOPPED, Seq(3), MAX_ATTEMPTS
         )
 
     assert await take() == 1
     assert await take() == 2
-    await store.mark_delivered(hook.id, session_id, SessionState.STOPPED, 200)
+    await store.mark_delivered(hook.id, session_id, Seq(3), 200)
     assert await take() is None
 
     spent = FakeStore(hooks=[hook])
     taken = [
         await spent.claim(
-            hook.id, session_id, SessionState.STOPPED, Seq(3), MAX_ATTEMPTS
+            hook.id, session_id, lifecycle.SESSION_STOPPED, Seq(3), MAX_ATTEMPTS
         )
         for _ in range(MAX_ATTEMPTS + 1)
     ]
     assert taken == [*range(1, MAX_ATTEMPTS + 1), None]
+
+
+async def test_the_fake_claim_keys_on_the_sequence_and_not_on_the_type() -> None:
+    """The fake held to the rule the schema holds, before a delivery case leans on it.
+
+    A fake keyed on the type would answer "already claimed" for the second of two
+    events that share one, and every case below that reaches one state twice would go
+    green over a dispatcher that delivers one callback where it owes two.
+    """
+    tenant = TenantId(uuid4())
+    hook = _hook(tenant, frozenset({lifecycle.SESSION_STOPPED}))
+    store = FakeStore(hooks=[hook])
+    session_id = new_session_id()
+
+    first = await store.claim(
+        hook.id, session_id, lifecycle.SESSION_STOPPED, Seq(3), MAX_ATTEMPTS
+    )
+    again = await store.claim(
+        hook.id, session_id, lifecycle.SESSION_STOPPED, Seq(7), MAX_ATTEMPTS
+    )
+
+    assert (first, again) == (1, 1)
 
 
 # --------------------------------------------------------------------------------
@@ -458,7 +461,7 @@ def test_a_destination_this_platform_will_not_call_is_refused(raw: str) -> None:
         parse_callback_url(raw)
 
 
-def test_a_registration_refuses_a_stray_field_no_states_and_no_secret_ref() -> None:
+def test_a_registration_refuses_a_stray_field_no_types_and_no_secret_ref() -> None:
     """`extra="forbid"` is what keeps a field carrying signing material out of the body.
 
     A model that ignored unknown fields would accept `secret` silently, and the tenant
@@ -466,25 +469,50 @@ def test_a_registration_refuses_a_stray_field_no_states_and_no_secret_ref() -> N
     """
     good: dict[str, Any] = {
         "url": "https://hooks.example.com/x",
-        "states": ["stopped"],
+        "event_types": [lifecycle.SESSION_STOPPED],
         "secret_ref": "signing-x",
     }
     parsed = RegisterWebhook.model_validate(good)
-    assert parsed.states == frozenset({SessionState.STOPPED})
+    assert parsed.event_types == frozenset({lifecycle.SESSION_STOPPED})
 
     for broken in (
         {**good, "secret": "hunter2"},
-        {**good, "states": []},
+        {**good, "event_types": []},
         {**good, "secret_ref": ""},
     ):
         with pytest.raises(ValueError):
             RegisterWebhook.model_validate(broken)
 
 
+def test_a_requested_type_longer_than_any_real_one_is_refused_by_the_model() -> None:
+    """The bound the enum used to provide, restored now the field is free strings.
+
+    Every refusal on this route echoes the offending value back, so an unbounded member
+    here would let a tenant choose how many bytes their own refusal costs to build and
+    to log. Refused at the model rather than in `parse_event_types`, because it is a
+    property of the field's shape and holds whether or not the name is eligible.
+    """
+    good: dict[str, Any] = {
+        "url": "https://hooks.example.com/x",
+        "event_types": [lifecycle.SESSION_STOPPED],
+        "secret_ref": "signing-x",
+    }
+
+    assert RegisterWebhook.model_validate(
+        {**good, "event_types": ["e" * MAX_EVENT_TYPE_LEN]}
+    ).event_types == frozenset({"e" * MAX_EVENT_TYPE_LEN}), (
+        "a name at the limit was refused, so the bound is off by one"
+    )
+    with pytest.raises(ValueError):
+        RegisterWebhook.model_validate(
+            {**good, "event_types": ["e" * (MAX_EVENT_TYPE_LEN + 1)]}
+        )
+
+
 def test_a_stored_registration_is_frozen_and_names_no_secret_but_the_reference() -> (
     None
 ):
-    record = _hook(TenantId(uuid4()), frozenset({SessionState.STOPPED}))
+    record = _hook(TenantId(uuid4()), frozenset({lifecycle.SESSION_STOPPED}))
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         record.secret_ref = "other"  # type: ignore[misc]
@@ -500,18 +528,22 @@ def test_a_stored_registration_is_frozen_and_names_no_secret_but_the_reference()
     )
 
 
-def test_the_tenant_visible_read_has_exactly_five_fields_and_sorts_its_states() -> None:
+def test_the_tenant_visible_read_has_five_fields_and_sorts_its_event_types() -> None:
     record = _hook(
-        TenantId(uuid4()), frozenset({SessionState.STOPPED, SessionState.RUNNING})
+        TenantId(uuid4()),
+        frozenset({lifecycle.SESSION_STOPPED, lifecycle.SESSION_CREATED}),
     )
 
     view = WebhookView.of(record)
 
-    assert view.states == (SessionState.RUNNING, SessionState.STOPPED)
+    assert view.event_types == (
+        lifecycle.SESSION_CREATED,
+        lifecycle.SESSION_STOPPED,
+    )
     assert set(WebhookView.model_fields) == {
         "id",
         "url",
-        "states",
+        "event_types",
         "secret_ref",
         "created_at_ms",
     }, "a field able to carry signing material was added to the tenant-visible read"
@@ -526,7 +558,7 @@ def _callback(**overrides: Any) -> Callback:
     base: dict[str, Any] = {
         "webhook_id": uuid4(),
         "session_id": new_session_id(),
-        "state": SessionState.STOPPED,
+        "event_type": lifecycle.SESSION_STOPPED,
         "seq": Seq(3),
         "delivered_at_ms": _A_MOMENT,
     }
@@ -594,7 +626,7 @@ def test_the_callback_has_exactly_five_fields_and_refuses_anything_else() -> Non
     assert set(Callback.model_fields) == {
         "webhook_id",
         "session_id",
-        "state",
+        "event_type",
         "seq",
         "delivered_at_ms",
     }
@@ -609,18 +641,72 @@ def test_the_callback_has_exactly_five_fields_and_refuses_anything_else() -> Non
 # --------------------------------------------------------------------------------
 
 
+# Types with a row in the projection's table that a tenant cannot put a callback on.
+# Listed rather than derived, because each one is a decision somebody has to have taken,
+# and the two halves of this set were decided for opposite reasons.
+#
+# The turn family began moving a Session's state when `RUNNING` came to mean "a Turn is
+# executing", and making those three deliverable would add three types to the published
+# webhook vocabulary -- which needs an API-version story rather than a `webhook=True`
+# nobody discussed. They are candidates that have not been taken up.
+#
+# The two lifecycle types are the other case: they are not waiting on a decision, they
+# are finished. A pod is leased for one Turn, so nothing suspends a Session and nothing
+# resumes one (ADR-041). Their rows here and their declarations stay because the events
+# a tenant's log already holds must keep folding and keep replaying; what a callback for
+# either would buy is a delivery that is never coming.
+#
+# Neither half is silent -- `registry.py` refuses a registration naming an ineligible
+# type and names it in the refusal, which is the cheap half of the trade `declare`
+# describes.
+_STATE_MOVING_BUT_NOT_DELIVERABLE = frozenset(
+    {
+        "turn.submitted",
+        "turn.completed",
+        "turn.failed",
+        "session.suspended",
+        "session.resumed",
+    }
+)
+
+
 def test_every_state_moving_event_type_is_one_the_tail_reads() -> None:
     """The drift guard.
 
-    A type that moves a Session's state but is not in the lifecycle family would never
+    A type that moves a Session's state and is not marked webhook-eligible would never
     be tailed, so the callback for it would simply never be sent -- with no error
     anywhere. Pinned against the projection's own table rather than against a list here,
     which is the only version of this assertion that can notice a new transition.
+
+    It is one direction only, and deliberately: the tail is wider than this table --
+    every eligible type is tailed whether or not it moves a state -- and requiring the
+    two to be equal would refuse a deliverable event that leaves a Session where it was.
+
+    The exception set is the second half of the guard rather than a hole in it. A new
+    state-moving type has to be either deliverable or written down there with a reason,
+    and either way somebody decides; what this refuses is the third option, where a type
+    starts moving the state and nobody notices it cannot be subscribed to.
     """
-    untailed = sorted(set(_TRANSITIONS) - set(LIFECYCLE_TYPES))
+    untailed = sorted(
+        set(_TRANSITIONS) - WEBHOOK_ELIGIBLE - _STATE_MOVING_BUT_NOT_DELIVERABLE
+    )
     assert untailed == [], (
         f"these event types move a Session's state and the webhook tail does not read "
-        f"them: {untailed}. Declare them in the lifecycle family."
+        f"them: {untailed}. Declare them with webhook=True, or record them in "
+        f"_STATE_MOVING_BUT_NOT_DELIVERABLE with the reason."
+    )
+
+
+def test_the_undeliverable_exceptions_are_all_really_state_moving() -> None:
+    """The exception set cannot outlive what it excuses.
+
+    A name left there after its type stopped moving the state -- or one that never did
+    -- would quietly widen the guard's blind spot, so the set is checked against the
+    projection's table in the other direction too.
+    """
+    stale = sorted(_STATE_MOVING_BUT_NOT_DELIVERABLE - set(_TRANSITIONS))
+    assert stale == [], (
+        f"these are excused from a rule they are not subject to: {stale}"
     )
 
 
@@ -633,7 +719,7 @@ async def test_a_stop_posts_one_callback_whose_signature_verifies() -> None:
     tenant = TenantId(uuid4())
     log = FakeLog(tenant=tenant)
     session_id = _stopped_session(log)
-    store = FakeStore(hooks=[_hook(tenant, frozenset({SessionState.STOPPED}))])
+    store = FakeStore(hooks=[_hook(tenant, frozenset({lifecycle.SESSION_STOPPED}))])
     recorder = Recorder(200)
 
     async with recorder.client() as client:
@@ -642,15 +728,14 @@ async def test_a_stop_posts_one_callback_whose_signature_verifies() -> None:
         again = await dispatcher.sweep_once(now_ms=_A_MOMENT + 60_000)
 
     assert len(recorder.sent) == 1, (
-        f"a state reached once produced {len(recorder.sent)} callbacks; the promise is "
-        "exactly one"
+        f"one event produced {len(recorder.sent)} callbacks; the promise is exactly one"
     )
     assert (len(run.delivered), len(again.delivered)) == (1, 0)
 
     request = recorder.sent[0]
     payload = json.loads(request.content)
     assert payload["session_id"] == str(session_id)
-    assert payload["state"] == "stopped"
+    assert payload["event_type"] == lifecycle.SESSION_STOPPED
     assert payload["seq"] == 3
 
     timestamp = request.headers[TIMESTAMP_HEADER]
@@ -672,7 +757,7 @@ async def test_no_credential_reaches_the_wire() -> None:
     tenant = TenantId(uuid4())
     log = FakeLog(tenant=tenant)
     _stopped_session(log)
-    store = FakeStore(hooks=[_hook(tenant, frozenset({SessionState.STOPPED}))])
+    store = FakeStore(hooks=[_hook(tenant, frozenset({lifecycle.SESSION_STOPPED}))])
     recorder = Recorder(200)
 
     async with recorder.client() as client:
@@ -689,21 +774,21 @@ async def test_no_credential_reaches_the_wire() -> None:
     assert set(json.loads(request.content)) == {
         "webhook_id",
         "session_id",
-        "state",
+        "event_type",
         "seq",
         "delivered_at_ms",
     }
     assert request.url.host == "hooks.example.com"
 
 
-async def test_another_state_and_another_tenant_are_both_passed_over() -> None:
+async def test_another_event_type_and_another_tenant_are_both_passed_over() -> None:
     tenant = TenantId(uuid4())
     log = FakeLog(tenant=tenant)
     _stopped_session(log)
     store = FakeStore(
         hooks=[
-            _hook(tenant, frozenset({SessionState.SUSPENDED})),
-            _hook(TenantId(uuid4()), frozenset({SessionState.STOPPED})),
+            _hook(tenant, frozenset({lifecycle.SESSION_SUSPENDED})),
+            _hook(TenantId(uuid4()), frozenset({lifecycle.SESSION_STOPPED})),
         ]
     )
     recorder = Recorder(200)
@@ -715,14 +800,19 @@ async def test_another_state_and_another_tenant_are_both_passed_over() -> None:
     assert run.delivered == ()
 
 
-async def test_two_watched_states_get_one_callback_each_and_no_more() -> None:
-    """The Session passes through RUNNING and then STOPPED. Two states, two callbacks,
-    and the second sweep adds none."""
+async def test_two_watched_event_types_get_one_callback_each_and_no_more() -> None:
+    """The Session is created and then stops. Two events, two callbacks, and the
+    second sweep adds none."""
     tenant = TenantId(uuid4())
     log = FakeLog(tenant=tenant)
     _stopped_session(log)
     store = FakeStore(
-        hooks=[_hook(tenant, frozenset({SessionState.RUNNING, SessionState.STOPPED}))]
+        hooks=[
+            _hook(
+                tenant,
+                frozenset({lifecycle.SESSION_CREATED, lifecycle.SESSION_STOPPED}),
+            )
+        ]
     )
     recorder = Recorder(200)
 
@@ -731,66 +821,60 @@ async def test_two_watched_states_get_one_callback_each_and_no_more() -> None:
         await dispatcher.sweep_once(now_ms=_A_MOMENT)
         await dispatcher.sweep_once(now_ms=_A_MOMENT + 60_000)
 
-    states = [json.loads(r.content)["state"] for r in recorder.sent]
-    assert sorted(states) == ["running", "stopped"]
+    delivered = [json.loads(r.content)["event_type"] for r in recorder.sent]
+    assert sorted(delivered) == [
+        lifecycle.SESSION_CREATED,
+        lifecycle.SESSION_STOPPED,
+    ]
 
 
-async def test_a_session_swept_between_the_tail_and_the_fold_is_skipped() -> None:
-    """The tail named it; the retention sweep emptied it before the fold got there.
+async def test_one_state_reached_twice_is_called_back_for_each_event() -> None:
+    """The reason this slice exists, at the surface a tenant actually sees.
 
-    Nothing true can be said about a Session whose log is gone, so no callback goes out
-    -- and the watermark still advances, because the window really was read and a
-    watermark that stalled here would re-read this window for ever.
+    The Session is created and then stopped twice. Both stops fold to `STOPPED`, so a
+    delivery keyed on the state the platform folded to could hold only one of them: the
+    second would land on the first's row and be answered as a second attempt at a
+    callback already delivered. The tenant would hear about one ending and never about
+    the other, and no counter anywhere would move.
+
+    Keyed on the sequence, the three events are three callbacks, each naming its own
+    sequence -- and a second sweep adds none, so this is not a dispatcher that simply
+    posts on every pass.
+
+    This case used to be built from a create, a suspend and a resume, where the create
+    and the resume were the pair that collided. Nothing suspends or resumes a Session
+    any more (ADR-041), and neither type is deliverable, so the collision is now the one
+    two stops make -- the same defect, reached through the race `_end_and_release`
+    documents rather than through a pod's life.
     """
     tenant = TenantId(uuid4())
     log = FakeLog(tenant=tenant)
-    session_id = _stopped_session(log)
-    log.swept.add(session_id)
+    session_id = _twice_stopped_session(log)
     store = FakeStore(
-        hooks=[_hook(tenant, frozenset({SessionState.STOPPED}))],
-        # Close enough behind that one window reaches the frontier, so the assertion
-        # below is about the skip rather than about MAX_WINDOW_MS.
-        watermark=_A_MOMENT - SAFETY_LAG_MS - 1_000,
+        hooks=[
+            _hook(
+                tenant,
+                frozenset({lifecycle.SESSION_CREATED, lifecycle.SESSION_STOPPED}),
+            )
+        ]
     )
     recorder = Recorder(200)
 
     async with recorder.client() as client:
-        run = await _dispatcher(store, log, client).sweep_once(now_ms=_A_MOMENT)
+        dispatcher = _dispatcher(store, log, client)
+        await dispatcher.sweep_once(now_ms=_A_MOMENT)
+        await dispatcher.sweep_once(now_ms=_A_MOMENT + 60_000)
 
-    assert recorder.sent == []
-    assert store.watermark == _A_MOMENT - SAFETY_LAG_MS
-    assert run.scanned_through_ms == _A_MOMENT - SAFETY_LAG_MS
-
-
-async def test_the_fold_reads_the_whole_log_rather_than_one_default_page() -> None:
-    """The read names a limit wide enough for the range it asks for.
-
-    Taking the adapter's default has shipped twice in this repository: a fold that stops
-    at page one reports the state as of that page, with nothing raising. Driven against
-    a log that really does page, so what is graded is the state that got delivered
-    rather than the argument that was passed.
-
-    The Session here is created (1), calls a tool (2), stops (3). A fold capped at two
-    rows arrives at RUNNING and stays there, and RUNNING was already called back for
-    seq 1 -- so the failure is silent: one callback, naming the wrong state, and no
-    "stopped" callback ever.
-    """
-    tenant = TenantId(uuid4())
-    log = CappedLog(tenant=tenant)
-    _stopped_session(log)
-    store = FakeStore(
-        hooks=[_hook(tenant, frozenset({SessionState.RUNNING, SessionState.STOPPED}))]
+    delivered = [json.loads(r.content) for r in recorder.sent]
+    assert [(body["event_type"], body["seq"]) for body in delivered] == [
+        (lifecycle.SESSION_CREATED, 1),
+        (lifecycle.SESSION_STOPPED, 2),
+        (lifecycle.SESSION_STOPPED, 3),
+    ], (
+        f"the tenant was told about {[b['seq'] for b in delivered]}. A second ending "
+        "is a separate event at a separate sequence and owes a separate callback."
     )
-    recorder = Recorder(200)
-
-    async with recorder.client() as client:
-        await _dispatcher(store, log, client).sweep_once(now_ms=_A_MOMENT)
-
-    delivered = sorted(json.loads(r.content)["state"] for r in recorder.sent)
-    assert delivered == ["running", "stopped"], (
-        f"the callbacks named {delivered}; a fold that stopped at the log's first page "
-        "never reaches the stopped event and reports the state as of that page"
-    )
+    assert {body["session_id"] for body in delivered} == {str(session_id)}
 
 
 async def test_a_window_inside_the_safety_lag_reads_and_moves_nothing() -> None:
@@ -798,7 +882,7 @@ async def test_a_window_inside_the_safety_lag_reads_and_moves_nothing() -> None:
     log = FakeLog(tenant=tenant)
     _stopped_session(log)
     store = FakeStore(
-        hooks=[_hook(tenant, frozenset({SessionState.STOPPED}))],
+        hooks=[_hook(tenant, frozenset({lifecycle.SESSION_STOPPED}))],
         watermark=_A_MOMENT,
     )
     recorder = Recorder(200)
@@ -833,10 +917,10 @@ async def test_a_lost_claim_costs_no_vault_read_and_no_request() -> None:
     tenant = TenantId(uuid4())
     log = FakeLog(tenant=tenant)
     session_id = _stopped_session(log)
-    hook = _hook(tenant, frozenset({SessionState.STOPPED}))
+    hook = _hook(tenant, frozenset({lifecycle.SESSION_STOPPED}))
     store = FakeStore(hooks=[hook])
     # Another dispatcher already delivered this exact callback.
-    store.delivered[(hook.id, session_id, SessionState.STOPPED.value)] = 200
+    store.delivered[(hook.id, session_id, Seq(3))] = 200
     recorder = Recorder(200)
 
     async with recorder.client() as client:
@@ -858,10 +942,14 @@ async def test_an_unreachable_receiver_leaves_its_row_owed_and_the_pass_running(
     store = FakeStore(
         hooks=[
             _hook(
-                tenant, frozenset({SessionState.STOPPED}), "https://down.example.com/x"
+                tenant,
+                frozenset({lifecycle.SESSION_STOPPED}),
+                "https://down.example.com/x",
             ),
             _hook(
-                tenant, frozenset({SessionState.STOPPED}), "https://up.example.com/x"
+                tenant,
+                frozenset({lifecycle.SESSION_STOPPED}),
+                "https://up.example.com/x",
             ),
         ]
     )
@@ -894,7 +982,7 @@ async def test_a_refusing_receiver_is_retried_once_per_pass_and_stops_at_the_cap
     tenant = TenantId(uuid4())
     log = FakeLog(tenant=tenant)
     _stopped_session(log)
-    store = FakeStore(hooks=[_hook(tenant, frozenset({SessionState.STOPPED}))])
+    store = FakeStore(hooks=[_hook(tenant, frozenset({lifecycle.SESSION_STOPPED}))])
     recorder = Recorder(500)
 
     async with recorder.client() as client:
@@ -914,7 +1002,7 @@ async def test_a_receiver_that_answers_late_is_not_posted_to_again() -> None:
     tenant = TenantId(uuid4())
     log = FakeLog(tenant=tenant)
     _stopped_session(log)
-    store = FakeStore(hooks=[_hook(tenant, frozenset({SessionState.STOPPED}))])
+    store = FakeStore(hooks=[_hook(tenant, frozenset({lifecycle.SESSION_STOPPED}))])
     recorder = Recorder(503, 200)
 
     async with recorder.client() as client:
@@ -940,14 +1028,14 @@ class InMemoryWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         record = WebhookRecord(
             id=uuid4(),
             tenant_id=tenant_id,
             url=url,
-            states=states,
+            event_types=event_types,
             secret_ref=secret_ref,
             created_at_ms=len(self.rows),
         )
@@ -968,9 +1056,13 @@ class InMemoryWebhooks:
         return removed
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        return [r for r in self.rows if r.tenant_id == tenant_id and state in r.states]
+        return [
+            r
+            for r in self.rows
+            if r.tenant_id == tenant_id and event_type in r.event_types
+        ]
 
 
 class UnusedPort:
@@ -1012,7 +1104,7 @@ def test_registering_returns_201_and_an_id_the_caller_did_not_send() -> None:
         "/v1/webhooks",
         json={
             "url": "https://hooks.example.com/x",
-            "states": ["stopped"],
+            "event_types": ["session.stopped"],
             "secret_ref": "signing-x",
         },
         headers=_as(tenant),
@@ -1021,7 +1113,7 @@ def test_registering_returns_201_and_an_id_the_caller_did_not_send() -> None:
     assert response.status_code == 201
     view = WebhookView.model_validate(response.json())
     assert view.id == store.rows[0].id
-    assert view.states == (SessionState.STOPPED,)
+    assert view.event_types == (lifecycle.SESSION_STOPPED,)
 
 
 def test_a_plaintext_destination_is_refused_by_code_and_writes_nothing() -> None:
@@ -1031,7 +1123,7 @@ def test_a_plaintext_destination_is_refused_by_code_and_writes_nothing() -> None
         "/v1/webhooks",
         json={
             "url": "http://hooks.example.com/x",
-            "states": ["stopped"],
+            "event_types": ["session.stopped"],
             "secret_ref": "signing-x",
         },
         headers=_as(TenantId(uuid4())),
@@ -1058,7 +1150,7 @@ def test_a_reference_that_is_not_a_vault_name_is_refused_at_registration() -> No
             "/v1/webhooks",
             json={
                 "url": "https://hooks.example.com/x",
-                "states": ["stopped"],
+                "event_types": ["session.stopped"],
                 "secret_ref": ref,
             },
             headers=_as(TenantId(uuid4())),
@@ -1077,7 +1169,7 @@ def test_a_reference_that_is_not_a_vault_name_is_refused_at_registration() -> No
             "/v1/webhooks",
             json={
                 "url": "https://hooks.example.com/x",
-                "states": ["stopped"],
+                "event_types": ["session.stopped"],
                 "secret_ref": "vendor/prod-token.v2",
             },
             headers=_as(TenantId(uuid4())),
@@ -1096,7 +1188,7 @@ def test_a_refused_reference_names_itself_and_not_the_url() -> None:
         "/v1/webhooks",
         json={
             "url": "https://hooks.example.com/x",
-            "states": ["stopped"],
+            "event_types": ["session.stopped"],
             "secret_ref": "vault://x",
         },
         headers=_as(TenantId(uuid4())),
@@ -1107,6 +1199,113 @@ def test_a_refused_reference_names_itself_and_not_the_url() -> None:
     assert "url" not in detail, "the refusal blames the url, which was well-formed"
 
 
+def test_a_registration_naming_an_ineligible_type_is_refused_and_names_it() -> None:
+    """`turn.message_delta` is published, and it is not something to post.
+
+    It arrives once per token. A registration for it would put one delivery row and one
+    outbound request through the ledger per token generated, on the platform's retry
+    budget and at somebody's endpoint -- which is discovered by the receiver rather than
+    by the tenant who asked for it.
+
+    The refusal names the type, because a request carrying several is otherwise a
+    refusal the tenant cannot act on: they are told the registration was rejected and
+    left to work out which of them did it.
+    """
+    store = InMemoryWebhooks()
+
+    response = _client(store).post(
+        "/v1/webhooks",
+        json={
+            "url": "https://hooks.example.com/x",
+            "event_types": [turn.TURN_MESSAGE_DELTA],
+            "secret_ref": "signing-x",
+        },
+        headers=_as(TenantId(uuid4())),
+    )
+
+    assert response.status_code == STATUS_FOR[ErrorCode.REQUEST_INVALID]
+    refusal = PublicErrorEnvelope.model_validate(response.json()).error
+    assert refusal.code is ErrorCode.REQUEST_INVALID
+    assert turn.TURN_MESSAGE_DELTA in json.dumps(refusal.detail), (
+        f"the refusal detail is {refusal.detail} and does not name the type that was "
+        "refused"
+    )
+    assert store.rows == [], "an ineligible type was written to the store"
+
+
+def test_a_registration_naming_a_type_that_does_not_exist_is_refused() -> None:
+    """A misspelling is refused rather than stored and never fired.
+
+    Accepted, it is a registration that matches no event for the life of the
+    platform -- and the tenant's evidence for that is silence, which is
+    indistinguishable from a platform that is not delivering.
+    """
+    store = InMemoryWebhooks()
+
+    response = _client(store).post(
+        "/v1/webhooks",
+        json={
+            "url": "https://hooks.example.com/x",
+            "event_types": ["session.stoped"],
+            "secret_ref": "signing-x",
+        },
+        headers=_as(TenantId(uuid4())),
+    )
+
+    assert response.status_code == STATUS_FOR[ErrorCode.REQUEST_INVALID]
+    assert "session.stoped" in json.dumps(response.json())
+    assert store.rows == []
+
+
+def test_one_bad_type_beside_a_good_one_refuses_the_whole_registration() -> None:
+    """Not a partial registration.
+
+    Storing the eligible half would leave the tenant holding a registration that is not
+    the one they asked for, and no answer anywhere saying so -- so the events they
+    thought they had subscribed to would simply never arrive.
+    """
+    store = InMemoryWebhooks()
+
+    response = _client(store).post(
+        "/v1/webhooks",
+        json={
+            "url": "https://hooks.example.com/x",
+            "event_types": [lifecycle.SESSION_STOPPED, turn.TURN_MESSAGE_DELTA],
+            "secret_ref": "signing-x",
+        },
+        headers=_as(TenantId(uuid4())),
+    )
+
+    assert response.status_code == STATUS_FOR[ErrorCode.REQUEST_INVALID]
+    assert store.rows == []
+
+
+def test_every_eligible_type_is_one_this_route_accepts() -> None:
+    """The other direction, so the check cannot be tightened into refusing everything.
+
+    A gate that refused every type would satisfy all three cases above. This is the one
+    that fails if it does -- and it is driven off the registry rather than a list here,
+    so a family that becomes deliverable is covered without an edit.
+    """
+    for eligible in sorted(WEBHOOK_ELIGIBLE):
+        store = InMemoryWebhooks()
+
+        response = _client(store).post(
+            "/v1/webhooks",
+            json={
+                "url": "https://hooks.example.com/x",
+                "event_types": [eligible],
+                "secret_ref": "signing-x",
+            },
+            headers=_as(TenantId(uuid4())),
+        )
+
+        assert response.status_code == 201, (
+            f"{eligible} is marked webhook-eligible and the route refused it with "
+            f"{response.status_code}"
+        )
+
+
 def test_a_request_with_no_tenant_is_refused_before_the_store_is_reached() -> None:
     store = InMemoryWebhooks()
 
@@ -1114,7 +1313,7 @@ def test_a_request_with_no_tenant_is_refused_before_the_store_is_reached() -> No
         "/v1/webhooks",
         json={
             "url": "https://hooks.example.com/x",
-            "states": ["stopped"],
+            "event_types": ["session.stopped"],
             "secret_ref": "signing-x",
         },
     )
@@ -1129,7 +1328,7 @@ def test_a_list_holds_only_the_calling_tenants_registrations() -> None:
     mine, theirs = TenantId(uuid4()), TenantId(uuid4())
     body = {
         "url": "https://hooks.example.com/x",
-        "states": ["stopped"],
+        "event_types": ["session.stopped"],
         "secret_ref": "signing-x",
     }
     client.post("/v1/webhooks", json=body, headers=_as(mine))
@@ -1148,7 +1347,7 @@ def test_deleting_answers_204_once_and_then_refuses_with_webhook_not_found() -> 
         "/v1/webhooks",
         json={
             "url": "https://hooks.example.com/x",
-            "states": ["stopped"],
+            "event_types": ["session.stopped"],
             "secret_ref": "signing-x",
         },
         headers=_as(tenant),
@@ -1171,7 +1370,7 @@ def test_deleting_another_tenants_registration_refuses_and_leaves_it_readable() 
         "/v1/webhooks",
         json={
             "url": "https://hooks.example.com/x",
-            "states": ["stopped"],
+            "event_types": ["session.stopped"],
             "secret_ref": "signing-x",
         },
         headers=_as(owner),
@@ -1207,24 +1406,26 @@ async def test_the_registration_round_trips_and_is_scoped_to_its_tenant(
     store: PostgresWebhookStore,
 ) -> None:
     mine, theirs = TenantId(uuid4()), TenantId(uuid4())
-    states = frozenset({SessionState.STOPPED, SessionState.SUSPENDED})
+    event_types = frozenset({lifecycle.SESSION_STOPPED, lifecycle.SESSION_SUSPENDED})
 
     written = await store.register(
-        mine, CallbackUrl("https://hooks.example.com/a"), states, "signing-a"
+        mine, CallbackUrl("https://hooks.example.com/a"), event_types, "signing-a"
     )
     await store.register(
-        theirs, CallbackUrl("https://hooks.example.com/b"), states, "signing-b"
+        theirs, CallbackUrl("https://hooks.example.com/b"), event_types, "signing-b"
     )
 
     listed = await store.list_for_tenant(mine)
     assert [r.id for r in listed] == [written.id]
-    assert listed[0].states == states
+    assert listed[0].event_types == event_types
     assert listed[0].created_at_ms > 0
-    assert [r.id for r in await store.watching(mine, SessionState.STOPPED)] == [
+    assert [r.id for r in await store.watching(mine, lifecycle.SESSION_STOPPED)] == [
         written.id
     ]
-    assert await store.watching(mine, SessionState.RUNNING) == []
-    assert await store.watching(theirs, SessionState.STOPPED) != []
+    assert await store.watching(mine, lifecycle.SESSION_CREATED) == [], (
+        "a registration that named neither of these types was returned for one of them"
+    )
+    assert await store.watching(theirs, lifecycle.SESSION_STOPPED) != []
 
 
 async def test_deleting_takes_the_delivery_rows_with_it_and_leaves_another_alone(
@@ -1234,19 +1435,19 @@ async def test_deleting_takes_the_delivery_rows_with_it_and_leaves_another_alone
     doomed = await store.register(
         tenant,
         CallbackUrl("https://hooks.example.com/doomed"),
-        frozenset({SessionState.STOPPED}),
+        frozenset({lifecycle.SESSION_STOPPED}),
         "signing-a",
     )
     spared = await store.register(
         tenant,
         CallbackUrl("https://hooks.example.com/spared"),
-        frozenset({SessionState.STOPPED}),
+        frozenset({lifecycle.SESSION_STOPPED}),
         "signing-b",
     )
     session_id = new_session_id()
     for hook in (doomed, spared):
         await store.claim(
-            hook.id, session_id, SessionState.STOPPED, Seq(3), MAX_ATTEMPTS
+            hook.id, session_id, lifecycle.SESSION_STOPPED, Seq(3), MAX_ATTEMPTS
         )
 
     assert await store.delete(doomed.id, tenant) is True
@@ -1267,28 +1468,29 @@ async def test_deleting_takes_the_delivery_rows_with_it_and_leaves_another_alone
         ] == [spared.id]
 
 
-async def test_the_schema_refuses_no_states_a_plaintext_url_and_a_second_scan_row(
+async def test_the_schema_refuses_no_types_a_plaintext_url_and_a_second_scan_row(
     engine: AsyncEngine,
 ) -> None:
     """Three constraints, each of which would otherwise be a check somebody can skip.
 
-    The empty-array case is the one worth naming: `array_length(states, 1)` returns NULL
-    for an empty array and a CHECK whose expression is NULL passes, so the obvious
+    The empty-array case is the one worth naming: `array_length(event_types, 1)` returns
+    NULL for an empty array and a CHECK whose expression is NULL passes, so the obvious
     spelling admits exactly the row it was written to refuse. This is what proves the
-    constraint on the table is the one that works.
+    constraint on the table is the one that works -- and that it survived being rebuilt
+    under the column's new name.
     """
     async with engine.begin() as conn:
         good = sa.text(
-            "INSERT INTO webhook (id, tenant_id, url, states, secret_ref)"
-            " VALUES (:wid, :tid, :url, :states, 'signing-x')"
+            "INSERT INTO webhook (id, tenant_id, url, event_types, secret_ref)"
+            " VALUES (:wid, :tid, :url, :types, 'signing-x')"
         ).bindparams(
             sa.bindparam("wid", type_=sa.Uuid()),
             sa.bindparam("tid", type_=sa.Uuid()),
-            sa.bindparam("states", type_=sa.ARRAY(sa.Text())),
+            sa.bindparam("types", type_=sa.ARRAY(sa.Text())),
         )
-        for url, states in (
+        for url, event_types in (
             ("https://hooks.example.com/x", []),
-            ("http://hooks.example.com/x", ["stopped"]),
+            ("http://hooks.example.com/x", [lifecycle.SESSION_STOPPED]),
         ):
             with pytest.raises(sa.exc.IntegrityError):
                 async with engine.begin() as attempt:
@@ -1298,7 +1500,7 @@ async def test_the_schema_refuses_no_states_a_plaintext_url_and_a_second_scan_ro
                             "wid": uuid4(),
                             "tid": uuid4(),
                             "url": url,
-                            "states": states,
+                            "types": event_types,
                         },
                     )
 
@@ -1335,14 +1537,14 @@ async def test_the_claim_counts_up_stops_at_delivered_and_stops_at_the_cap(
     hook = await store.register(
         tenant,
         CallbackUrl("https://hooks.example.com/x"),
-        frozenset({SessionState.STOPPED}),
+        frozenset({lifecycle.SESSION_STOPPED}),
         "signing-x",
     )
     session_id = new_session_id()
 
     async def take() -> int | None:
         return await store.claim(
-            hook.id, session_id, SessionState.STOPPED, Seq(3), MAX_ATTEMPTS
+            hook.id, session_id, lifecycle.SESSION_STOPPED, Seq(3), MAX_ATTEMPTS
         )
 
     assert [await take() for _ in range(MAX_ATTEMPTS + 1)] == [
@@ -1352,7 +1554,9 @@ async def test_the_claim_counts_up_stops_at_delivered_and_stops_at_the_cap(
 
     other = new_session_id()
     assert (
-        await store.claim(hook.id, other, SessionState.STOPPED, Seq(3), MAX_ATTEMPTS)
+        await store.claim(
+            hook.id, other, lifecycle.SESSION_STOPPED, Seq(3), MAX_ATTEMPTS
+        )
         == 1
     )
     owed = await store.undelivered(MAX_ATTEMPTS, 100)
@@ -1360,15 +1564,64 @@ async def test_the_claim_counts_up_stops_at_delivered_and_stops_at_the_cap(
         (r.session_id, r.secret_ref, r.url) for r in owed if r.session_id == other
     ] == [(other, "signing-x", "https://hooks.example.com/x")]
 
-    await store.mark_delivered(hook.id, other, SessionState.STOPPED, 200)
+    await store.mark_delivered(hook.id, other, Seq(3), 200)
     assert (
-        await store.claim(hook.id, other, SessionState.STOPPED, Seq(3), MAX_ATTEMPTS)
+        await store.claim(
+            hook.id, other, lifecycle.SESSION_STOPPED, Seq(3), MAX_ATTEMPTS
+        )
         is None
     )
     assert [r.session_id for r in await store.undelivered(MAX_ATTEMPTS, 100)] != [other]
 
 
-async def test_two_dispatchers_claiming_one_state_change_produce_exactly_one_winner(
+async def test_two_events_on_one_session_each_get_their_own_delivery(
+    store: PostgresWebhookStore,
+) -> None:
+    """One Session, three lifecycle events, three deliveries owed, in front of the
+    real database that decides it.
+
+    This is the case the delivery key decides. A Session that is created and then
+    stopped twice appends three events a tenant registered to hear about, and each is a
+    separate thing that happened -- so each is owed a callback of its own. The second
+    stop is the race `control/session/lifecycle.py` documents rather than a shape
+    invented for this test: two archive callers each fold before either appends, and the
+    losing append still lands.
+
+    Keyed on the state a fold named, the third claim was not a new row: both stops
+    arrive at STOPPED, so the third event landed on the row the second one inserted and
+    was answered as a second *attempt* at a callback already delivered -- `[1, 1, 2]`
+    rather than `[1, 1, 1]`. One ending reached the tenant, the other did not, and
+    nothing anywhere recorded a delivery as missing.
+
+    Keyed on the sequence, the three are three rows, because the sequence is what makes
+    two events on one Session distinguishable at all.
+    """
+    tenant = TenantId(uuid4())
+    hook = await store.register(
+        tenant,
+        CallbackUrl("https://hooks.example.com/twice-stopped"),
+        frozenset({lifecycle.SESSION_CREATED, lifecycle.SESSION_STOPPED}),
+        "signing-twice-stopped",
+    )
+    session_id = new_session_id()
+
+    granted = [
+        await store.claim(hook.id, session_id, event_type, Seq(seq), MAX_ATTEMPTS)
+        for event_type, seq in (
+            (lifecycle.SESSION_CREATED, 1),
+            (lifecycle.SESSION_STOPPED, 2),
+            (lifecycle.SESSION_STOPPED, 3),
+        )
+    ]
+
+    assert granted == [1, 1, 1], (
+        f"the three events were granted {granted}. Anything but a first attempt each "
+        "means two events collapsed onto one delivery row, and the later one is "
+        "delivered as a retry of the earlier or not at all."
+    )
+
+
+async def test_two_dispatchers_claiming_one_event_produce_exactly_one_winner(
     store: PostgresWebhookStore,
 ) -> None:
     """The race that decides whether "one callback" is true.
@@ -1380,14 +1633,14 @@ async def test_two_dispatchers_claiming_one_state_change_produce_exactly_one_win
     hook = await store.register(
         tenant,
         CallbackUrl("https://hooks.example.com/x"),
-        frozenset({SessionState.STOPPED}),
+        frozenset({lifecycle.SESSION_STOPPED}),
         "signing-x",
     )
     session_id = new_session_id()
 
     taken = await asyncio.gather(
         *(
-            store.claim(hook.id, session_id, SessionState.STOPPED, Seq(3), 1)
+            store.claim(hook.id, session_id, lifecycle.SESSION_STOPPED, Seq(3), 1)
             for _ in range(10)
         ),
         return_exceptions=True,
@@ -1438,7 +1691,7 @@ async def test_the_tail_returns_each_lifecycle_event_once_with_its_owning_tenant
     low, high = int(edges.lo) - 1, int(edges.hi) + 1
     whole = [
         row
-        for row in await ranges.lifecycle_events_between(LIFECYCLE_TYPES, low, high)
+        for row in await ranges.lifecycle_events_between(WEBHOOK_ELIGIBLE, low, high)
         if row.session_id in mine
     ]
 
@@ -1446,17 +1699,24 @@ async def test_the_tail_returns_each_lifecycle_event_once_with_its_owning_tenant
     assert {row.tenant_id for row in whole} == set(owners)
     for row in whole:
         assert row.seq in (1, 3), "the tool.called row was tailed"
+    assert sorted({row.type for row in whole}) == [
+        lifecycle.SESSION_CREATED,
+        lifecycle.SESSION_STOPPED,
+    ], (
+        "the tail must hand back each event's own type -- it is what a registration is "
+        "matched against, and nothing downstream can recover it"
+    )
 
     # Two consecutive half-open windows over the same span cover it exactly once.
     midpoint = (low + high) // 2
     first = [
         (r.session_id, r.seq)
-        for r in await ranges.lifecycle_events_between(LIFECYCLE_TYPES, low, midpoint)
+        for r in await ranges.lifecycle_events_between(WEBHOOK_ELIGIBLE, low, midpoint)
         if r.session_id in mine
     ]
     second = [
         (r.session_id, r.seq)
-        for r in await ranges.lifecycle_events_between(LIFECYCLE_TYPES, midpoint, high)
+        for r in await ranges.lifecycle_events_between(WEBHOOK_ELIGIBLE, midpoint, high)
         if r.session_id in mine
     ]
     assert sorted(first + second) == sorted((r.session_id, r.seq) for r in whole)
@@ -1499,7 +1759,7 @@ def test_the_adapters_satisfy_the_ports_the_dispatcher_names() -> None:
             "u",
             "r",
             new_session_id(),
-            SessionState.STOPPED,
+            lifecycle.SESSION_STOPPED,
             Seq(1),
         )
     )

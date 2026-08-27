@@ -117,6 +117,17 @@ class FakeCluster:
     pods: dict[str, dict[str, Any]] = field(default_factory=dict)
     secrets: dict[str, dict[str, Any]] = field(default_factory=dict)
     status_of: dict[str, dict[str, Any]] = field(default_factory=dict)
+    lingering: set[str] = field(default_factory=set)
+    created: int = 0
+
+    def finish_deletion(self, name: str) -> None:
+        """Complete a teardown the way kubelet does when the grace period runs out.
+
+        Only meaningful for a pod named in `lingering`; for anything else the delete
+        already removed the object and there is nothing left to finish.
+        """
+        self.pods.pop(name, None)
+        self.status_of.pop(name, None)
 
     async def read_pod(self, request: Request) -> JSONResponse:
         name = request.path_params["name"]
@@ -132,7 +143,14 @@ class FakeCluster:
         name = body["metadata"]["name"]
         if name in self.pods:
             return _status(_CONFLICT, "AlreadyExists", f'pods "{name}" already exists')
-        body["metadata"]["uid"] = f"uid-of-{name}"
+        # A fresh uid per creation, not one derived from the name. A real API server
+        # never reissues one, and uid identity is the whole mechanism behind owner
+        # references: a Secret owned by uid A is collected when uid A goes, and survives
+        # a different object that merely reuses A's name. Deriving it from the name made
+        # a replaced pod indistinguishable from the pod it replaced, which is exactly
+        # the distinction the garbage-collection cases turn on.
+        self.created += 1
+        body["metadata"]["uid"] = f"uid-{self.created}-of-{name}"
         # Stamped for the same reason `uid` is: the API server sets both at admission,
         # so a caller that reads either off a pod it did not create would otherwise be
         # reading a field this fake had silently left out. A test that needs an *old*
@@ -167,10 +185,36 @@ class FakeCluster:
         )
 
     async def delete_pod(self, request: Request) -> JSONResponse:
+        """Delete, in either of the two shapes a real API server answers with.
+
+        A pod with nothing running in it -- Pending, unscheduled, already terminal --
+        really is removed by the time the call returns, and that is the default here.
+        A pod whose containers are up is not: the API server stamps
+        `deletionTimestamp`, answers 200, and the object stays addressable for its whole
+        grace period while kubelet stops the containers. Naming a pod in `lingering`
+        asks for that second shape, and `finish_deletion` is kubelet arriving.
+
+        Both are real, and which one a pod gets depends on its state rather than on a
+        preference -- so a test that needs the lingering shape has to say so. This
+        started out modelling only the first, and the gap cost a live defect: a Turn
+        arriving inside the grace window read the terminating pod as GONE and was
+        refused, which no offline test could reproduce because deletion here had no
+        duration at all.
+        """
         name = request.path_params["name"]
+        if name in self.lingering:
+            pod = self.pods.get(name)
+            if pod is None:
+                return _status(_NOT_FOUND, "NotFound", f'pods "{name}" not found')
+            pod["metadata"].setdefault("deletionTimestamp", rfc3339(0))
+            return JSONResponse(pod)
         pod = self.pods.pop(name, None)
         if pod is None:
             return _status(_NOT_FOUND, "NotFound", f'pods "{name}" not found')
+        # The scripted status goes with the object it describes. It is keyed by name,
+        # and a name is reusable -- so leaving it behind would have a freshly created
+        # pod read back the phase of the pod it replaced, which no real cluster does.
+        self.status_of.pop(name, None)
         return JSONResponse(pod)
 
     async def create_secret(self, request: Request) -> JSONResponse:

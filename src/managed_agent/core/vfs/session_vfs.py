@@ -1,51 +1,55 @@
-"""A Session's durable filesystem: declared lanes, and which of them may be rewritten.
+"""A Session's durable filesystem: the lanes a Turn's output is delivered in.
 
-The pod's workspace is an `emptyDir`. It is created with the pod and destroyed with it,
-so a file the agent produces survives exactly as long as the pod that produced it, and
-nothing crosses a Turn boundary except the Rollout. This module is the other half of the
-split that fixes that: durability lives in the object store, and the pod's filesystem
-becomes a place work happens rather than the place work is kept. Materializing a lane
-into a pod and syncing it back out is transport and is deliberately not here -- what is
-here is the namespace those two ends have to agree on, and the rule about which lane a
-write may land in.
+The pod's workspace is a mounted subtree of a volume every Session shares (ADR-035), so
+the agent's working files are durable where they sit and cross a Turn boundary without
+anything copying them anywhere. This module is for the other thing: what a Turn
+*delivers*. An artifact is not a working file that happened to survive -- it is a byte
+string the platform promised a tenant under a digest the tenant can check later, and
+that promise needs a store which can refuse to overwrite. A filesystem cannot be that
+store; its whole contract is that the last writer wins.
+
+So what is here is the namespace the delivery path agrees on, and the rule that a
+delivered object is written once. Getting bytes out of the pod is transport and is
+deliberately not here.
 
 **Which lanes a developer's own code organises into is that developer's decision,
 not this module's.** A platform that shipped a fixed taxonomy would hand a product
 opinion to every engineer building on it, and the one who needed a fifth lane, or three,
 or different words for the same four, would work around the platform rather than with
-it. So the mechanism comes first: two lane *kinds*, and a name refused unless it could
-be one directory. A caller declares the set it wants and which of them are sealed.
+it. So the mechanism comes first: a lane is a name refused unless it could be one
+directory, and a caller declares the set it wants.
 
-**Two lanes are named here anyway, because the platform itself writes them.**
-`ARTIFACTS` holds what a Turn produced and `WORKING` holds the agent's workspace between
-Turns -- both written by control-plane code in this tree, on every Session, whether or
-not any developer ever declares a lane of their own. A name a platform writes has to be
-one constant: the ship-out that places into it, the sync that materializes it back, and
-the route that serves it are three modules that must agree, and three string literals
-agree only until one is edited. These are the platform's two, not a ceiling on anyone
-else's.
+**One lane is named here anyway, because the platform itself writes it.** `ARTIFACTS`
+holds what a Turn produced, written by control-plane code in this tree on every Session,
+whether or not any developer ever declares a lane of their own. A name the platform
+writes has to be one constant: the ship-out that places into it and the route that
+serves it are two modules that must agree, and two string literals agree only until one
+is edited. That is the platform's one, not a ceiling on anyone else's.
 
-That is also why the kinds are two types rather than one enum with a flag: an enum
-would have to enumerate, and enumerating is the part that belongs upstairs.
+**There is one lane kind, and every lane is sealed.** There was a second -- a mutable
+kind, carrying the agent's workspace between Turns, with a `replace` that accepted files
+in it and nothing else. That lane is gone: the workspace is a mounted volume now and
+nothing copies it across a boundary (ADR-035), which left the mutable kind with no
+caller. Keeping it for one that does not exist would leave a way to make an object here
+rewritable sitting next to the promise that objects here are not, and the next writer to
+reach for it would be reaching past a guarantee rather than around a limitation.
 
-**Why the type split.** An agent that can overwrite its own evidence can "correct" the
+**Why sealed at all.** An agent that can overwrite its own evidence can "correct" the
 raw record it is supposed to be judged against, and an artifact whose bytes can be
 swapped after the fact makes every recorded digest a claim about bytes that may no
 longer exist. Both are silent: the write succeeds, the file looks right, and only an
 auditor rehashing an object finds the discrepancy. A boolean on a lane, or a string
 compared at each call site, would put that guarantee in every caller's hands -- and the
-one caller that forgets is the one that matters. So `replace` accepts `MutableFile` and
-nothing else, and a `MutableFile` cannot be built over a sealed lane because its lane
-field is typed to the lane kind that permits rewriting. Overwriting evidence is not
-refused here; it is not expressible.
+one caller that forgets is the one that matters. So there is no call here that
+overwrites. Rewriting a stored object is not refused; it is not expressible.
 
-The type is the design and the store is the enforcement. `place` writes conditionally --
-it fails if the key already holds an object -- so a sealed lane's immutability survives
-a caller that reaches the adapter by some route this module did not anticipate. That
-conditional write is also why nothing here needs a delete: the control plane's grant has
-`s3:PutObject` and `s3:GetObject` and deliberately no `s3:DeleteObject`, so an overwrite
-is the only way to destroy a stored object at all, and a conditional put is exactly the
-thing that closes it.
+The surface is the design and the store is the enforcement. `place` writes conditionally
+-- it fails if the key already holds an object -- so a sealed lane's immutability
+survives a caller that reaches the adapter by some route this module did not anticipate.
+That conditional write is also why nothing here needs a delete: the control plane's
+grant has `s3:PutObject` and `s3:GetObject` and deliberately no `s3:DeleteObject`, so an
+overwrite is the only way to destroy a stored object at all, and a conditional put is
+exactly the thing that closes it.
 
 **Keyed by tenant and then Session, in that order.** The Session id alone would be
 enough to separate two Sessions, and it is not enough to make a cross-tenant read
@@ -125,22 +129,13 @@ class SealedLane:
         parse_lane_name(self.directory)
 
 
-@dataclass(frozen=True, slots=True)
-class MutableLane:
-    """A lane whose objects may be rewritten in place.
+Lane = SealedLane
+"""What the rest of the tree annotates a lane parameter with.
 
-    A separate type rather than a field on `SealedLane`, because the difference has to
-    reach the signature of `replace`. A flag would make every write site the place the
-    rule is enforced; a type makes the compiler the place.
-    """
-
-    directory: str
-
-    def __post_init__(self) -> None:
-        parse_lane_name(self.directory)
-
-
-Lane = SealedLane | MutableLane
+One kind today, and the alias is kept rather than inlined so that stays a fact about
+this module: a second kind would be added to this line, not to the thirty signatures
+that name it.
+"""
 
 
 ARTIFACTS: Final = SealedLane("artifacts")
@@ -163,25 +158,16 @@ store refuses the second write. `control/files/output_shipout.py` reads the stor
 digest and treats identical bytes as already delivered -- see the reasoning there.
 """
 
-WORKING: Final = MutableLane("working")
-"""The agent's workspace, as it stood at the end of the last Turn.
-
-Mutable, because a workspace is the one thing here that is *supposed* to change: an
-agent editing `analysis.py` across four Turns writes that path four times, and a sealed
-lane would refuse every write after the first. Its promise is not immutability but
-currency -- what is here is what the agent last had.
-
-**Not scratch relocated.** Nothing crosses the network mid-Turn; this is written once at
-a Turn boundary and read once at pod placement, which is what keeps ADR-006's reason for
-rejecting "everything remote" intact -- that reason is about paying remote latency per
-write, and this pays it twice per Turn.
-"""
-
-LANES: Final = (ARTIFACTS, WORKING)
+LANES: Final = (ARTIFACTS,)
 """The lanes the platform itself writes, for a caller sweeping or listing all of them.
 
-A tuple rather than a set because the order is the order a reader wants them in, and a
-tuple rather than a list because nothing may append to it at run time -- a lane the
+One entry, and still a tuple. A second lane -- `working`, holding the agent's tree
+between Turns -- was here until the workspace became a mounted volume that needs no
+carrying (ADR-035). What is left is a sequence with one member rather than a bare
+constant, because the callers that sweep it sweep "the lanes the platform writes", and
+that is a set which happens to have one member rather than a fact about `ARTIFACTS`.
+
+A tuple rather than a list because nothing may append to it at run time -- a lane the
 platform writes is a lane some module in this tree places into, and one added by
 mutation at run time has no such module behind it.
 """
@@ -278,30 +264,12 @@ class SealedFile:
         return lane_prefix(self.tenant_id, self.session_id, self.lane) + self.relative
 
 
-@dataclass(frozen=True, slots=True)
-class MutableFile:
-    """One object in the lane that does accept a rewrite.
+VfsFile = SealedFile
+"""What the rest of the tree annotates a stored-object parameter with.
 
-    Structurally identical to `SealedFile` and deliberately not a subclass of it or of
-    a shared base. The two types exist to be non-interchangeable at a signature; a base
-    class both satisfy would put them back in one bucket and hand `replace` a sealed
-    file again.
-    """
-
-    tenant_id: TenantId
-    session_id: SessionId
-    lane: MutableLane
-    relative: str
-
-    def __post_init__(self) -> None:
-        parse_relative_path(self.relative)
-
-    @property
-    def key(self) -> str:
-        return lane_prefix(self.tenant_id, self.session_id, self.lane) + self.relative
-
-
-VfsFile = SealedFile | MutableFile
+Kept for the same reason as `Lane`, and it moves with it: one file type today because
+there is one lane kind, and a second would be added here rather than at every use.
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,22 +333,21 @@ class VfsUnconfigured(RuntimeError):
 
 @runtime_checkable
 class LaneBlobs(Protocol):
-    """The four object-store operations a lane needs, and no others.
+    """The three object-store operations a lane needs, and no others.
 
-    `put_new` and `put` are separate operations rather than one with a flag, because
-    the difference is the whole guarantee and a flag defaulted wrong is an overwrite
-    nobody asked for. There is no delete: the grant this runs under has none, and a
-    lane's expiry is a prefix sweep owned by whatever owns retention -- not by the
+    The only write is conditional. An unconditional `put` sat here while a mutable lane
+    existed, and it went with that lane rather than being left as a capability nobody
+    calls -- a store that *can* overwrite is one a later writer will overwrite with,
+    and the seal is worth exactly as much as the narrowest surface behind it.
+
+    There is no delete either, for a nearer reason: the grant this runs under has none,
+    and a lane's expiry is a prefix sweep owned by whatever owns retention -- not by the
     module that writes one file.
     """
 
     async def put_new(self, key: str, body: bytes) -> None:
         """Store `body` at `key` only if nothing is there. Raises
         `ObjectAlreadyPresent`."""
-        ...
-
-    async def put(self, key: str, body: bytes) -> None:
-        """Store `body` at `key`, replacing whatever was there."""
         ...
 
     async def get(self, key: str) -> bytes | None:
@@ -402,11 +369,10 @@ class LaneBlobs(Protocol):
 class SessionFiles(Protocol):
     """A Session's durable filesystem, as everything above the adapter sees it.
 
-    Two writes and not one. `place` creates and refuses to clobber, and is the only
-    write a sealed lane has; `replace` overwrites and accepts a `MutableFile`, which no
-    sealed lane can produce. A single `write(lane, ...)` would make the lane a value the
-    caller passes and the store checks, and every caller would then be a place the check
-    could be got wrong.
+    One write, and it creates. There is no call here that overwrites, so "may this key
+    be written twice" is not a question any caller asks or any store answers -- which is
+    the point. A `write(lane, ...)` that decided by inspecting the lane would make every
+    caller a place that decision could be got wrong.
     """
 
     async def place(
@@ -421,17 +387,6 @@ class SessionFiles(Protocol):
         """
         ...
 
-    async def replace(
-        self, file: MutableFile, body: bytes, sources: Sequence[SourceRef] = ()
-    ) -> StoredObject:
-        """Overwrite an object in the one lane where that is legal.
-
-        Takes `MutableFile` and not `VfsFile`. That is the lane lifecycle: there is no
-        argument a caller can construct that asks this to overwrite evidence, an
-        artifact or a snapshot.
-        """
-        ...
-
     async def read(self, file: VfsFile) -> bytes | None:
         """The object's bytes, or None when the lane holds nothing at that path."""
         ...
@@ -441,9 +396,8 @@ class SessionFiles(Protocol):
     ) -> Sequence[LaneEntry]:
         """Everything in one lane of one Session.
 
-        Takes the lane as `Lane` rather than as either half, because reading and listing
-        do not care which kind it is -- only writing does. Narrowing it here would make
-        a caller that wants to list `working/` and `evidence/` in one loop unable to
-        hold them in one variable.
+        Takes the lane as `Lane`, which is the alias every lane-shaped parameter in this
+        tree takes. A caller listing several of a Session's lanes in one loop holds them
+        in one variable, and that stays true of whatever `Lane` names later.
         """
         ...

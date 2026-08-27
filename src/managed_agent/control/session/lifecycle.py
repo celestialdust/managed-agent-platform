@@ -35,6 +35,7 @@ from managed_agent.core.ids import FIRST_SEQ, Seq, SessionId, TurnId, new_turn_i
 from managed_agent.core.ports import EventLogAppend, EventLogRange, EventRecord
 from managed_agent.core.session.projection import project
 from managed_agent.core.session.session import SessionState
+from managed_agent.core.session.turns import open_turn
 from managed_agent.core.vocabulary import lifecycle, turn
 
 _UNBOUNDED_END: Seq = 2**62
@@ -140,6 +141,14 @@ async def admit_turn(
     a stop must still get back the Turn it originally started; refusing it instead would
     turn a submission that succeeded into an error the client cannot tell apart from one
     that never happened.
+
+    The two state checks ask different questions, and they have to. The first asks
+    whether a Turn may start, which is `IDLE` and refuses a Session already working. The
+    second cannot ask that, because by then this call's own `turn.submitted` is in the
+    prefix it re-reads -- so the Session is `RUNNING` *because of this submission*, and
+    re-asking would have every admission refuse itself. What the second read is for is
+    narrower: something else may have ended the Session in the window between the fold
+    and the append, and a stop is the only ending there is. So it asks about a stop.
     """
     before = await whole_log(ranged, session_id)
     if (earlier := _first_submission(before, idempotency_key)) is not None:
@@ -162,7 +171,7 @@ async def admit_turn(
     if winner.turn_id != submission.turn_id:
         return TurnReplayed(turn_id=winner.turn_id, seq=winner.seq)
     settled_state, _ = project(settled)
-    if not settled_state.accepts_a_turn():
+    if settled_state is SessionState.STOPPED:
         return TurnRefused(state=settled_state)
     return TurnAdmitted(turn_id=submission.turn_id, seq=seq)
 
@@ -237,39 +246,6 @@ class ArchiveRefused:
 ArchiveOutcome = SessionArchived | SessionAlreadyArchived | ArchiveRefused
 
 
-def open_turn(events: Iterable[EventRecord]) -> TurnId | None:
-    """The Turn this Session has submitted and not yet closed, or None.
-
-    A Turn is open from its `turn.submitted` until whichever of `turn.completed` or
-    `turn.failed` names it. Both terminal types are read, because reading only the
-    completion would leave every failed Turn open for ever -- and a Session that had
-    ever failed a Turn could then never be archived or reclaimed.
-
-    Matched by the `turn_id` in the payload rather than by "the last turn event wins",
-    because the events of two Turns can interleave in the log -- a `turn.message_delta`
-    of one arriving between another's submission and completion -- and a positional rule
-    would then close the wrong Turn. A terminal event naming a Turn that was never
-    submitted is ignored rather than treated as an error: this answers what is still
-    running, and a close with no open is not something still running.
-
-    Returns the earliest still-open Turn, so a caller telling somebody to interrupt one
-    names the Turn that has been waiting longest. In practice at most one is ever open,
-    because `admit_turn` is the only thing that appends a submission and it refuses a
-    Session whose state does not accept a Turn -- but nothing here depends on that, and
-    a rule reading "the only one" would be a claim about a component this does not own.
-    """
-    open_turns: dict[str, TurnId] = {}
-    for event in events:
-        identifier = event.payload.get("turn_id")
-        if not isinstance(identifier, str):
-            continue
-        if event.type == turn.TURN_SUBMITTED:
-            open_turns[identifier] = TurnId(UUID(identifier))
-        elif event.type in (turn.TURN_COMPLETED, turn.TURN_FAILED):
-            open_turns.pop(identifier, None)
-    return next(iter(open_turns.values()), None)
-
-
 async def archive_session(
     session_id: SessionId,
     log: EventLogAppend,
@@ -278,21 +254,25 @@ async def archive_session(
 ) -> ArchiveOutcome:
     """Stop this Session accepting events, and give its pod back.
 
-    Refuses while a Turn is open, which is the one refusal this operation has -- and it
-    is about a Turn rather than about the Session's state. That distinction is the whole
-    reading of this platform's state machine against the API it mirrors: `RUNNING` here
-    means "would accept a Turn", which is the *idle* end of that API, and there is no
-    member standing for "an agent is executing right now" -- a Turn in flight is visible
-    only as a submission nothing has closed. So the refusal has to be folded out of the
-    Turn events, and refusing on `SessionState.RUNNING` would refuse every Session that
-    was archivable.
+    Refuses while a Turn is open, which is the one refusal this operation has. There is
+    now a state that says exactly that -- `RUNNING` means an agent is executing right
+    now -- and this still folds the Turn events instead of reading it. The two are not
+    the same question. `open_turn` names *which* Turn is unfinished, and the refusal has
+    to carry that identifier so the caller knows what to interrupt; a state check could
+    only say that something was running. Reading the state and then folding anyway to
+    get the id would be one question asked twice, with a race between the answers.
+
+    An earlier version of this paragraph argued the opposite -- that no member stood for
+    "an agent is executing right now", so the refusal *had* to be folded out of the Turn
+    events. That member exists now (ADR-032). The conclusion survives its premise, for
+    the reason above.
 
     Archives from any state but `STOPPED`, which needs no append and is reported as
-    already archived so a retried call is not a second stop in the log. A `SUSPENDED`
-    Session archives into a stop, which is what finalising a parked Session means. A
-    `TAKEN_OVER` one archives too: archiving is a deliberate call by the tenant that
-    owns the Session, and refusing it would leave the one state a human is watching as
-    the state whose pod can never be handed back.
+    already archived so a retried call is not a second stop in the log. An `IDLE`
+    Session archives into a stop, which is what deliberately ending a resting Session
+    means. A `TAKEN_OVER` one archives too: archiving is a deliberate call by the tenant
+    that owns the Session, and refusing it would leave the one state a human is watching
+    as the state whose pod can never be handed back.
 
     The stop is appended before the pod is released, and a crash between them is why
     that order and not the other. This way the log says the Session is archived and a
@@ -315,78 +295,30 @@ async def archive_session(
         return SessionAlreadyArchived(seq=seq)
     if (running := open_turn(before)) is not None:
         return ArchiveRefused(turn_id=running)
-    stopped_at, released = await _end_and_release(
-        session_id,
-        lifecycle.SESSION_STOPPED,
-        lifecycle.SessionStopped(stop_reason=lifecycle.StopReason.ARCHIVED),
-        log,
-        ranged,
-        release,
-    )
+    stopped_at, released = await _end_and_release(session_id, log, ranged, release)
     return SessionArchived(seq=stopped_at, pod_released=released)
-
-
-async def suspend_session(
-    session_id: SessionId,
-    log: EventLogAppend,
-    ranged: EventLogRange,
-    release: SessionPodRelease,
-) -> Seq:
-    """Park this Session and give its pod back, because nothing is using it.
-
-    **A Session this reaches cannot currently be resumed, and a caller has to have
-    decided that is acceptable.** `SUSPENDED` accepts no Turn, so what this appends is,
-    today, the end of that Session's working life. It is not the end of its history:
-    every event stays readable, and its Rollout is preserved by whatever
-    `ShipOutAtTurnCompletion` was wired with, so the state a resume needs is off the pod
-    rather than dying with it (ADR-004).
-
-    What is missing is now this transition and nothing below it. A pod that continues a
-    Session's thread from its stored Rollout exists -- the placement path compiles one
-    and the shim resumes from the seeded record (ADR-031) -- and a Session whose pod
-    simply vanished is re-placed by the next Turn that finds none. Only a Session parked
-    HERE stays parked, because no Turn is admitted to go and ask for that pod.
-
-    So this is deliberately not called at `turn.completed`. A Session that finishes its
-    work stays at `RUNNING` and waits, and suspending there would make every Session
-    single-Turn -- reclaiming the slot by destroying the thing occupying it.
-
-    Whether nothing is using it is the caller's judgement and not checked here: this
-    appends and releases, and `session_reaper.py` owns the rules about what counts as
-    idle. Splitting it that way keeps one place that knows the ordering below and one
-    that knows the policy, rather than a policy that can be right while the ordering is
-    wrong.
-
-    Returns the sequence of the suspension. The pod is not released when a Turn opened
-    across the append, for the reason `archive_session` gives: the Session is parked
-    either way, and a sweep reclaims the pod once that Turn is closed.
-    """
-    seq, _ = await _end_and_release(
-        session_id,
-        lifecycle.SESSION_SUSPENDED,
-        lifecycle.SessionSuspended(stop_reason=lifecycle.StopReason.IDLE_TIMEOUT),
-        log,
-        ranged,
-        release,
-    )
-    return seq
 
 
 async def _end_and_release(
     session_id: SessionId,
-    type_: str,
-    payload: lifecycle.SessionSuspended | lifecycle.SessionStopped,
     log: EventLogAppend,
     ranged: EventLogRange,
     release: SessionPodRelease,
 ) -> tuple[Seq, bool]:
-    """Append the event that ends a Session's working life, then give its pod back.
+    """Append the stop that ends this Session, then give its pod back.
 
-    The order is the invariant both callers need, and the reason this is one function
-    rather than six lines written twice. Append first: a failure after it leaves a
-    Session correctly recorded as ended with a pod still up, which a sweep reclaims from
-    the state it reads. Releasing first would leave a Session recorded as live with
-    nothing behind it.
+    One caller, and it stays a function of its own because what it holds is an ordering
+    argument rather than a step: the lines below are correct only in this order, and the
+    reasons are longer than the code. It took the event and its payload as arguments
+    while reclaiming a resting Session's pod was a second kind of ending; that caller is
+    gone and the parameters went with it, rather than staying as a widening nothing
+    asks for and nothing grades.
+
+    Append first: a failure after it leaves the event correctly recorded with a pod
+    still up, which a sweep reclaims on its next pass. Releasing first would leave a
+    Session whose log says nothing happened and whose pod is gone, which reads as live
+    with nothing behind it -- every later Turn answering 502 with nothing naming the
+    cause.
 
     Between the append and the release, the prefix ending at the append is re-read and
     the pod is kept if a Turn is open in it -- the same append-then-settle move
@@ -410,9 +342,77 @@ async def _end_and_release(
     again. One extra event per retry for the life of the Session would not be
     acceptable, and that is the property the tests assert.
     """
-    seq = await log.append(session_id, type_, payload.model_dump(mode="json"))
+    seq = await log.append(
+        session_id,
+        lifecycle.SESSION_STOPPED,
+        lifecycle.SessionStopped(stop_reason=lifecycle.StopReason.ARCHIVED).model_dump(
+            mode="json"
+        ),
+    )
     settled = await ranged.read(session_id, FIRST_SEQ, seq, limit=seq)
     if open_turn(settled) is not None:
         return seq, False
     await release.release(session_id)
     return seq, True
+
+
+async def close_abandoned_turn(
+    session_id: SessionId,
+    turn_id: TurnId,
+    log: EventLogAppend,
+    ranged: EventLogRange,
+    cause: turn.TurnFailureCause,
+) -> bool:
+    """Record that this Turn produced no answer, so its Session can work again.
+
+    Here beside `admit_turn` and `archive_session` rather than in the sweep that calls
+    it, because it is the inverse of the refusal those two make: they read `open_turn`
+    and stand down, and this is the only thing in the tree that makes `open_turn` stop
+    naming a Turn from outside the request path. A transition and its two refusals that
+    lived in different modules would be free to disagree about what closing means.
+
+    Returns whether this call is the one that appended. False means the Turn was already
+    closed -- by the request path finishing after all, or by another replica's sweep --
+    and a caller counting closes must not count it.
+
+    **Folded in front rather than appended blind, and that fold is what bounds the
+    redundancy.** It refuses a Turn that is not open, so calling this a second time on a
+    closed Turn appends nothing and a sweep may run every tick for the life of the
+    process at no cost to the log.
+
+    What it does not do is make two replicas racing impossible. Both fold, both see the
+    Turn open, and both append -- and no re-read afterwards could prevent that, because
+    by then the event is written and this port offers no conditional append. The reason
+    that is acceptable rather than merely tolerated is the fold every reader takes:
+    `open_turn` pops a Turn on whichever terminal event names it first, so the second
+    ending changes no state anybody reads, and the guard above means the excess is one
+    event per racing sweep on a Turn that was ending anyway rather than one per tick.
+    That is the same bound `_end_and_release` records for the stop event, in the same
+    words, for the same reason.
+
+    **The cause is the caller's to name, and has no default.** Naming a cause at all is
+    what makes this event worth more to the tenant than the state change it buys -- a
+    Turn that simply stopped is indistinguishable from one the platform never received.
+    But the callers here do not all mean the same thing. A Turn whose pod died means
+    `RUNTIME_LOST`: the work was lost with the process carrying it, and resubmitting is
+    the remedy. A Turn that was never given a pod means `RUNTIME_DID_NOT_START`: nothing
+    was carrying it, so nothing was lost, and the tenant's next move differs.
+
+    A default would collapse that distinction silently, which is the exact failure
+    `TurnFailureCause`'s own docstring records: `POD_UNREACHABLE` answered for four
+    unrelated situations with disagreeing remedies, and one confident wrong name is
+    worse than no name. Requiring the argument makes a new caller choose, and makes a
+    wrong choice visible in its own call rather than inherited from here.
+    """
+    before = await whole_log(ranged, session_id)
+    if open_turn(before) != turn_id:
+        return False
+    await log.append(
+        session_id,
+        turn.TURN_FAILED,
+        {
+            "turn_id": str(turn_id),
+            "cause": cause.value,
+        },
+    )
+    return True

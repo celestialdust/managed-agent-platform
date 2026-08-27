@@ -39,6 +39,7 @@ from mcp.types import ElicitRequestFormParams, ElicitRequestParams, ElicitResult
 
 from managed_agent.core.errors import ErrorCode
 from managed_agent.core.ids import DefinitionId, SessionId, TenantId
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.scope_binding import (
     ParameterType,
     RegisteredTool,
@@ -63,6 +64,7 @@ from managed_agent.gateway.tool.credential_broker import (
 )
 from managed_agent.gateway.tool.evidence_capture import EvidenceCapture
 from managed_agent.gateway.tool.mcp_proxy import McpProxy, SessionUpstreams
+from managed_agent.gateway.tool.scope_clamp import narrow
 
 
 class _NeverCaptures:
@@ -187,22 +189,47 @@ def deepwiki_server(
 
 
 def tool(
-    name: str, remote: str, server: str, endpoint: ServerEndpoint, argument: str
+    name: str,
+    remote: str,
+    server: str,
+    endpoint: ServerEndpoint,
+    argument: str,
+    dimension: str,
 ) -> RegisteredTool:
+    """One registration, whose Scope Binding says what the bound argument means.
+
+    `dimension` is a parameter rather than a constant this helper picks, because the
+    dimension and the argument have to name the same thing: the Tool Gateway writes
+    the Scope's value for `dimension` into `argument` on every outbound call, so a
+    registration pairing an argument with a dimension that means something else does
+    not fail — it silently sends the wrong value to the server and gets an answer
+    about the wrong subject. A helper that defaulted the dimension would make that
+    pairing invisible at each call site, which is exactly how `repoName` came to be
+    bound to `account` here.
+    """
     return RegisteredTool(
         name=name,
+        advertised_name=advertised_name_for(server, name),
         remote_name=remote,
         parameters={argument: ParameterType.STRING},
-        scope_bindings=(ScopeBinding(dimension="account", argument=argument),),
+        scope_bindings=(ScopeBinding(dimension=dimension, argument=argument),),
         server_name=server,
         endpoint=endpoint,
     )
 
 
+_CONFORMANCE_SERVER: Final[str] = "conformance_stdio"
+"""The one server every tool in this file sits behind.
+
+Named once because the advertised name is built from it, and a case asserting a literal
+`conformance_stdio__echo_credential` would be a second copy of a fact this constant
+already holds."""
+
+
 def stdio_tools(*args: str) -> list[RegisteredTool]:
     endpoint = stdio_server(*args)
     return [
-        tool(name, name, "conformance_stdio", endpoint, "query")
+        tool(name, name, _CONFORMANCE_SERVER, endpoint, "query", "account")
         for name in (
             "echo_credential",
             "explode",
@@ -213,18 +240,59 @@ def stdio_tools(*args: str) -> list[RegisteredTool]:
     ]
 
 
+IN_SCOPE_ACCOUNT: Final[str] = "the-tenants-own-account"
+"""What the Session below is bounded to on the `account` dimension."""
+
+IN_SCOPE_REPO: Final[str] = "pallets/click"
+"""What the Session below is bounded to on the `repository` dimension.
+
+Named once and read by both the deepwiki registrations and the assertions made against
+them, because the clamp makes them one fact rather than two: whatever this says is what
+leaves on the wire in `repoName`, and no call here supplies that argument at all. A
+test that spelt the repository out separately would be asserting that deepwiki knows
+about a string this file happens to repeat, and would go on passing while the Scope
+narrowed the call to something else entirely.
+"""
+
 DEEPWIKI_TOOL = tool(
-    "repo_map", "read_wiki_structure", "deepwiki", deepwiki_server(), "repoName"
+    "repo_map",
+    "read_wiki_structure",
+    "deepwiki",
+    deepwiki_server(),
+    "repoName",
+    "repository",
 )
 
 
-class FixedScope:
-    """A `SessionScopeReader` answering the one Scope every tool here is bound to.
+_VALUE_BY_DIMENSION: Final[dict[str, str]] = {
+    "account": IN_SCOPE_ACCOUNT,
+    "repository": IN_SCOPE_REPO,
+}
+"""What a Session in this file is bounded to, per dimension its tools bind.
 
-    Every registration in this file declares a Scope Binding on the `account`
-    dimension, because a tool that declares none cannot be registered at all -- so a
-    proxy in a fidelity suite needs a Scope for the same reason a real Session does,
-    and not because anything here is about clamping.
+A dimension no entry names raises where the Scope is built, which is the right place
+to find out: a registration binding a dimension nobody said what the Session holds for
+is a fixture that cannot describe the Session it is asking for.
+"""
+
+
+class FixedScope:
+    """A `SessionScopeReader` answering the Scope the given tools are bound to.
+
+    Every registration in this file declares a Scope Binding, because a tool that
+    declares none cannot be registered at all -- so a proxy in a fidelity suite needs a
+    Scope for the same reason a real Session does. Two dimensions are in reach here and
+    they are different things: the stdio tools take a free-text `query` this Session
+    bounds to an account, and deepwiki's `repoName` names a repository, which cannot be
+    answered from the same value.
+
+    **The Scope is derived from the tools rather than written out**, and that is the
+    clamp's symmetry showing up in a fixture. A Scope dimension no binding on the tool
+    being called names now refuses the call: a Session scoped to an account *and* a
+    repository, calling a tool that binds only the account, is refused rather than sent
+    out wide on the repository. This file used to hold exactly that Session and every
+    call in it would now be refused, so the fixture states the rule instead of tripping
+    over it -- a Session is scoped to what the tools it was granted actually bind.
 
     Written out rather than imported from `tests/gateway/tool/tool_gateway_harness.py`,
     for the reason `_NeverCaptures` above already gives: pytest puts each test
@@ -232,14 +300,29 @@ class FixedScope:
     that one.
     """
 
+    def __init__(self, tools: Sequence[RegisteredTool]) -> None:
+        # Through a dict, so five stdio tools binding one dimension produce one pair
+        # rather than five copies of it. A Session's Scope is one value per dimension.
+        bounded = {
+            binding.dimension: _VALUE_BY_DIMENSION[binding.dimension]
+            for tool in tools
+            for binding in tool.scope_bindings
+        }
+        self.scope: tuple[tuple[str, str], ...] = tuple(bounded.items())
+        # Derived from the same tools, for the same reason the Scope is. The Grant is
+        # enforced now, so a Session handed the empty set is offered nothing and every
+        # call in this file would be refused before the proxy's fidelity was ever
+        # exercised -- which is not what any case here is about.
+        self.grant = frozenset(tool.advertised_name for tool in tools)
+
     async def fetch(self, session_id: SessionId, tenant_id: TenantId) -> SessionRecord:
         return SessionRecord(
             id=session_id,
             tenant_id=tenant_id,
             definition_id=DefinitionId(UUID("33333333-3333-4333-8333-333333333333")),
             definition_revision="0" * 40,
-            grant=frozenset(),
-            scope=(("account", "the-tenants-own-account"),),
+            grant=self.grant,
+            scope=self.scope,
             budget_minor_units=1_000,
             budget_currency="USD",
             retention_days=1,
@@ -262,7 +345,7 @@ async def proxying(
     owner = asyncio.create_task(upstreams.run())
     try:
         yield McpProxy(
-            scopes=FixedScope(),
+            scopes=FixedScope(tools),
             tenant_id=TENANT,
             session_id=SessionId(uuid4()),
             registry=FixedRegistry(tools),
@@ -285,22 +368,35 @@ def _envelope(content: Sequence[object]) -> dict[str, object]:
     return parsed
 
 
-async def test_a_tool_is_offered_under_its_own_name_and_the_servers_shape() -> None:
+async def test_a_tool_is_offered_under_its_advertised_name_and_the_servers_shape() -> (
+    None
+):
+    """The name carries the server, and the rest of the tool is the server's own.
+
+    The offered name is `<server>__<tool>` because the runtime is given one namespace
+    for every server a tenant has: two servers may each call a tool `search`, so the
+    bare name is not enough to say which one a call meant. Everything else here --
+    description, schema -- still comes from the server unchanged.
+    """
     async with proxying(stdio_tools()) as proxy:
         offered = await proxy.list_tools()
 
+    echo = advertised_name_for(_CONFORMANCE_SERVER, "echo_credential")
     by_name = {t.name: t for t in offered}
-    assert sorted(by_name) == [
-        "ask_operator",
-        "crawl",
-        "echo_credential",
-        "explode",
-        "sleep_forever",
-    ]
-    assert by_name["echo_credential"].description == (
+    assert sorted(by_name) == sorted(
+        advertised_name_for(_CONFORMANCE_SERVER, name)
+        for name in (
+            "ask_operator",
+            "crawl",
+            "echo_credential",
+            "explode",
+            "sleep_forever",
+        )
+    )
+    assert by_name[echo].description == (
         "Return the credential this process was started with."
     )
-    assert by_name["echo_credential"].input_schema == {
+    assert by_name[echo].input_schema == {
         "type": "object",
         "properties": {},
     }
@@ -311,7 +407,9 @@ async def test_only_the_registry_decides_which_tools_exist_here() -> None:
     async with proxying(stdio_tools()[:1]) as proxy:
         offered = await proxy.list_tools()
 
-    assert [t.name for t in offered] == ["echo_credential"]
+    assert [t.name for t in offered] == [
+        advertised_name_for(_CONFORMANCE_SERVER, "echo_credential")
+    ]
 
 
 async def test_a_call_returns_the_servers_own_content_and_the_credential_it_got() -> (
@@ -375,7 +473,7 @@ async def test_a_registered_command_that_dies_on_startup_is_an_unavailable_serve
         credential_ref="conformance/stdio",
         credential_env_var="MAP_CONFORMANCE_TOKEN",
     )
-    registered = tool("doomed", "doomed", "dead_server", dies, "query")
+    registered = tool("doomed", "doomed", "dead_server", dies, "query", "account")
 
     async with proxying([registered]) as proxy:
         result = await proxy.call_tool("doomed", {})
@@ -482,6 +580,36 @@ async def test_a_uri_under_a_listed_template_is_read_without_a_prior_listing() -
     assert _text(read.contents) == "a resource the stdio server serves"
 
 
+async def test_the_deepwiki_call_leaves_here_naming_the_repository_it_asks_about() -> (
+    None
+):
+    """The offline half of the live claims below, and the only half the gate runs.
+
+    Every assertion about what deepwiki answers carries `@pytest.mark.network`, and the
+    default run excludes that mark -- so the clamp sitting between the call and the wire
+    is watched by nothing `pytest -q` executes. It went unwatched once: `repoName` was
+    bound to the `account` dimension, every live call was rewritten to ask about a
+    repository named after the Session's account, and deepwiki answered `Invalid
+    repoName format: "the-tenants-own-account"`. No offline run could have said why,
+    because no offline run touched the clamp at all.
+
+    This runs that clamp with no network in reach. What leaves for the wire has to be
+    the string the live assertions then look for in the answer -- so a binding that
+    stops meaning the repository fails here, in the gate, rather than at a third party
+    nobody runs against by default.
+
+    The call supplies nothing, which is now the only way a caller may write it: the
+    Gateway does not advertise a Scope-bound argument, and a caller that supplies one
+    anyway is refused rather than clamped. So the value under assertion is one the
+    platform put there and not one it copied over.
+    """
+    record = await FixedScope([DEEPWIKI_TOOL]).fetch(SessionId(uuid4()), TENANT)
+
+    narrowed = narrow(DEEPWIKI_TOOL, dict(record.scope), {})
+
+    assert narrowed == {"repoName": IN_SCOPE_REPO}
+
+
 @pytest.mark.network
 async def test_deepwiki_is_reached_over_streamable_http_and_answers_this_proxy() -> (
     None
@@ -489,13 +617,18 @@ async def test_deepwiki_is_reached_over_streamable_http_and_answers_this_proxy()
     """The third-party half of the row's claim: a real registered server, live."""
     async with proxying([DEEPWIKI_TOOL]) as proxy:
         offered = await proxy.list_tools()
-        result = await proxy.call_tool("repo_map", {"repoName": "pallets/click"})
+        result = await proxy.call_tool("repo_map", {})
 
     assert [t.name for t in offered] == ["repo_map"]
     assert offered[0].description is not None
-    assert "repoName" in json.dumps(offered[0].input_schema)
+    # Against a real third party's own schema: the bound argument is not offered, and
+    # the call that omitted it is answered about the repository anyway. Deepwiki
+    # declares `repoName` and requires it, so this is the removal working on a schema
+    # nobody here wrote -- and the answer below is what proves the platform filled the
+    # field the model was never shown.
+    assert "repoName" not in offered[0].input_schema.get("properties", {})
     assert result.is_error is not True
-    assert "pallets/click" in _text(result.content)
+    assert IN_SCOPE_REPO in _text(result.content)
 
 
 @pytest.mark.network
@@ -538,18 +671,19 @@ async def test_the_credential_goes_on_the_wire_as_the_vault_holds_it() -> None:
         "deepwiki",
         deepwiki_server(credential_header="Authorization"),
         "repoName",
+        "repository",
     )
     bearer = PlaceholderVault("Bearer map-conformance-not-a-real-token")
     bare = PlaceholderVault("map-conformance-not-a-scheme")
 
     async with proxying([registered], vault=bearer) as proxy:
-        as_a_token = await proxy.call_tool("repo_map", {"repoName": "pallets/click"})
+        as_a_token = await proxy.call_tool("repo_map", {})
     async with proxying([registered], vault=bare) as proxy:
-        as_a_string = await proxy.call_tool("repo_map", {"repoName": "pallets/click"})
+        as_a_string = await proxy.call_tool("repo_map", {})
 
     assert "Authentication is not allowed" in _text(as_a_token.content)
     assert "Authentication is not allowed" not in _text(as_a_string.content)
-    assert "pallets/click" in _text(as_a_string.content)
+    assert IN_SCOPE_REPO in _text(as_a_string.content)
 
 
 @pytest.mark.network
@@ -568,6 +702,7 @@ async def test_one_unreachable_server_does_not_empty_the_reachable_ones_list(
             credential_header="X-Map-Conformance",
         ),
         "query",
+        "account",
     )
 
     with caplog.at_level(logging.ERROR, logger="managed_agent.gateway.tool.error_map"):

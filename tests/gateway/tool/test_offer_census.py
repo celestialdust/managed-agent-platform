@@ -39,6 +39,7 @@ from tool_gateway_harness import (
 )
 
 from managed_agent.core.ids import SessionId, TenantId
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.scope_binding import (
     ParameterType,
     RegisteredTool,
@@ -110,6 +111,7 @@ async def _decline(params: ElicitRequestParams) -> ElicitResult:
 def _tool(name: str, server: str, remote: str | None = None) -> RegisteredTool:
     return RegisteredTool(
         name=name,
+        advertised_name=advertised_name_for(server, name),
         remote_name=remote or name,
         parameters={"query": ParameterType.STRING},
         scope_bindings=(ScopeBinding(dimension="account", argument="query"),),
@@ -127,8 +129,9 @@ def _remote(name: str) -> Tool:
 
 
 def _proxy(registry: FixedRegistry, upstreams: ScriptedUpstreams) -> McpProxy:
+    """Granted every tool the registry holds -- no case here is about the Grant."""
     return McpProxy(
-        scopes=FixedScope(),
+        scopes=FixedScope(*(tool.advertised_name for tool in registry.tools)),
         tenant_id=TENANT,
         session_id=SessionId(uuid4()),
         registry=registry,
@@ -196,12 +199,15 @@ async def test_a_partial_drop_names_the_tools_that_were_lost(
     with caplog.at_level(logging.INFO, logger=PROXY_LOGGER):
         offered = await _proxy(registry, upstreams).list_tools()
 
-    assert [tool.name for tool in offered] == ["kept"]
+    assert [tool.name for tool in offered] == [advertised_name_for("up", "kept")]
     line = _census(caplog)
     assert line.levelno == logging.WARNING
     assert "registered=2" in line.getMessage()
     assert "offered=1" in line.getMessage()
-    assert "lost" in line.getMessage()
+    # The advertised form, because that is what an operator has to grep for: a bare
+    # `lost` would still match `up__lost` and would keep matching if the census
+    # regressed to naming a tool by a name the model was never shown.
+    assert advertised_name_for("up", "lost") in line.getMessage()
 
 
 async def test_a_healthy_listing_still_leaves_one_line_and_leaves_it_cheaply(
@@ -216,7 +222,9 @@ async def test_a_healthy_listing_still_leaves_one_line_and_leaves_it_cheaply(
     with caplog.at_level(logging.INFO, logger=PROXY_LOGGER):
         offered = await _proxy(registry, upstreams).list_tools()
 
-    assert sorted(tool.name for tool in offered) == ["also_kept", "kept"]
+    assert sorted(tool.name for tool in offered) == [
+        advertised_name_for("up", name) for name in ("also_kept", "kept")
+    ]
     line = _census(caplog)
     assert line.levelno == logging.INFO
     assert "registered=2" in line.getMessage()

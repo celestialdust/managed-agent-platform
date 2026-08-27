@@ -58,7 +58,7 @@ from managed_agent.core.registration.scope_binding import (
     RegisteredTool,
     ServerRegistration,
 )
-from managed_agent.core.session.session import SessionRecord, SessionState
+from managed_agent.core.session.session import SessionRecord
 
 SKILLS_REPO = "git@github.com:acme/skills.git"
 PUBLISHED = "a" * 40
@@ -855,7 +855,7 @@ async def test_an_archived_version_starts_no_session_and_stops_no_running_one(
 
     assert harness.log.events(running_id) == before
     assert readable.status_code == 200
-    assert readable.json()["state"] == "running"
+    assert readable.json()["state"] == "idle"
     assert (
         await harness.definitions.read_version(
             DefinitionId(UUID(agent_id)), harness.tenant, 1
@@ -911,7 +911,7 @@ class UnusedWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         raise AssertionError("a test in this file registered a webhook")
@@ -923,9 +923,9 @@ class UnusedWebhooks:
         raise AssertionError("a test in this file deleted a webhook")
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        raise AssertionError("a test in this file asked what watches a state")
+        raise AssertionError("a test in this file asked what watches a type")
 
 
 FIXTURE_IMAGE = "registry.map.internal/session@sha256:" + "a" * 64

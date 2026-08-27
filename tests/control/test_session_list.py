@@ -50,7 +50,7 @@ from managed_agent.core.registration.scope_binding import (
     RegisteredTool,
     ServerRegistration,
 )
-from managed_agent.core.session.session import SessionRecord, SessionState
+from managed_agent.core.session.session import SessionRecord
 
 _SKILLS_SHA = "0" * 39 + "a"
 
@@ -610,7 +610,7 @@ def _create_body(definition_id: str, environment_id: str) -> dict[str, object]:
     return {
         "definition_id": definition_id,
         "environment_id": environment_id,
-        "grant": ["fs.read"],
+        "grant": [],
         "scope": {"repository": "acme/widgets"},
         "budget_minor_units": _BUDGET,
         "budget_currency": "EUR",
@@ -756,7 +756,7 @@ class UnusedWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         raise AssertionError("a test in this file registered a webhook")
@@ -768,9 +768,9 @@ class UnusedWebhooks:
         raise AssertionError("a test in this file deleted a webhook")
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        raise AssertionError("a test in this file asked what watches a state")
+        raise AssertionError("a test in this file asked what watches a type")
 
 
 class UnusedEnvironmentStore:

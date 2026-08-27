@@ -57,9 +57,30 @@ PROFILE_CONFIG_MAP: Final = "map-session-seccomp"
 INSTALLER_DAEMONSET: Final = "map-session-seccomp-installer"
 
 _IDENTITIES: Final = Path("deploy/k8s/cluster-bootstrap.yaml")
+_SESSION_VFS: Final = Path("deploy/k8s/session-vfs.yaml")
 _SHIM_SERVICE: Final = Path("deploy/k8s/session-shim-service.yaml")
 _PROFILE: Final = Path("deploy/seccomp/session-sandbox.json")
 _INSTALLER: Final = Path("deploy/k8s/session-sandbox-seccomp-installer.yaml")
+_AUTOSCALER: Final = Path("deploy/k8s/cluster-autoscaler.yaml")
+
+APPLIES: Final[tuple[Path, ...]] = (
+    _IDENTITIES,
+    _SESSION_VFS,
+    _SHIM_SERVICE,
+    _INSTALLER,
+    _AUTOSCALER,
+)
+"""Every manifest under `deploy/k8s/` this bootstrap puts into the cluster.
+
+The steps below are the authority on how each is applied; this says only which
+ones, and it exists so that a manifest applied by nothing can be told apart from a
+manifest applied here. `_PROFILE` is not in it -- that is a seccomp JSON, not a
+Kubernetes object, and it reaches the cluster as the body of a generated ConfigMap.
+
+Not derived from `steps()`: those carry the manifest inside an argv, sometimes as
+`-` with the bytes on stdin, so recovering the file from them means parsing a
+command line to find out what a command line was built from.
+"""
 
 _ROLLOUT_TIMEOUT: Final = "180s"
 
@@ -115,7 +136,14 @@ def required_inputs(root: Path) -> tuple[Path, ...]:
     """Every file this reads, resolved against a repository root."""
     return tuple(
         root / relative
-        for relative in (_IDENTITIES, _SHIM_SERVICE, _PROFILE, _INSTALLER)
+        for relative in (
+            _IDENTITIES,
+            _SESSION_VFS,
+            _SHIM_SERVICE,
+            _PROFILE,
+            _INSTALLER,
+            _AUTOSCALER,
+        )
     )
 
 
@@ -131,7 +159,7 @@ def missing_inputs(root: Path) -> tuple[Path, ...]:
 
 
 def steps(root: Path, account_id: str) -> tuple[Step, ...]:
-    """The four applies, in the order their dependencies impose.
+    """The five applies, in the order their dependencies impose.
 
     `account_id` is passed in rather than read here, and that is not a style choice.
     This function is called by the offline test suite, which has no AWS credentials and
@@ -143,6 +171,11 @@ def steps(root: Path, account_id: str) -> tuple[Step, ...]:
     puts the namespace ahead of what lives in it. The ConfigMap precedes the DaemonSet
     that mounts it -- not for correctness, since kubelet retries a missing volume, but
     because the operator watching this run should not have to know that.
+
+    The workspace volume and its claim are second, and the ordering there is NOT the
+    same kind of courtesy. A pod naming an absent PersistentVolumeClaim is refused at
+    admission and never schedules, so a cluster without this claim places no Session for
+    any tenant -- kubelet gets no chance to retry into it the way it does a ConfigMap.
     """
     return (
         Step(
@@ -156,6 +189,14 @@ def steps(root: Path, account_id: str) -> tuple[Step, ...]:
                 (root / _IDENTITIES).read_text(), account_id
             ),
             source=root / _IDENTITIES,
+        ),
+        Step(
+            describe="the workspace volume every Session pod mounts a subtree of",
+            # No `-n`: the file's own PersistentVolumeClaim carries its namespace,
+            # and the PersistentVolume beside it is cluster-scoped, so a namespace on
+            # the command line would be right for one document and meaningless for
+            # the other.
+            argv=("kubectl", "apply", "-f", str(root / _SESSION_VFS)),
         ),
         Step(
             describe="the headless Service every Session pod is addressed through",
@@ -185,6 +226,15 @@ def steps(root: Path, account_id: str) -> tuple[Step, ...]:
         Step(
             describe="the installer that copies the profile onto every node",
             argv=("kubectl", "apply", "-n", NAMESPACE, "-f", str(root / _INSTALLER)),
+        ),
+        Step(
+            # It runs in this platform's own namespace rather than kube-system, which
+            # is what lets the capacity route read its Deployment with the same
+            # credentials it reads everything else with. Applied here rather than with
+            # a release: it scales the nodes the whole cluster shares, so its lifetime
+            # is the cluster's and not any one image's.
+            describe="the autoscaler that adds nodes when a Session pod cannot fit",
+            argv=("kubectl", "apply", "-n", NAMESPACE, "-f", str(root / _AUTOSCALER)),
         ),
     )
 

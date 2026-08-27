@@ -23,10 +23,16 @@ this module -- where every bound and every refusal lives -- exercisable without 
 request or a bucket.
 """
 
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from managed_agent.control.files.lane_digests import (
+    SessionLogReader,
+    digest_differs,
+    digests_in_lane,
+)
 from managed_agent.control.files.store import content_digest
 from managed_agent.core.ids import SessionId, TenantId, TurnId
 from managed_agent.core.pod.workspace_contract import is_a_produced_path
@@ -43,27 +49,92 @@ from managed_agent.core.vfs.session_vfs import (
 )
 from managed_agent.core.vocabulary import output
 
-OUTPUT_COUNT_LIMIT = 32
-"""How many produced files one completed Turn may ship, and the most one is listed.
+_LOG = logging.getLogger(__name__)
+"""This module's own logger, for the operator half of a partial ship-out.
+
+The composition root wires no Python logger -- its `log` is the Event Log append port --
+so this is taken from the standard hierarchy rather than injected. Nothing here logs a
+path or a byte of a tenant's document; the counts and the Session id are what an
+operator needs and all they get.
+"""
+
+OUTPUT_TREE_LIMIT = 2048
+"""How many files the pod will enumerate under its output directory, at most.
+
+**Two bounds and not one, because listing a file and shipping a file cost different
+things.** This bounds a walk of the pod's own disk and the size of the listing that
+crosses the wire; `OUTPUT_COUNT_LIMIT` below bounds how many files one Turn transfers.
+They were one constant until 2026-08-25, and that is precisely what made the transfer
+bound cumulative: the pod stopped scanning at the transfer bound, so a Session already
+holding that many had the files it added this Turn fall outside what the pod would even
+report. The filter that weighs already-delivered paths out of the transfer bound cannot
+weigh a path it was never shown.
+
+The scan stops once it has this many *plus one*, and that extra entry is the signal
+rather than a payload: it lets the far end tell "the tree holds exactly what I will
+enumerate" from "it holds more", without the pod having read a directory of unknown size
+to count.
+
+Two thousand and forty-eight, and the ratio to the transfer bound is the point rather
+than the number. Being over this one is
+the worse of the two failures: past it the walk yields a sorted prefix and nothing
+else, so a file whose name sorts beyond the cut is invisible on this Turn and on every
+Turn after it. Being over the transfer bound is recoverable by comparison -- that tail
+stays on the pod and the next Turn reaches further into it.
+
+Which is why the signal is read rather than merely available. `_within_the_ceilings`
+is told whether the listing came back over this bound and `output.partial` carries it,
+on every Turn it is true and not only on the Turn a tail also existed. There is nothing
+the platform can do about a tree this size -- it will not walk further, and it cannot
+delete out of a pod -- and everything the tenant can, once they are told.
+
+It is not higher, and the reason is the pod's own clock rather than the wire. Every file
+this walk lists is read and hashed on every Turn (`_digest_of` in `shim/serve.py`), so
+the ceiling is also what a Session pays per Turn for the rest of its life. Two thousand
+small documents is milliseconds; two hundred thousand would be a Turn spent hashing.
+"""
+
+OUTPUT_COUNT_LIMIT = 500
+"""How many produced files one completed Turn may ship.
 
 Declared here rather than beside the route that reports them, because it is a bound on
-what a control-plane worker will take rather than a fact about the pod -- and read by
-`shim/serve.py`, so the listing and the refusal cannot come to disagree about what "too
-many" is. The listing stops once it has this many *plus one*, and that extra entry is
-what lets this module tell "exactly the limit" from "more than the limit" without the
-pod having read a directory of unknown size to count.
+what a control-plane worker will take rather than a fact about the pod.
 
-Thirty-two is generous for what this ships and small enough to keep the transfer
-bounded. An agent asked to produce a document produces one to a handful of files at
-its working root; a tree with more than thirty-two files directly in it is a build
-directory, and shipping one of those is an unbounded transfer of things nobody asked
-to keep.
+**Five hundred, raised from thirty-two on 2026-08-25, and the reason for the old number
+had stopped being true.** Thirty-two was chosen for an agent that writes a document:
+one to a handful of files at a working root, and a tree with more than thirty-two files
+directly in it read as a build directory nobody asked to keep. Agents that fan a
+literature review out to a file per paper, or a report out to a file per section,
+produce hundreds in one Turn and are not build directories, and thirty-two turned them
+into a Turn that shipped a third of its work.
 
-The cost is stated where it bites: a Session whose agent leaves more than this at its
-root has every Turn refused, and cannot be unwedged from the tenant surface -- there is
-no route that deletes a file out of a pod. That is the deliberate trade. A tenant handed
-thirty-two of a hundred files cannot tell which the platform dropped, or that it dropped
-any, and a silent wrong answer is worse than a loud refusal.
+It is not the bound that keeps the transfer finite -- `OUTPUT_BUDGET_BYTES` is, and it
+did not move. What this one bounds is the *count*: five hundred sequential fetch-and-
+store round trips, one per file, inside the tenant's own request. At an in-cluster fetch
+plus an object-store write that is tens of seconds on a Turn that produced five hundred
+files, which is a Turn that has already been running for minutes. Raising it further
+buys less: the byte budget would bind first for anything but very small files, and the
+round trips are what a tenant waits through.
+
+It is deliberately far below `OUTPUT_TREE_LIMIT`, and the gap is what makes this a bound
+on one Turn rather than on the Session -- see that constant. Moving this one up without
+moving that one is what tightens the gap, and
+`test_the_enumeration_bound_is_well_above_what_one_turn_transfers` is what notices.
+
+**It bounds what one Turn ADDS, not what the Session holds**, and that distinction was
+missing until 2026-08-25. Nothing empties the agent's output directory between Turns, so
+the pod re-offers every file it has ever produced on every Turn; counted whole, this was
+a budget on distinct paths for the life of the Session, and a run writing four files a
+Turn shipped seven times and was refused on the eighth having done nothing different.
+Worse, there is no route that deletes a file out of a pod, so that refusal repeated on
+every Turn after it and the Session could never deliver again. `_not_yet_delivered` is
+what makes the count this docstring always claimed the count that is taken.
+
+Being over it no longer fails the Turn either. Ship-out takes this many in sorted
+order, leaves the rest on the pod for the next Turn, and appends `output.partial`
+naming what it left and which ceiling bound it. The objection the old refusal rested
+on was silence rather than partiality -- a tenant handed some of what they produced
+cannot tell which the platform dropped *if nothing says so* -- and the event says so.
 """
 
 OUTPUT_BUDGET_BYTES = 64 * 1024 * 1024
@@ -81,9 +152,16 @@ is one file rather than the whole set -- but the set is what a Turn is allowed t
 and an unbounded one is a control-plane replica killed by the OOM reaper while serving
 one tenant's Session.
 
-Checked against the lengths the listing reported, before any transfer starts, for the
-reason `session_files.py` checks its budget before its first push: a Turn that is going
-to be refused on its fourth file should not have shipped three.
+Spent against the lengths the listing reported rather than against what arrives, so the
+set a Turn will take is decided before the first byte moves. Files are taken in sorted
+order until the next one would cross this line, and the rest are left on the pod with
+`output.partial` naming them -- so a Turn that cannot afford its fourth file still ships
+three, which is the opposite of the old shape, where one file over the line cost every
+file beside it.
+
+One case this cannot repair, stated because only the event makes it visible: a single
+file larger than this whole budget fits in no prefix and is therefore left behind on
+every Turn, forever.
 """
 
 
@@ -122,13 +200,42 @@ class ProducedFile:
 class OutputsNotShippable(Exception):
     """What the agent produced cannot be made durable, so the Turn did not achieve it.
 
-    One type for every reason, because the caller does the same thing with all of them:
-    `HttpPodDispatch` turns whatever the completion seam raises into `TurnUndeliverable`
-    and `control/api/routes/turns.py` records the Turn as failed. The reasons are not
-    interchangeable to a reader, though -- too many files, too many bytes, a body that
-    did not match its listed length, and a name the pod promised not to send are four
-    different problems -- so each carries its own message.
+    One type for every reason whose *caller* acts the same on it, which is all of them
+    but one: `HttpPodDispatch` turns whatever the completion seam raises into
+    `TurnUndeliverable` and `control/api/routes/turns.py` records the Turn as failed.
+    The reasons are not interchangeable to a reader, though -- a body that did not match
+    its listed length, bytes that changed between the listing and the fetch, and a name
+    the pod promised not to send are three different problems -- so each carries its own
+    message.
+
+    The exception is `OutputNotRevisable` below, which subclasses this. It is split off
+    because the caller does *not* do the same thing with it: it is the tenant's own
+    doing, it answers 409 rather than 502, and the move it invites is the opposite of a
+    retry.
     """
+
+
+class OutputNotRevisable(OutputsNotShippable):
+    """The agent wrote a produced path it had already delivered, with other bytes.
+
+    The one refusal in this module the tenant caused and can fix, which is why it is
+    the one with a type of its own. Everything else raised here is the pod failing to
+    serve what it listed, and a tenant's move for all of those is to try the Turn
+    again; trying again here re-runs an agent that writes the same path a second time.
+
+    A subclass rather than a separate hierarchy so a caller that knows only
+    `OutputsNotShippable` still catches it -- and `pod_channel.py`, which translates
+    this one to a 409 and collapses the rest into `TurnUndeliverable`, tells them apart
+    by type rather than by matching the message. Matching the message would make a
+    tenant-visible status depend on how an operator worded a sentence.
+
+    The path is an attribute because the refusal envelope two hops up puts it in
+    `detail`; recovering it by parsing the message would tie that field to the prose.
+    """
+
+    def __init__(self, path: str, message: str) -> None:
+        super().__init__(message)
+        self.path = path
 
 
 class WorkspaceOutputs(Protocol):
@@ -239,6 +346,67 @@ class EachAtTurnCompletion:
             await seam.turn_completed(session_id, turn_id)
 
 
+@dataclass(frozen=True, slots=True)
+class _Bounded:
+    """What one Turn's ship-out takes of what it was offered, and what it leaves.
+
+    `left_behind` counts only paths the pod actually listed. `tree_truncated` says the
+    listing was not the whole tree, so there are further paths this number does not
+    include and cannot -- counting them would mean the pod reading a directory of
+    unknown size, which is what `OUTPUT_TREE_LIMIT` exists to prevent. The two fields
+    together are the honest answer: this many are late, and there may be more.
+    """
+
+    taken: tuple[ProducedFile, ...]
+    left_behind: int
+    bytes_taken: int
+    tree_truncated: bool
+
+
+def _within_the_ceilings(
+    undelivered: Sequence[ProducedFile], tree_truncated: bool
+) -> _Bounded:
+    """As many new files as one Turn ships, and how many it turned away.
+
+    **A prefix of the sorted list rather than, say, the smallest files first.** A prefix
+    is stable, so a Session over the ceiling converges on having its first N paths
+    durable instead of thrashing between arbitrary halves of itself -- and the paths it
+    did not take are offered again next Turn, where the ones already delivered cost
+    nothing and the same prefix rule reaches further into the tail.
+
+    **Both ceilings are checked per file rather than over the set**, which is what makes
+    a partial possible at all: the old shape summed the whole set and refused, so one
+    file over the budget cost every file beside it. Here the loop stops adding when the
+    next file would cross either line, and everything it already took still ships.
+
+    A single file larger than the whole byte budget is left behind rather than allowed
+    through, and it is the one case this costs something real: no prefix containing it
+    ever fits, so it never ships. `output.partial` is the only place a tenant could
+    learn that, which is why it is appended for every non-empty tail rather than only
+    for the ones that will drain.
+
+    The only walk of this shape left in the tree. There was a near-copy in the
+    working-lane sync, deliberately kept separate because the ceilings and the announced
+    counts differed; that module is gone with the lane (ADR-035), so the question of
+    folding them is closed rather than answered.
+    """
+    taken: list[ProducedFile] = []
+    bytes_taken = 0
+    for file in sorted(undelivered, key=lambda one: one.name):
+        if len(taken) >= OUTPUT_COUNT_LIMIT:
+            break
+        if bytes_taken + file.byte_length > OUTPUT_BUDGET_BYTES:
+            break
+        taken.append(file)
+        bytes_taken += file.byte_length
+    return _Bounded(
+        taken=tuple(taken),
+        left_behind=len(undelivered) - len(taken),
+        bytes_taken=bytes_taken,
+        tree_truncated=tree_truncated,
+    )
+
+
 class ShipOutOutputsAtTurnCompletion:
     """Puts every file the agent produced this Turn into the object store.
 
@@ -286,11 +454,13 @@ class ShipOutOutputsAtTurnCompletion:
         artifacts: ArtifactLane,
         sessions: SessionCreationFacts,
         events: EventLogAppend,
+        log_range: SessionLogReader,
     ) -> None:
         self._outputs = outputs
         self._artifacts = artifacts
         self._sessions = sessions
         self._events = events
+        self._log_range = log_range
 
     async def turn_completed(self, session_id: SessionId, turn_id: TurnId) -> None:
         """Ship what this Session's agent produced, or refuse having shipped none.
@@ -305,28 +475,133 @@ class ShipOutOutputsAtTurnCompletion:
         file under, and a name that fails it is a pod sending something its own listing
         promised not to. That is a lying pod rather than a badly named document, which
         is why it raises rather than being skipped -- a real pod never produces it.
+
+        **That check runs over everything the pod offered, and it runs first.** A
+        compromised pod is a different kind of problem from a Turn that produced too
+        much, and ordering the bounds ahead of it would let a pod hide an illegal path
+        behind a listing large enough to be refused on its count. Both refuse the Turn,
+        so the ordering costs nothing but which reason is reported -- and the reason is
+        the only thing an operator reading it has.
+
+        **The bounds are then weighed over what is NOT already delivered**, which is
+        what makes them per-Turn; `_not_yet_delivered` carries why. A Turn that produced
+        nothing new returns having asked nothing of the pod, the bucket or the Session
+        registry -- the same shape a Turn that produced nothing at all takes, and for
+        the same reason: there is no work in it.
+
+        **Being over those bounds ships part and appends `output.partial`; it does not
+        fail the Turn.** That is the sibling sync's choice and the reason carries over
+        with one addition. A Turn that did the work and wrote the documents must not be
+        failed for how many of them there were -- and here it must especially not be,
+        because nothing removes a file from a pod, so a refusal repeats on every Turn
+        after it and the Session can never deliver again. The objection the old refusal
+        was built on was silence, not partiality: a tenant handed some of what they
+        produced cannot tell which the platform dropped *if nothing says so*. The event
+        says so, and names the ceiling that bound it.
+
+        What still fails the Turn is the set of things a later Turn cannot repair: a pod
+        offering a path its own listing rule forbids, a body that arrives at the wrong
+        length or the wrong digest, and an artifact rewritten under a path already
+        delivered. None of those is a quantity, and none of them drains.
         """
         produced = await self._outputs.list_outputs(session_id)
         if not produced:
             return
-        if len(produced) > OUTPUT_COUNT_LIMIT:
-            raise OutputsNotShippable(
-                f"the workspace of session {session_id} holds more than "
-                f"{OUTPUT_COUNT_LIMIT} files at its root after turn {turn_id}, so "
-                "shipping them would be an unbounded transfer and shipping some of "
-                "them would not say which"
-            )
-        total = sum(file.byte_length for file in produced)
-        if total > OUTPUT_BUDGET_BYTES:
-            raise OutputsNotShippable(
-                f"the files session {session_id} produced in turn {turn_id} total "
-                f"{total} bytes, over the {OUTPUT_BUDGET_BYTES} one Turn may ship"
-            )
         for file in produced:
             _refuse_a_path_the_pod_promised_not_to_send(session_id, file.name)
-        tenant_id = (await self._sessions.read(session_id)).tenant_id
-        for file in produced:
-            await self._ship_one(session_id, tenant_id, file)
+        bounded = _within_the_ceilings(
+            await self._not_yet_delivered(session_id, produced),
+            tree_truncated=len(produced) > OUTPUT_TREE_LIMIT,
+        )
+        if bounded.taken:
+            tenant_id = (await self._sessions.read(session_id)).tenant_id
+            for file in bounded.taken:
+                await self._ship_one(session_id, tenant_id, file)
+        if bounded.left_behind or bounded.tree_truncated:
+            await self._say_what_did_not_fit(session_id, bounded)
+
+    async def _not_yet_delivered(
+        self, session_id: SessionId, produced: Sequence[ProducedFile]
+    ) -> tuple[ProducedFile, ...]:
+        """The files whose bytes this Session's artifacts lane does not already hold.
+
+        **This is what makes the two bounds above per-Turn rather than per-Session.**
+        Nothing empties the agent's output directory between Turns and nothing should,
+        so the pod re-offers every file it has ever produced on every Turn after the
+        first. Counted whole, the bound is a budget on distinct paths for the life of
+        the Session: a run writing four files a Turn ships seven times and is refused on
+        the eighth, having done nothing different. Counted here, only what this Turn
+        actually added is weighed, which is what both bounds' own docstrings say they
+        weigh.
+
+        It also removes the transfer. A path already delivered with identical bytes is
+        dropped before anything is fetched from the pod or read out of the bucket, so a
+        Turn that produced nothing new costs one log fold instead of a fetch and a
+        download per file it has ever produced.
+
+        **A path already delivered with DIFFERENT bytes is kept, not dropped.** That is
+        the agent rewriting a delivered artifact, the seal says it cannot be recorded,
+        and `_ship_one` is where it is refused saying so. Dropping it here would be the
+        silent wrong answer -- a Turn reporting success having stored neither version.
+
+        The fold fails safe, so a path whose write has fallen below the log's retained
+        floor reads as undelivered and is transferred again. `_ship_one` then finds the
+        key occupied and settles it on the bytes, which is the slow path and the correct
+        one.
+        """
+        delivered = await digests_in_lane(
+            self._log_range, session_id, ARTIFACTS.directory
+        )
+        return tuple(
+            file
+            for file in produced
+            if digest_differs(file.content_sha256, delivered.get(file.name))
+        )
+
+    async def _say_what_did_not_fit(
+        self, session_id: SessionId, bounded: _Bounded
+    ) -> None:
+        """Announce the tail this Turn did not take, and log it for an operator.
+
+        Both audiences, because the two learn different things from it. The tenant gets
+        the counts and the ceilings, which is what tells them a document is coming
+        rather than lost; the platform's own log gets the same numbers against a
+        Session id, which is what turns "one tenant's file is late" into a pattern.
+
+        **Appended for a truncated tree even when nothing was left behind**, and that is
+        the case worth being deliberate about. A Session past the enumeration bound goes
+        on taking Turns, and on most of them everything the listing showed is already
+        delivered -- every ceiling here satisfied, `paths_left` zero, and by every
+        measure this code has of its own work the Turn went perfectly. The files past
+        the cut are still unreachable. Announced only on the Turn a tail existed, the
+        one report would be the Turn it first appeared on and a tenant not watching then
+        would never hear of it again.
+        """
+        _LOG.warning(
+            "session %s produced more than one Turn ships; took %d of %d new paths "
+            "(%d bytes) against ceilings %d and %d, tree truncated: %s",
+            session_id,
+            len(bounded.taken),
+            len(bounded.taken) + bounded.left_behind,
+            bounded.bytes_taken,
+            OUTPUT_COUNT_LIMIT,
+            OUTPUT_BUDGET_BYTES,
+            bounded.tree_truncated,
+        )
+        await append_in_order(
+            self._events,
+            session_id,
+            output.OUTPUT_PARTIAL,
+            {
+                "paths_shipped": len(bounded.taken),
+                "paths_left": bounded.left_behind,
+                "bytes_shipped": bounded.bytes_taken,
+                "path_ceiling": OUTPUT_COUNT_LIMIT,
+                "byte_ceiling": OUTPUT_BUDGET_BYTES,
+                "tree_ceiling": OUTPUT_TREE_LIMIT,
+                "tree_truncated": bounded.tree_truncated,
+            },
+        )
 
     async def _ship_one(
         self,
@@ -405,10 +680,11 @@ class ShipOutOutputsAtTurnCompletion:
         except ObjectAlreadyPresent as occupied:
             if await self._is_already_delivered(target, body):
                 return
-            raise OutputsNotShippable(
+            raise OutputNotRevisable(
+                file.name,
                 f"session {session_id} produced {file.name!r} again with different "
                 "bytes, and an artifact already delivered under that path cannot be "
-                "revised -- write the new version under a different path"
+                "revised -- write the new version under a different path",
             ) from occupied
         await append_in_order(
             self._events,

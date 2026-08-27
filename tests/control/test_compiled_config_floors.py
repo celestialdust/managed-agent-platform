@@ -62,6 +62,7 @@ from managed_agent.core.pod.permission_profile import (
     nested_deny_pairs,
     path_spelling_error,
 )
+from managed_agent.core.pod.workspace_contract import SCRATCH_ROOT
 from managed_agent.core.registration.definition import (
     AgentDefinition,
     SkillsRevision,
@@ -77,6 +78,9 @@ from managed_agent.core.session.session_token import (
 POD_TEMPLATE = (
     Path(__file__).resolve().parents[2] / "deploy" / "k8s" / "session-pod.yaml"
 )
+_DOCKERFILE = (
+    Path(__file__).resolve().parents[2] / "deploy" / "docker" / "session.Dockerfile"
+).read_text()
 GATEWAY_URL = "https://tool-gateway.map.internal/mcp"
 
 # Where a Session pod reaches the Model Gateway. The `/v1` is load-bearing at both ends:
@@ -527,8 +531,20 @@ def test_workspace_metadata_is_denied_before_it_exists() -> None:
     assert rules[f"{WORKSPACE_ROOT}/.agents"] == FsAccess.DENY.value
 
 
-def test_the_workspace_is_the_only_writable_prefix() -> None:
-    assert session_profile().writable() == (WORKSPACE_ROOT,)
+def test_the_writable_prefixes_are_the_workspace_and_pod_local_scratch() -> None:
+    """Two, and the pair is asserted whole rather than one membership at a time.
+
+    The profile extends `:read-only`, so this tuple IS the set of places a confined
+    command can write anything at all -- there is no writable root that is not a rule
+    here. A third entry appearing is the sandbox getting wider, which is the change
+    this file exists to make loud; either entry disappearing takes a capability the
+    platform has promised the model in `core/pod/workspace_contract.py`.
+
+    Order is the declaration order the profile renders in, and it is asserted with the
+    membership because `writable()` documents itself as ordered: a comparison that
+    sorted first would stop grading the rendering.
+    """
+    assert session_profile().writable() == (WORKSPACE_ROOT, SCRATCH_ROOT)
 
 
 def test_the_profile_extends_the_read_only_built_in() -> None:
@@ -1236,26 +1252,18 @@ def test_the_pod_manifest_parses_and_declares_both_stages() -> None:
     """Guard the guard: every loop below is over something read out of this file, and
     a manifest that failed to parse into the expected shape would make them vacuous."""
     spec = _pod()["spec"]
-    # By name and in order rather than by count, because the ORDER is the load-bearing
-    # part: init containers run in sequence, and `restore-working-lane` writes into
-    # /session/workspace/.codex's parent only after `seed-runtime-home` has created that
-    # directory and `.agents` beside it -- the two targets bwrap refuses to build a
-    # sandbox without. A count says nothing about which came first.
-    #
-    # `seed-rollout` is third for a reason of the same kind: it writes into a second
-    # volume, and a workspace restore that is going to refuse should refuse before that
-    # happens. A refusal stops every container behind it, so the cheaper and likelier
-    # failure goes first.
+    # By name rather than by count. The ordering that used to be load-bearing here --
+    # the Rollout written under CODEX_HOME only after that root exists -- is inside one
+    # container's body now, and `tests/deploy/test_the_pod_seeds_its_rollout.py` asserts
+    # it by position there. What this still says is which container exists at all.
     assert [container["name"] for container in spec["initContainers"]] == [
         "seed-runtime-home",
-        "restore-working-lane",
-        "seed-rollout",
     ]
     assert [container["name"] for container in spec["containers"]] == [
         "agent-runtime",
         "session-shim",
     ]
-    assert len(spec["volumes"]) == 7
+    assert len(spec["volumes"]) == 8
 
 
 def test_every_path_the_profile_names_lives_in_a_volume_the_pod_mounts() -> None:
@@ -1330,6 +1338,18 @@ def test_no_container_redirects_the_system_temporary_directory() -> None:
     for container in _all_containers():
         named = {entry["name"] for entry in container.get("env", [])}
         assert not named & {"TMPDIR", "TMP", "TEMP"}, container["name"]
+
+    # The image is the third door and the one the manifest cannot see. All three
+    # containers run one image, so an `ENV TMPDIR=` there reaches this process's
+    # environment exactly as a container entry would -- and it does so invisibly to
+    # every case in this file that reads the manifest. ADR-037 asks for a TMPDIR on
+    # pod-local scratch and that is the reason this clause is here rather than merely
+    # implied: the variable cannot be aimed at the agent without also aiming it at the
+    # runtime, because they are one process's environment, and pointing it at a
+    # directory the confined process can write hands the agent the staging area the
+    # sandbox helper builds mount targets in before every command.
+    for line in _DOCKERFILE.splitlines():
+        assert not re.match(r"ENV\s+(TMPDIR|TMP|TEMP)=", line.strip()), line
 
 
 def test_the_scratch_volume_is_bounded_and_on_the_node_disk() -> None:
@@ -1440,6 +1460,36 @@ def test_the_pod_mounts_no_service_account_token() -> None:
     assert _pod()["spec"]["automountServiceAccountToken"] is False
 
 
+def test_the_two_start_up_budgets_are_one_budget_sampled_twice() -> None:
+    """The runtime's startupProbe and the shim's readinessProbe wait for one event.
+
+    That event is the control socket appearing. The manifest says so beside the shim's
+    probe -- its budget "matches agent-runtime's startupProbe above, because it is the
+    same wait" -- and until this existed, that was one sentence holding two numbers
+    equal. They drift silently and in the direction that hurts: a shim whose budget runs
+    out first is a pod that never enters DNS while the runtime beside it comes up
+    perfectly, and under `restartPolicy: Never` that pod never runs a Turn.
+
+    The PRODUCT is asserted and the sampling period is not, which is deliberate. How
+    finely the budget is sampled is a latency decision -- a pod ready at 3.2s waits out
+    the rest of whatever period it is in -- and halving the period while doubling the
+    threshold must be free to make without touching this.
+    """
+    containers = {c["name"]: c for c in _all_containers()}
+    runtime = containers["agent-runtime"]["startupProbe"]
+    shim = containers["session-shim"]["readinessProbe"]
+
+    def budget(probe: dict[str, Any]) -> int:
+        return int(probe["periodSeconds"]) * int(probe["failureThreshold"])
+
+    assert budget(runtime) > 0, "a probe budgeting nothing is not a budget"
+    assert budget(runtime) == budget(shim), (
+        f"the runtime is given {budget(runtime)}s to bind its control socket and the "
+        f"shim {budget(shim)}s to see it happen; the shorter of the two is the one "
+        "that decides, and the manifest claims they are the same wait"
+    )
+
+
 def test_every_container_drops_every_capability() -> None:
     """Container-level and not inherited from the pod's securityContext, which is why an
     init container that omits the block runs with the default bounding set while its
@@ -1448,8 +1498,6 @@ def test_every_container_drops_every_capability() -> None:
     containers = _all_containers()
     assert [container["name"] for container in containers] == [
         "seed-runtime-home",
-        "restore-working-lane",
-        "seed-rollout",
         "agent-runtime",
         "session-shim",
     ]

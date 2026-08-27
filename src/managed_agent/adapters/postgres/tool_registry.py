@@ -34,6 +34,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from managed_agent.core.ids import TenantId
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.scope_binding import (
     NameAlreadyRegistered,
     RegisteredTool,
@@ -45,7 +46,8 @@ from managed_agent.core.registration.scope_binding import (
 # already filtered by tenant and the composite foreign key makes a tool and its server
 # share one -- the constraint is what lets the read stay this short.
 _TOOL_COLUMNS = (
-    "SELECT t.name AS name, t.remote_name AS remote_name,"
+    "SELECT t.name AS name, t.advertised_name AS advertised_name,"
+    " t.remote_name AS remote_name,"
     " t.parameters AS parameters, t.scope_bindings AS scope_bindings,"
     " s.server_name AS server_name, s.endpoint AS endpoint"
     " FROM registered_tool t JOIN tool_server s ON s.id = t.server_id"
@@ -53,6 +55,7 @@ _TOOL_COLUMNS = (
 
 _READ_TYPES = {
     "name": sa.Text(),
+    "advertised_name": sa.Text(),
     "remote_name": sa.Text(),
     "parameters": sa.JSON(),
     "scope_bindings": sa.JSON(),
@@ -67,8 +70,12 @@ _TAKEN_SERVER_NAME = sa.text(
     " WHERE tenant_id = :tenant AND server_name = :server_name"
 ).bindparams(_TENANT)
 
+# On the advertised name and not on `name`, which is what per-server scoping means
+# here: `search` behind two servers is two rows and no collision, while two rows that
+# would advertise one string is still the collision the runtime cannot survive.
 _TAKEN_TOOL_NAMES = sa.text(
-    "SELECT name FROM registered_tool WHERE tenant_id = :tenant AND name = ANY(:names)"
+    "SELECT advertised_name FROM registered_tool"
+    " WHERE tenant_id = :tenant AND advertised_name = ANY(:names)"
 ).bindparams(_TENANT, sa.bindparam("names", type_=sa.ARRAY(sa.Text())))
 
 _INSERT_SERVER = sa.text(
@@ -82,8 +89,10 @@ _INSERT_SERVER = sa.text(
 
 _INSERT_TOOL = sa.text(
     "INSERT INTO registered_tool"
-    " (tenant_id, name, server_id, remote_name, parameters, scope_bindings)"
-    " VALUES (:tenant, :name, :server_id, :remote_name, :parameters, :scope_bindings)"
+    " (tenant_id, name, advertised_name, server_id, remote_name, parameters,"
+    " scope_bindings)"
+    " VALUES (:tenant, :name, :advertised_name, :server_id, :remote_name,"
+    " :parameters, :scope_bindings)"
 ).bindparams(
     _TENANT,
     sa.bindparam("server_id", type_=sa.Uuid()),
@@ -91,8 +100,12 @@ _INSERT_TOOL = sa.text(
     sa.bindparam("scope_bindings", type_=sa.JSON()),
 )
 
+# Keyed on the advertised name because that is what the caller has: the Gateway is
+# handed one string by the model and has no second field carrying the server.
 _LOOKUP = (
-    sa.text(f"{_TOOL_COLUMNS} WHERE t.tenant_id = :tenant AND t.name = :name")
+    sa.text(
+        f"{_TOOL_COLUMNS} WHERE t.tenant_id = :tenant AND t.advertised_name = :name"
+    )
     .bindparams(_TENANT)
     .columns(**_READ_TYPES)
 )
@@ -113,10 +126,14 @@ class PostgresToolRegistry:
     ) -> None:
         """Write the server and every tool it offers, or write none of them.
 
-        Raises `NameAlreadyRegistered` when this tenant already holds the server name or
-        any of the tool names, naming which. The refusal is whole rather than partial:
-        a registration that dropped its colliding tools and kept the rest would leave a
-        tenant believing it registered a catalog it did not.
+        Raises `NameAlreadyRegistered` when this tenant already holds the server name,
+        or when any tool would advertise a name it already advertises, naming which. A
+        tool name this tenant uses behind a *different* server is not a collision: the
+        pair identifies the tool, and only the joined form has to stay unique.
+
+        The refusal is whole rather than partial: a registration that dropped its
+        colliding tools and kept the rest would leave a tenant believing it registered
+        a catalog it did not.
 
         The server name is checked before the tool names, and the order is the answer to
         a case where both are taken: re-submitting a registration that already succeeded
@@ -134,7 +151,10 @@ class PostgresToolRegistry:
             if taken_server is not None:
                 raise NameAlreadyRegistered("server", (str(taken_server),))
 
-            names = [tool.name for tool in registration.tools]
+            names = [
+                advertised_name_for(registration.server_name, tool.name)
+                for tool in registration.tools
+            ]
             taken_tools = (
                 (
                     await conn.execute(
@@ -173,6 +193,9 @@ class PostgresToolRegistry:
                         {
                             "tenant": tenant_id,
                             "name": tool.name,
+                            "advertised_name": advertised_name_for(
+                                registration.server_name, tool.name
+                            ),
                             "server_id": server_id,
                             "remote_name": tool.remote_name,
                             "parameters": {
@@ -186,10 +209,22 @@ class PostgresToolRegistry:
                         },
                     )
                 except IntegrityError as exc:
-                    raise NameAlreadyRegistered("tool", (tool.name,)) from exc
+                    # Named by the advertised form, because the bare name is not what
+                    # collided: the caller may hold no other `search`, and being told
+                    # `search` is taken would send them looking for one. The advertised
+                    # name says which server already offers it.
+                    raise NameAlreadyRegistered(
+                        "tool",
+                        (advertised_name_for(registration.server_name, tool.name),),
+                    ) from exc
 
     async def lookup(self, tenant_id: TenantId, tool_name: str) -> RegisteredTool:
-        """The tool of that name and the server behind it, for this tenant only.
+        """The tool of that advertised name and the server behind it, this tenant only.
+
+        `tool_name` is the *advertised* name -- `<server>__<tool>` -- because that is
+        the only name the caller has. The Tool Gateway is handed one string by the model
+        and no second field carrying the server, which is the whole reason the joined
+        form exists.
 
         Raises `UnknownTool` when the tenant has none of that name. One refusal covers
         both "never registered" and "another tenant's", so holding a name confirms

@@ -19,11 +19,16 @@ import httpx
 import pytest
 
 from managed_agent.composition import _BUCKET_ENV, _RolloutNotYetShipped, build
+from managed_agent.control.files.output_shipout import (
+    EachAtTurnCompletion,
+    OutputNotRevisable,
+)
 from managed_agent.control.files.rollout_sync import (
     TURN_CLOSED_ABORTED,
     TURN_CLOSED_COMPLETE,
     TURN_OPENED,
     MalformedRollout,
+    RolloutObjectStore,
     RolloutSync,
     ShipOutAtTurnCompletion,
     rollout_key,
@@ -35,7 +40,11 @@ from managed_agent.control.session.placement import (
     Placement,
     PodPhase,
 )
-from managed_agent.control.session.turn_dispatch import TurnDispatch, TurnUndeliverable
+from managed_agent.control.session.turn_dispatch import (
+    TurnDispatch,
+    TurnOutputNotRevisable,
+    TurnUndeliverable,
+)
 from managed_agent.core.ids import FIRST_SEQ, Seq, SessionId, TurnId, new_turn_id
 from managed_agent.core.session.markers import DiscardCause, WorkDiscarded, discard
 from managed_agent.core.vocabulary import turn
@@ -229,6 +238,56 @@ def _a_pod_streaming_one_completed_turn(turn_id: TurnId) -> httpx.MockTransport:
         return httpx.Response(200, content=body)
 
     return httpx.MockTransport(answer)
+
+
+def _a_pod_streaming_one_failed_turn(turn_id: TurnId) -> httpx.MockTransport:
+    """A pod whose Turn ended without completing, built as the shim really builds one.
+
+    The `{"kind": "completed"}` line the helper above ends with is **absent**, and its
+    absence is the whole difference. `serve.StreamedCompletion` writes that line only
+    when the runtime reached a completion, so a failed Turn's stream carries its
+    `turn.failed` event and then stops -- which is what tells `_record` apart the two
+    endings it now runs different seams for.
+    """
+    body = (
+        json.dumps(
+            {
+                "kind": "event",
+                "type": turn.TURN_FAILED,
+                "payload": {"turn_id": str(turn_id), "cause": "model_error"},
+            }
+        )
+        + "\n"
+    ).encode()
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=body)
+
+    return httpx.MockTransport(answer)
+
+
+class RecordingSeam:
+    """A second completion seam, standing in for the outputs ship-out.
+
+    It records rather than acts, because what these cases grade is *which* seams a
+    Turn's ending runs -- not what the outputs seam does once it runs, which
+    `tests/control/test_output_shipout.py` grades on its own with the collaborators
+    that seam really needs.
+
+    It exists because every dispatch case in this file used to hand `on_completed` a
+    bare `ShipOutAtTurnCompletion`, which is not the shape `composition.build` builds:
+    with a bucket configured the seam is an `EachAtTurnCompletion` holding the Rollout's
+    ship-out *and* the outputs ship-out. A bare seam reads as though a completed Turn
+    ran one thing, and that reading is how a change to the ship-out's trigger could look
+    local while it silently moved the outputs seam too. Composing the real shape costs
+    one line per case and keeps the second seam where a reader trips over it.
+    """
+
+    def __init__(self) -> None:
+        self.ran: list[TurnId] = []
+
+    async def turn_completed(self, session_id: SessionId, turn_id: TurnId) -> None:
+        self.ran.append(turn_id)
 
 
 # ------------------------------------------------------------------------------------
@@ -646,7 +705,14 @@ class FixedPhase:
         return self._phase
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("reading a rollout tried to remove a pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
 
 class NeverDialled(httpx.AsyncBaseTransport):
@@ -972,21 +1038,42 @@ async def test_a_bucket_that_refuses_the_write_fails_the_turn_as_undeliverable()
     from the closed set, and the Event Log gets no record that the Turn produced an
     answer nothing can resume from.
 
-    The `turn.completed` append is asserted to have happened first, because that is the
-    divergence ADR-004 puts in writing: the Event Log may be one Turn ahead of the
-    resume state, and failing loudly here is the deliberate alternative to a Turn that
-    reads as durable while its bytes are only inside a pod about to be allowed to die.
+    **The `turn.completed` append is asserted NOT to have happened**, which is the
+    reverse of what this case asserted until 2026-08-26. The divergence it used to
+    assert -- the Event Log running one Turn ahead of the resume state -- is real and
+    still tolerated, and it survives this: every other event this Turn produced is in
+    the log, so the log still holds a Turn the stored Rollout does not. What is
+    withheld is only the marker that says the Turn reached the durability boundary,
+    because the seam that makes that true is the seam that just failed.
+
+    The marker is not decoration. `control/session/pods.py` folds it into `resuming`,
+    and a pod told it is resuming with nothing to resume from refuses to start
+    (`session_shim/seed_rollout.py`). While a pod outlived its Turn that cost a resume;
+    since ADR-041 made every Turn a placement it costs every Turn, so a Session whose
+    **first** completed Turn failed to ship -- the one case where "one Turn ahead" is
+    ahead of nothing at all -- could never be placed again. Append-only, no recovery.
+
+    Withholding it costs nothing in the case the divergence was written for. A Session
+    at Turn N>1 still holds `turn.completed` from Turn N-1, so it still compiles
+    `resuming=True`, still finds Turn N-1's Rollout, and still replays Turn N exactly
+    as before. What changes is that one Turn now carries one terminal event instead of
+    the `turn.completed` **and** `turn.failed` it used to end up with once the route
+    appended its own.
     """
     session_id = SessionId(uuid4())
     turn_id = new_turn_id()
     log = CountingLog()
+    outputs = RecordingSeam()
     dispatch = HttpPodDispatch(
         placement=Placement(FixedPhase()),
         pods=NeverPlaces(),
         log=log,
-        on_completed=ShipOutAtTurnCompletion(
-            FixedFetch(_rollout(_meta(), _event("turn_complete", 1))),
-            RolloutSync(StoreThatCannotWrite()),
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(
+                FixedFetch(_rollout(_meta(), _event("turn_complete", 1))),
+                RolloutSync(StoreThatCannotWrite()),
+            ),
+            outputs,
         ),
         namespace=_NAMESPACE,
         token_key=_KEY,
@@ -996,9 +1083,191 @@ async def test_a_bucket_that_refuses_the_write_fails_the_turn_as_undeliverable()
     with pytest.raises(TurnUndeliverable, match=str(session_id)):
         await dispatch.dispatch(session_id, turn_id, "a prompt")
 
-    assert log.types == [turn.TURN_COMPLETED], (
-        "the tenant-visible append happened first"
+    assert log.types == [], (
+        "a Turn whose bytes were never stored must not carry the marker that says "
+        "they were"
     )
+    assert outputs.ran == [], (
+        "a seam that raises stops the ones behind it in the composite"
+    )
+
+
+async def test_a_turn_whose_bytes_were_stored_does_carry_the_marker() -> None:
+    """The other half of the case above, so the withholding cannot pass by never
+    appending at all.
+
+    A withheld marker and a lost one are the same absence, and only one of them is the
+    intended behaviour. This is the same dispatch against a store that accepts the
+    write: the marker arrives, and it arrives having outlived the seam that earned it.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    log = CountingLog()
+    outputs = RecordingSeam()
+    store = InMemoryRolloutStore()
+    dispatch = HttpPodDispatch(
+        placement=Placement(FixedPhase()),
+        pods=NeverPlaces(),
+        log=log,
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(
+                FixedFetch(_rollout(_meta(), _event("turn_complete", 1))),
+                RolloutSync(store),
+            ),
+            outputs,
+        ),
+        namespace=_NAMESPACE,
+        token_key=_KEY,
+        transport=_a_pod_streaming_one_completed_turn(turn_id),
+    )
+
+    await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+    assert log.types == [turn.TURN_COMPLETED]
+    assert outputs.ran == [turn_id], "the seam behind the Rollout's ran too"
+    assert store.objects, "the marker is only honest if the bytes really landed"
+
+
+class SealedTheLane:
+    """An outputs seam refusing an artifact the agent rewrote after delivering it."""
+
+    async def turn_completed(self, session_id: SessionId, turn_id: TurnId) -> None:
+        raise OutputNotRevisable("report/report.txt", "already delivered")
+
+
+async def test_an_artifact_the_agent_rewrote_does_not_cost_the_turn_its_marker() -> (
+    None
+):
+    """The one seam failure that leaves a Turn completed, and why it is the only one.
+
+    `EachAtTurnCompletion` runs the Rollout's ship-out first and stops at the first seam
+    that raises -- asserted in the bucket case above, which sees the outputs seam not
+    run at all. So reaching the outputs seam proves the Rollout is stored: the boundary
+    `turn.completed` claims really was reached, `resuming` will find bytes, and no
+    Session can be wedged by this.
+
+    What failed is the agent rewriting a path it had already delivered, which the seal
+    on the lane refuses and the route answers 409 for. That is the tenant's own doing
+    and not a platform failure, so the Turn carries `turn.completed` here and
+    `turn.failed` once the route appends its own -- both true, about different things.
+    Withholding the marker for this would fail a Turn that worked.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    log = CountingLog()
+    store = InMemoryRolloutStore()
+    dispatch = HttpPodDispatch(
+        placement=Placement(FixedPhase()),
+        pods=NeverPlaces(),
+        log=log,
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(
+                FixedFetch(_rollout(_meta(), _event("turn_complete", 1))),
+                RolloutSync(store),
+            ),
+            SealedTheLane(),
+        ),
+        namespace=_NAMESPACE,
+        token_key=_KEY,
+        transport=_a_pod_streaming_one_completed_turn(turn_id),
+    )
+
+    with pytest.raises(TurnOutputNotRevisable):
+        await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+    assert log.types == [turn.TURN_COMPLETED], (
+        "the Rollout was stored, so this Turn reached the boundary its marker claims"
+    )
+    assert store.objects, "the seam ahead of the refusing one really did run"
+
+
+class ClusterRefusedTheDelete(Exception):
+    """What the API server refusing to remove a pod raises out of the cluster seam."""
+
+
+class CannotRemove(FixedPhase):
+    """A cluster that answers phases but refuses to give a pod back.
+
+    One transient `DELETE` failure is the ordinary shape of this: the object exists,
+    the API server is briefly unwilling, and nothing about the Turn that just ran is
+    wrong.
+    """
+
+    async def remove(self, pod_name: str) -> None:
+        raise ClusterRefusedTheDelete(pod_name)
+
+
+def _dispatch_over(
+    cluster: FixedPhase,
+    log: CountingLog,
+    transport: httpx.MockTransport,
+    store: RolloutObjectStore,
+) -> HttpPodDispatch:
+    return HttpPodDispatch(
+        placement=Placement(cluster),
+        pods=NeverPlaces(),
+        log=log,
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(
+                FixedFetch(_rollout(_meta(), _event("turn_complete", 1))),
+                RolloutSync(store),
+            ),
+            RecordingSeam(),
+        ),
+        namespace=_NAMESPACE,
+        token_key=_KEY,
+        transport=transport,
+    )
+
+
+async def test_a_release_that_fails_does_not_replace_the_turns_own_failure() -> None:
+    """A refused `DELETE` must not become the Turn's diagnosis.
+
+    `dispatch` releases the pod in a `finally`, and an exception raised in a `finally`
+    **replaces** the one already in flight. So a cluster blip during release used to
+    erase the real `TurnUndeliverable`: `control/api/routes/turns.py` catches two types
+    and a cluster error is neither, so the tenant got a bare 500, no `turn.failed` was
+    appended, and the Turn stayed open -- permanently, because the sweep that would
+    collect it refuses to act on a Session whose Turn is open.
+
+    Asserted by type and by the session id in the message, so a refused delete
+    dressed up as something else could not satisfy it.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    log = CountingLog()
+    dispatch = _dispatch_over(
+        CannotRemove(),
+        log,
+        _a_pod_streaming_one_completed_turn(turn_id),
+        StoreThatCannotWrite(),
+    )
+
+    with pytest.raises(TurnUndeliverable, match=str(session_id)):
+        await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+
+async def test_a_release_that_fails_does_not_fail_a_turn_that_worked() -> None:
+    """The tenant's answer survives a pod this platform could not tidy away.
+
+    The Turn ran, its bytes are stored, and the only thing left undone is operational.
+    Raising here would take a Turn the tenant was already streamed and report it as
+    undeliverable, which is both false and -- because the route would then append
+    `turn.failed` over a Turn that completed -- unrecoverable in the log.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    log = CountingLog()
+    dispatch = _dispatch_over(
+        CannotRemove(),
+        log,
+        _a_pod_streaming_one_completed_turn(turn_id),
+        InMemoryRolloutStore(),
+    )
+
+    await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+    assert log.types == [turn.TURN_COMPLETED]
 
 
 async def test_a_pod_refusal_at_the_fetch_reaches_the_caller_as_itself() -> None:
@@ -1016,8 +1285,11 @@ async def test_a_pod_refusal_at_the_fetch_reaches_the_caller_as_itself() -> None
         placement=Placement(FixedPhase()),
         pods=NeverPlaces(),
         log=CountingLog(),
-        on_completed=ShipOutAtTurnCompletion(
-            RefusedByThePod(), RolloutSync(StoreThatCannotWrite())
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(
+                RefusedByThePod(), RolloutSync(StoreThatCannotWrite())
+            ),
+            RecordingSeam(),
         ),
         namespace=_NAMESPACE,
         token_key=_KEY,
@@ -1043,15 +1315,22 @@ async def test_a_transport_failure_at_the_fetch_is_not_reported_as_a_store_one()
         placement=Placement(FixedPhase()),
         pods=NeverPlaces(),
         log=CountingLog(),
-        on_completed=ShipOutAtTurnCompletion(
-            UnreachableAtTheFetch(), RolloutSync(StoreThatCannotWrite())
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(
+                UnreachableAtTheFetch(), RolloutSync(StoreThatCannotWrite())
+            ),
+            RecordingSeam(),
         ),
         namespace=_NAMESPACE,
         token_key=_KEY,
         transport=_a_pod_streaming_one_completed_turn(turn_id),
     )
 
-    with pytest.raises(TurnUndeliverable, match="could not be reached"):
+    # "stopped answering" rather than "could not be reached": the two are now separate
+    # causes, and this is the second one. The pod took the Turn and streamed it, then
+    # went away during the fetch -- which is what this case builds and what its
+    # docstring already calls "a pod that stopped answering".
+    with pytest.raises(TurnUndeliverable, match="stopped answering"):
         await dispatch.dispatch(session_id, turn_id, "a prompt")
 
 
@@ -1063,12 +1342,16 @@ async def test_a_completed_turn_whose_bytes_do_reach_the_bucket_does_not_raise()
     session_id = SessionId(uuid4())
     turn_id = new_turn_id()
     store = InMemoryRolloutStore()
+    outputs = RecordingSeam()
     body = _rollout(_meta(), _event("turn_complete", 1))
     dispatch = HttpPodDispatch(
         placement=Placement(FixedPhase()),
         pods=NeverPlaces(),
         log=CountingLog(),
-        on_completed=ShipOutAtTurnCompletion(FixedFetch(body), RolloutSync(store)),
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(FixedFetch(body), RolloutSync(store)),
+            outputs,
+        ),
         namespace=_NAMESPACE,
         token_key=_KEY,
         transport=_a_pod_streaming_one_completed_turn(turn_id),
@@ -1077,6 +1360,195 @@ async def test_a_completed_turn_whose_bytes_do_reach_the_bucket_does_not_raise()
     await dispatch.dispatch(session_id, turn_id, "a prompt")
 
     assert store.objects[rollout_key(session_id)] == body
+    assert outputs.ran == [turn_id], "the second seam of the composite ran too"
+
+
+async def test_a_failed_turn_ships_its_rollout_to_the_bucket() -> None:
+    """The Turn that ends without completing still has a conversation worth keeping.
+
+    Before `on_terminal` existed this shipped nothing, and the reasoning written down
+    for that was about the wrong noun: there is indeed no *completed Turn* to make
+    durable, but there is a conversation, and the runtime has already folded it into
+    compaction checkpoints no other record in this platform reproduces. Under a pod that
+    lives one Turn (ADR-041) the pod holding those bytes is destroyed the moment this
+    returns, so a Turn's failure would silently cost the Session everything said in it.
+
+    **What this does not yet reach.** `restore_for_resume` cuts at the last
+    `turn_complete`, so these bytes are stored and then cut away again on the path back
+    into the next pod. Moving that cut moves ADR-004's recovery boundary and is a
+    decision above this seam; until it is taken, this case asserts the half that is
+    true -- the bytes are in the store -- and claims nothing about what a later Turn
+    reads back.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    store = InMemoryRolloutStore()
+    body = _rollout(
+        _meta(),
+        _event("turn_complete", 1),
+        _event("turn_started", 2),
+        _said("a sentence the tenant paid for", 3),
+        _event("turn_aborted", 4),
+    )
+    log = CountingLog()
+    dispatch = HttpPodDispatch(
+        placement=Placement(FixedPhase()),
+        pods=NeverPlaces(),
+        log=log,
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(FixedFetch(body), RolloutSync(store)),
+            RecordingSeam(),
+        ),
+        namespace=_NAMESPACE,
+        token_key=_KEY,
+        transport=_a_pod_streaming_one_failed_turn(turn_id),
+        on_terminal=ShipOutAtTurnCompletion(FixedFetch(body), RolloutSync(store)),
+    )
+
+    await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+    assert store.objects[rollout_key(session_id)] == body
+    assert log.types == [turn.TURN_FAILED]
+
+
+async def test_a_failed_turn_does_not_run_the_seams_a_completed_turn_owes() -> None:
+    """Two endings, two seams, and the outputs ship-out belongs to only one of them.
+
+    This is why `on_terminal` is a second parameter instead of an outcome flag handed
+    to one seam. A completed Turn's outputs are what the agent *declared* it produced;
+    a Turn that failed declared nothing, and publishing whatever happened to be sitting
+    in the output tree would put a half-written document under a name that reads as
+    delivered. The Rollout has no such problem -- partial conversation is still that
+    conversation -- so the two rightly part company here.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    store = InMemoryRolloutStore()
+    outputs = RecordingSeam()
+    body = _rollout(_meta(), _event("turn_complete", 1))
+    dispatch = HttpPodDispatch(
+        placement=Placement(FixedPhase()),
+        pods=NeverPlaces(),
+        log=CountingLog(),
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(FixedFetch(body), RolloutSync(store)),
+            outputs,
+        ),
+        namespace=_NAMESPACE,
+        token_key=_KEY,
+        transport=_a_pod_streaming_one_failed_turn(turn_id),
+        on_terminal=ShipOutAtTurnCompletion(FixedFetch(body), RolloutSync(store)),
+    )
+
+    await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+    assert outputs.ran == [], "a failed Turn published outputs it never declared"
+    assert store.puts == [rollout_key(session_id)], "the Rollout still shipped, once"
+
+
+async def test_a_completed_turn_ships_its_rollout_once_and_not_twice() -> None:
+    """The two seams are alternatives, not a pair that both run on a completion.
+
+    Wired as `on_completed` and `on_terminal` the same ship-out object appears twice in
+    one dispatch, so an `if completed: ... if terminal: ...` written as two independent
+    tests would put the Rollout in the bucket twice per completed Turn. The bucket has
+    versioning on and no lifecycle rule, so the second put is not free and not visible
+    from anything a reader of this module would think to check.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    store = InMemoryRolloutStore()
+    body = _rollout(_meta(), _event("turn_complete", 1))
+    seam = ShipOutAtTurnCompletion(FixedFetch(body), RolloutSync(store))
+    dispatch = HttpPodDispatch(
+        placement=Placement(FixedPhase()),
+        pods=NeverPlaces(),
+        log=CountingLog(),
+        on_completed=EachAtTurnCompletion(seam, RecordingSeam()),
+        namespace=_NAMESPACE,
+        token_key=_KEY,
+        transport=_a_pod_streaming_one_completed_turn(turn_id),
+        on_terminal=seam,
+    )
+
+    await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+    assert store.puts == [rollout_key(session_id)]
+
+
+async def test_a_store_that_refuses_a_failed_turns_rollout_does_not_fail_it_again() -> (
+    None
+):
+    """The one seam failure that is logged instead of raised, and why that is right.
+
+    Everywhere else in `_record` a seam that fails raises, because the Turn's outcome is
+    still open and a Turn reading as durable while its bytes sit in a doomed pod is the
+    lie the raise exists to prevent. Here the pod has already streamed `turn.failed`,
+    the append has already happened, and the tenant has already been told. Raising would
+    hand `routes/turns.py` a `TurnUndeliverable` it answers by appending a *second*
+    `turn.failed` for one Turn and returning 502 "the session could not be reached"
+    about a Turn that ran and failed for a reason the pod named precisely.
+
+    So: one terminal event, no exception, and the operator's log carries the loss --
+    asserted here as the count of appends, because a duplicate terminal event is the
+    concrete corruption this arrangement avoids.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    log = CountingLog()
+    dispatch = HttpPodDispatch(
+        placement=Placement(FixedPhase()),
+        pods=NeverPlaces(),
+        log=log,
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(
+                FixedFetch(_rollout(_meta(), _event("turn_complete", 1))),
+                RolloutSync(InMemoryRolloutStore()),
+            ),
+            RecordingSeam(),
+        ),
+        namespace=_NAMESPACE,
+        token_key=_KEY,
+        transport=_a_pod_streaming_one_failed_turn(turn_id),
+        on_terminal=ShipOutAtTurnCompletion(
+            FixedFetch(_rollout(_meta(), _event("turn_complete", 1))),
+            RolloutSync(StoreThatCannotWrite()),
+        ),
+    )
+
+    await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+    assert log.types == [turn.TURN_FAILED], "one Turn, one terminal event"
+
+
+async def test_without_on_terminal_a_failed_turn_still_ships_nothing() -> None:
+    """The default keeps a process that has not been wired for this behaving as before.
+
+    `on_terminal` defaults to None so `composition.build` can adopt it in its own
+    commit rather than in the same one as the mechanism. A default that silently shipped
+    would make that staging a lie, and a process that never passes the argument would
+    change behaviour on a deploy nobody attributed to this.
+    """
+    session_id = SessionId(uuid4())
+    turn_id = new_turn_id()
+    store = InMemoryRolloutStore()
+    body = _rollout(_meta(), _event("turn_complete", 1))
+    dispatch = HttpPodDispatch(
+        placement=Placement(FixedPhase()),
+        pods=NeverPlaces(),
+        log=CountingLog(),
+        on_completed=EachAtTurnCompletion(
+            ShipOutAtTurnCompletion(FixedFetch(body), RolloutSync(store)),
+            RecordingSeam(),
+        ),
+        namespace=_NAMESPACE,
+        token_key=_KEY,
+        transport=_a_pod_streaming_one_failed_turn(turn_id),
+    )
+
+    await dispatch.dispatch(session_id, turn_id, "a prompt")
+
+    assert store.puts == []
 
 
 # ------------------------------------------------------------------------------------

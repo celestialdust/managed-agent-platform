@@ -521,15 +521,77 @@ def test_a_session_pod_may_reach_exactly_the_two_gateways() -> None:
         f"{sorted(expected)}. Anything else in that set is a pod running a tenant's "
         "model-authored code being allowed to dial something nobody decided it could."
     )
-    assert not [
-        block
+
+
+def test_a_session_pods_one_address_range_is_the_public_internet_on_443() -> None:
+    """The single CIDR a Session pod is allowed, and the three holes punched in it.
+
+    This case used to assert that the session-pod document named **no** address range at
+    all, on the premise that a Session pod has no destination outside this namespace.
+    That premise was wrong in a way no test could show: `Environment.allowed_domains` is
+    enforced by a proxy *inside* the pod, at the HTTP layer, and that proxy dials the
+    granted host outbound on 443. Denying every range did not narrow the allowlist, it
+    deleted the feature -- measured on 2026-08-26, when the set was first applied and
+    every granted domain in the platform began to hang.
+
+    So the guard moved rather than relaxed, and it is tighter than what it replaces. The
+    old assertion could only ever say "none"; this one pins the shape, and the shape is
+    where a regression would actually live. The `except` list is the whole security
+    argument for admitting `0.0.0.0/0` at all: drop `169.254.0.0/16` and a tenant's
+    model-authored code can take the node's instance role instead of its Session-scoped
+    bearer; drop `172.31.0.0/16` and the same rule silently re-grants the database, the
+    control plane and every other tenant's Session. Those are asserted by containment
+    rather than by string, so an equivalent CIDR written differently still passes and a
+    narrowed one does not.
+
+    What no file can tell you is whether any of it is enforced.
+    `test_a_session_pod_reaches_the_gateways_and_not_the_platform` is the case that asks
+    the kernel, and it needs a cluster.
+    """
+    session = _policies()["session-pod"]
+    ranged = [
+        (rule, block)
         for direction, rule in _rules(session)
         for block in _blocks(rule, direction)
-    ], (
-        "a Session pod's policy names an address range. Every destination it has is a "
-        "pod in this namespace, and a CIDR here is either the internet or an in-VPC "
-        "address, both of which this pod is not supposed to have."
+    ]
+    assert len(ranged) == 1, (
+        f"a Session pod's policy names {len(ranged)} address ranges: "
+        f"{[block for _, block in ranged]}. It gets exactly one -- the public internet "
+        "on 443, for the in-pod proxy that serves allowed_domains. Every other "
+        "destination it has is a pod in this namespace, named by selector."
     )
+    rule, block = ranged[0]
+    assert block["cidr"] == "0.0.0.0/0", (
+        f"the one range a Session pod names is {block['cidr']}. An in-VPC or "
+        "in-cluster range here is a destination nobody decided it could have; the only "
+        "range it is allowed is the public internet, carved out below."
+    )
+    assert _ports(rule) == [443], (
+        f"a Session pod's public range is open on {_ports(rule)}. 443 and nothing "
+        "else: "
+        "a wider port set on 0.0.0.0/0 hands model-authored code an arbitrary outbound "
+        "socket, which is an exfiltration channel with no protocol anyone can inspect."
+    )
+    carved = [_v4(entry) for entry in block.get("except", [])]
+    for forbidden, why in (
+        (
+            _IMDS,
+            "the node's instance credentials answer there, and a Session pod that "
+            "reached them would hold the node's role instead of the Session-scoped "
+            "bearer it is given -- the trust boundary inverted by one missing entry",
+        ),
+    ):
+        assert any(forbidden in network for network in carved), (
+            f"{forbidden} is not excluded from a Session pod's public range: {why}. "
+            f"The range carves out {[str(network) for network in carved]}."
+        )
+    for subnet in _subnet_cidrs():
+        assert any(_v4(subnet).subnet_of(network) for network in carved), (
+            f"{subnet} is a subnet every pod in this cluster takes its address from, "
+            "and a Session pod's public range does not carve it out -- so that rule "
+            "re-grants the database, the control plane and every other tenant's "
+            f"Session. The range carves out {[str(network) for network in carved]}."
+        )
 
 
 # --- Tier A, continued: the applier's refusal, and the Terraform that lifts it. ------
@@ -741,9 +803,13 @@ def test_every_policy_this_repo_declares_is_in_the_cluster() -> None:
     shape with a worse failure: nothing reports the absence, and the boundary is simply
     not there.
 
-    Nothing in this repository applies this file. Until something does, the command is
-    `kubectl apply -f deploy/k8s/network-policies.yaml`, and this case is what says
-    whether it has been run.
+    `deploy/platform.py` applies this file with the control plane, so it is re-asserted
+    on every release rather than remembered. That was not true until 2026-08-26: the set
+    sat in this repository and no applier named it, which is the third time this project
+    has paid for that gap and the first time the missing object was a boundary. The
+    offline guard on the applier is
+    `test_the_manifest_set_is_deployable.py::test_every_manifest_in_this_tree_is_applied_by_something`;
+    this case is the one that says whether the apply has actually landed here.
     """
     listed = json.loads(
         _kubectl("get", "networkpolicy", "-n", _NAMESPACE, "-o", "json")
@@ -754,4 +820,174 @@ def test_every_policy_this_repo_declares_is_in_the_cluster() -> None:
         f"{sorted(declared - live)} are declared in deploy/k8s/network-policies.yaml "
         f"and are not in namespace {_NAMESPACE}. The cluster holds {sorted(live)}. "
         "Apply the set: kubectl apply -f deploy/k8s/network-policies.yaml"
+    )
+
+
+_PROBE_POD: Final = "netpol-session-egress-probe"
+
+_PROBE: Final = """
+import socket
+socket.setdefaulttimeout(8)
+for label, host, port in (
+    ("gateway", "tool-gateway.map-dev.svc.cluster.local", 80),
+    ("control-plane", "control-plane.map-dev.svc.cluster.local", 80),
+    ("imds", "169.254.169.254", 80),
+    ("public443", "example.com", 443),
+):
+    try:
+        socket.create_connection((host, port), 8).close()
+        print(f"{label}=REACHED")
+    except Exception as error:
+        print(f"{label}=REFUSED {type(error).__name__}")
+"""
+
+
+def _reached_from_a_session_pod() -> dict[str, str]:
+    """Run the probe from a bare pod wearing the Session label; report what answered.
+
+    The pod is built here rather than borrowed from a live Session because a Session's
+    pod is leased for exactly one Turn (ADR-041) and is gone before anything can be
+    exec'd into it -- the same thing that pushed the live egress cases in `tests/pod/`
+    off real Sessions. It is bare, with no `ownerReferences`, because that is the shape
+    the control plane creates and therefore the shape whose enforcement is in question.
+
+    The image is read off the running control plane rather than written here: any image
+    with a Python would do, the digest moves every release, and a literal would fail as
+    an ImagePullBackOff that reads like a policy verdict.
+    """
+    image = _kubectl(
+        "get",
+        "deployment",
+        "control-plane",
+        "-n",
+        _NAMESPACE,
+        "-o",
+        "jsonpath={.spec.template.spec.containers[0].image}",
+    ).strip()
+    manifest = json.dumps(
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": _PROBE_POD,
+                "namespace": _NAMESPACE,
+                "labels": {"map.role": "session-pod"},
+            },
+            "spec": {
+                "restartPolicy": "Never",
+                "containers": [
+                    {
+                        "name": "probe",
+                        "image": image,
+                        "command": ["python", "-c", _PROBE],
+                    }
+                ],
+            },
+        }
+    )
+    subprocess.run(
+        [
+            "kubectl",
+            "delete",
+            "pod",
+            _PROBE_POD,
+            "-n",
+            _NAMESPACE,
+            "--ignore-not-found",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    try:
+        subprocess.run(
+            ["kubectl", "apply", "-n", _NAMESPACE, "-f", "-"],
+            input=manifest,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=True,
+        )
+        _kubectl(
+            "wait",
+            "--for=jsonpath={.status.phase}=Succeeded",
+            f"pod/{_PROBE_POD}",
+            "-n",
+            _NAMESPACE,
+            "--timeout=180s",
+        )
+        printed = _kubectl("logs", _PROBE_POD, "-n", _NAMESPACE)
+    finally:
+        subprocess.run(
+            [
+                "kubectl",
+                "delete",
+                "pod",
+                _PROBE_POD,
+                "-n",
+                _NAMESPACE,
+                "--ignore-not-found",
+                "--wait=false",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    reached = dict(line.split("=", 1) for line in printed.split() if "=" in line)
+    assert set(reached) == {"gateway", "control-plane", "imds", "public443"}, (
+        f"the probe did not report all four destinations, it printed {printed!r} -- so "
+        "nothing below is a measurement of anything"
+    )
+    return reached
+
+
+@requires_the_cluster
+def test_a_session_pod_reaches_the_gateways_and_not_the_platform() -> None:
+    """What a Session's pod can actually open, measured from inside `map-dev`.
+
+    **This is the only case anywhere that measures the session-pod policy at all.** The
+    cases in `tests/pod/` that probe what a Session can reach create a namespace of
+    their own for their pods -- `map-67-targets`, `map-68-confined`, one per file -- and
+    a NetworkPolicy is namespaced. So this set selects real Session pods and never
+    selects the pods that grade them: those cases were green on 2026-08-26 while the
+    policy denied every outbound 443 from every real Session in the platform, and they
+    would have stayed green indefinitely. A test in the wrong namespace is not weak
+    evidence, it is evidence about a different question.
+
+    The four destinations are one claim each, and the two refusals are the load-bearing
+    ones. `control-plane` answers without authentication, so a Session that could dial
+    it could act as the platform. `imds` is where the node's instance credentials
+    answer, and a Session that reached them would hold the node's role instead of the
+    Session-scoped bearer it is given -- the trust boundary inverted by one missing
+    CIDR in one `except` list.
+
+    `public443` must REACH, and that direction surprises people. The domain allowlist is
+    enforced by a proxy inside the pod, at the HTTP layer, which is why the case grading
+    a refused domain asserts on a 403. Denying 443 here does not tighten the allowlist;
+    it deletes `Environment.allowed_domains` outright, and a tenant's agent sees a hang
+    rather than a refusal. What this file's session-pod document enforces is the
+    infrastructure boundary, and the header says so at length.
+    """
+    reached = _reached_from_a_session_pod()
+
+    assert reached["gateway"] == "REACHED", (
+        "a Session pod cannot open the Tool Gateway, so no Session can call a tool or "
+        f"a model: {reached}. The rule names container port 8080 and the Service "
+        "publishes 80; if this is the failure, the Service-port translation did not "
+        "happen, and the fix is a Service whose port equals its container port rather "
+        "than a wider rule here."
+    )
+    assert reached["public443"] == "REACHED", (
+        "a Session pod cannot open 443 to the public internet, so "
+        "Environment.allowed_domains is inert -- every granted domain hangs and the "
+        f"tenant is told nothing: {reached}"
+    )
+    assert reached["control-plane"].startswith("REFUSED"), (
+        "a Session pod can dial this platform's own control plane, which answers "
+        "without authentication, so a tenant's agent can act as the platform: "
+        f"{reached}"
+    )
+    assert reached["imds"].startswith("REFUSED"), (
+        "a Session pod can reach the instance metadata service, so model-authored code "
+        f"can take the node's role instead of its Session-scoped bearer: {reached}"
     )

@@ -34,6 +34,7 @@ from managed_agent.control.api.request.tenancy import TENANT_HEADER
 from managed_agent.control.api.routes.session_list import SESSION_NOT_FOUND
 from managed_agent.core.ids import SessionId, TenantId
 from managed_agent.core.ports import SessionNotVisible
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.vocabulary import lifecycle
 
 _SKILLS_SHA = "0" * 39 + "a"
@@ -43,7 +44,18 @@ _SKILLS_SHA = "0" * 39 + "a"
 _BUDGET = 731
 _RETENTION = 17
 _CURRENCY = "EUR"
-_GRANT = ["fs.read", "web.fetch"]
+_SERVER = "scope-fixture-tools"
+_TOOLS = ("read_file", "fetch_page")
+_GRANT = [advertised_name_for(_SERVER, one) for one in _TOOLS]
+"""Real advertised names, because the create route now resolves every one of them.
+
+They were `fs.read` and `web.fetch` -- names nothing had ever registered, which the
+route stored unread. It refuses them now, so the fixture registers the server that
+makes them real rather than granting nothing: an empty Grant would be the same value
+every other fixture uses, and this file's whole method is that no constant here is
+shared, so a row filled from a constant rather than from the request shows up in the
+comparison below.
+"""
 _SCOPE = {"repository": "acme/widgets", "workspace": "research"}
 
 
@@ -102,6 +114,30 @@ async def platform_client(
 
 
 async def _a_session(client: AsyncClient, headers: dict[str, str]) -> str:
+    server = await client.post(
+        "/v1/mcp_servers",
+        json={
+            "server_name": _SERVER,
+            "endpoint": {
+                "transport": "streamable_http",
+                "url": "https://mcp.example.invalid",
+                "credential_ref": "vault/acme/scope-fixture",
+            },
+            "tools": [
+                {
+                    "name": one,
+                    "remote_name": one,
+                    "parameters": {"repoName": "string"},
+                    "scope_bindings": [
+                        {"dimension": "repository", "argument": "repoName"}
+                    ],
+                }
+                for one in _TOOLS
+            ],
+        },
+        headers=headers,
+    )
+    assert server.status_code == 201, server.text
     registered = await client.post("/v1/agents", json=_a_definition(), headers=headers)
     assert registered.status_code == 201, registered.text
     # The sandbox shape is registered through its own route rather than written into the
@@ -212,7 +248,7 @@ async def test_a_tenant_reads_back_its_own_session(
     response = await client.get(f"/v1/sessions/{session_id}", headers=headers)
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"id": session_id, "state": "running", "seq": 1}
+    assert response.json() == {"id": session_id, "state": "idle", "seq": 1}
 
 
 async def test_another_tenants_session_is_refused_and_not_answered_emptily(

@@ -44,8 +44,10 @@ from managed_agent.control.session.placement import (
     PlacementWaits,
     PodPhase,
 )
-from managed_agent.control.session.turn_dispatch import NoPodTransport
-from managed_agent.control.webhooks.dispatcher import LIFECYCLE_TYPES
+from managed_agent.control.session.turn_dispatch import (
+    NoPodTransport,
+    TurnUndeliverable,
+)
 from managed_agent.core.ids import (
     FIRST_SEQ,
     DefinitionId,
@@ -59,7 +61,12 @@ from managed_agent.core.ids import (
 from managed_agent.core.ports import SessionNotVisible
 from managed_agent.core.session.projection import _TRANSITIONS
 from managed_agent.core.session.session import SessionRecord
-from managed_agent.core.vocabulary import is_published, placement, turn
+from managed_agent.core.vocabulary import (
+    WEBHOOK_ELIGIBLE,
+    is_published,
+    placement,
+    turn,
+)
 from managed_agent.session_shim.pod_channel import HttpPodDispatch
 from managed_agent.session_shim.serve import SHIM_EVENT_TYPES
 
@@ -306,15 +313,19 @@ def test_placing_moves_no_session_state() -> None:
 
 
 def test_placing_is_not_posted_to_a_tenant_s_registered_callback() -> None:
-    """It is a stream signal, and the webhook tail is derived from one family string.
+    """It is a stream signal, and the webhook tail reads the eligible set.
 
-    `LIFECYCLE_TYPES` is every published name whose family is `lifecycle`, so declaring
-    this there would have started posting a callback per placement to every registered
+    `WEBHOOK_ELIGIBLE` is every type a tenant may register a callback for, so marking
+    this one would have started posting a callback per placement to every registered
     endpoint -- a delivery nobody asked for, on the platform's retry budget, announcing
     that a pod was being started.
+
+    The family is asserted alongside it because that is the second gate: a
+    lifecycle-family type must have a projection transition, and placing must not have
+    one, so being in that family would fail elsewhere for a different reason.
     """
     assert placement.FAMILY != "lifecycle"
-    assert placement.SESSION_PLACING not in LIFECYCLE_TYPES
+    assert placement.SESSION_PLACING not in WEBHOOK_ELIGIBLE
 
 
 def test_a_pod_may_not_claim_it_was_waiting_for_a_pod() -> None:
@@ -522,7 +533,14 @@ class ClusterThatPlacesOnDemand:
         return PodPhase.RUNNING if self.placed else PodPhase.ABSENT
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("a test in this file released a pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
 
 class ClusterAlreadyRunning:
@@ -535,7 +553,14 @@ class ClusterAlreadyRunning:
         return PodPhase.RUNNING
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("a test in this file released a pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
 
 class PodsThatTakeTime:
@@ -563,6 +588,18 @@ class NeverPlaces:
 
     async def ensure_for(self, session_id: SessionId) -> None:
         raise AssertionError("a Session with a running pod was placed again")
+
+
+class PodsThatRefuse:
+    """The placement seam saying this Session will not be given a pod.
+
+    `SessionPods.ensure_for` promises the transport exactly one exception type, so this
+    raises that one and nothing else -- a double that raised anything wider would be
+    grading the dispatch against a contract the port does not offer.
+    """
+
+    async def ensure_for(self, session_id: SessionId) -> None:
+        raise TurnUndeliverable("this Session has no pod and could not be given one")
 
 
 class Unnotified:
@@ -747,3 +784,144 @@ async def test_the_announcement_is_in_the_log_while_the_turn_is_still_queued() -
     assert pods.seen_while_waiting == [placement.SESSION_PLACING], (
         "the tenant had not been told it was queued at the moment it was queued"
     )
+
+
+# --------------------------------------------------------------------------------------
+# The other half of what a tenant learns about a pod: that one was placed at all
+# --------------------------------------------------------------------------------------
+
+
+class ClusterWhosePodFinishesWhilePlacementWaits:
+    """ABSENT, then GONE: a pod that came up and ended before the phase was re-read.
+
+    The narrow window `dispatch` re-reads the cluster for. It exists so the decision
+    "was this a placement" can be shown not to be taken from that second read -- under
+    this runner the second read says GONE, and a pod was still created.
+    """
+
+    def __init__(self) -> None:
+        self.placed = False
+
+    async def ensure(self, pod_name: str, compiled: object) -> PodPhase:
+        raise AssertionError("the dispatch bypassed SessionPods and placed directly")
+
+    async def phase_of(self, pod_name: str) -> PodPhase:
+        return PodPhase.GONE if self.placed else PodPhase.ABSENT
+
+    async def remove(self, pod_name: str) -> None:
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
+
+
+class PodsThatPlaceThenLoseIt:
+    """The placement seam for that runner: a pod is created, and then it is gone."""
+
+    def __init__(self, cluster: ClusterWhosePodFinishesWhilePlacementWaits) -> None:
+        self._cluster = cluster
+
+    async def ensure_for(self, session_id: SessionId) -> None:
+        self._cluster.placed = True
+
+
+async def test_a_turn_that_found_a_pod_announces_no_placement() -> None:
+    """A Turn that created nothing says nothing about a creation.
+
+    Under ADR-041 this is the state a Turn reaches only when a previous release did not
+    happen -- the lease means a Session between Turns owns no pod -- and the claim is
+    worth keeping for exactly that reason: the announcement has to follow what the
+    cluster actually did, not what a Turn usually does.
+
+    This case used to assert the same negative about `session.resumed`, whose trap was
+    its blast radius: the type is webhook-eligible, so an append per Turn posts a
+    callback per Turn to every endpoint a tenant registered for it. That is why the
+    producer is gone rather than gated, and why nothing here asserts its absence any
+    more -- an absence nothing can produce is not a finding.
+    """
+    clock = MovableClock()
+    placer = Placement(ClusterAlreadyRunning(), PlacementWaits(clock))
+    log = RecordingLog()
+    session_id, turn_id = new_session_id(), new_turn_id()
+
+    await HttpPodDispatch(
+        placement=placer,
+        pods=NeverPlaces(),
+        log=log,
+        on_completed=Unnotified(),
+        namespace="map-test",
+        token_key=b"a shim signing key",
+        transport=ShimThatStreams(_a_whole_turn(turn_id)),
+    ).dispatch(session_id, turn_id, "summarise it")
+
+    assert log.types() == [turn.TURN_STARTED, turn.TURN_COMPLETED]
+
+
+async def test_a_pod_that_ends_before_the_phase_is_re_read_was_still_placed() -> None:
+    """The decision is taken before the second `locate`, so the second cannot unmake it.
+
+    `dispatch` re-reads the cluster after placement because a pod can finish while
+    placement waits and the phase it acts on has to be the one the cluster reports now.
+    That re-read answers a different question -- can this Turn be carried -- and reading
+    "was this a placement" out of it would get both arms wrong: RUNNING there is
+    indistinguishable from the warm Turn above, and GONE there would hide a placement
+    that really happened -- exactly the cold start a tenant most wants told about.
+
+    So the Turn fails and the event stands: the log reads as "this Turn waited, got a
+    pod, and the pod was gone by the time it was dialled", which is what happened.
+
+    Graded on `session.placing` since ADR-041 deleted the producer of `session.resumed`,
+    which is what this case used to read. The two carried the same claim here -- both
+    are appended on the placing branch and neither is unmade by the second `locate` --
+    so what the removal costs this case is a second witness, not the finding.
+    """
+    clock = MovableClock()
+    cluster = ClusterWhosePodFinishesWhilePlacementWaits()
+    placer = Placement(cluster, PlacementWaits(clock))
+    log = RecordingLog()
+    session_id, turn_id = new_session_id(), new_turn_id()
+
+    with pytest.raises(TurnUndeliverable):
+        await HttpPodDispatch(
+            placement=placer,
+            pods=PodsThatPlaceThenLoseIt(cluster),
+            log=log,
+            on_completed=Unnotified(),
+            namespace="map-test",
+            token_key=b"a shim signing key",
+            transport=ShimThatStreams(_a_whole_turn(turn_id)),
+        ).dispatch(session_id, turn_id, "summarise it")
+
+    assert log.types() == [placement.SESSION_PLACING]
+
+
+async def test_a_placement_that_was_refused_says_no_pod_was_placed() -> None:
+    """Nothing was created, so nothing announces a creation.
+
+    The failing arm matters as much as the warm one: `ensure_for` raising is the common
+    refusal -- an unschedulable pod, a definition that will not resolve, a Session whose
+    Rollout cannot be seeded -- and an event appended around it rather than after it
+    would tell every one of those tenants their Session had been given a pod.
+    """
+    clock = MovableClock()
+    cluster = ClusterThatPlacesOnDemand()
+    placer = Placement(cluster, PlacementWaits(clock))
+    log = RecordingLog()
+    session_id, turn_id = new_session_id(), new_turn_id()
+
+    with pytest.raises(TurnUndeliverable):
+        await HttpPodDispatch(
+            placement=placer,
+            pods=PodsThatRefuse(),
+            log=log,
+            on_completed=Unnotified(),
+            namespace="map-test",
+            token_key=b"a shim signing key",
+            transport=ShimThatStreams(_a_whole_turn(turn_id)),
+        ).dispatch(session_id, turn_id, "summarise it")
+
+    assert log.types() == [placement.SESSION_PLACING]

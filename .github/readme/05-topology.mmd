@@ -2,13 +2,16 @@ flowchart TB
     T["`**Tenant service**
 a team's own product`"] -->|REST| CP["`**Control plane**
 sessions · definitions
-registries · files`"]
-    CP -->|"places the pod"| POD
+registries · files
+signs each pod's certificate`"]
+    CP -->|"`places the pod, then
+dials it over **mTLS**`"| POD
 
     subgraph POD ["SESSION POD · untrusted · no key · no cloud identity"]
         direction TB
         SH["`**session shim**
-four event types`"]
+four event types
+serves mTLS, client cert required`"]
         AL["`**agent loop**
 adopted, never patched`"]
         SB["`**sandbox**

@@ -92,6 +92,19 @@ class FakeAgentRuntime:
         assert self._conn is not None
         await self._conn.send(json.dumps(message))
 
+    async def vanish(self) -> None:
+        """Drop the socket with no closing handshake, the way a killed process does.
+
+        `transport.abort()` and not `close()`: closing sends the WebSocket closing
+        frames and the client reads that as an orderly end. A runtime container that
+        exits leaves a socket that simply stops, which the client raises as
+        `ConnectionClosedError: no close frame received or sent` -- and that is the
+        state worth reproducing, because it is the one the shim's shutdown met.
+        """
+        await asyncio.wait_for(self._attached.wait(), timeout=5.0)
+        assert self._conn is not None
+        self._conn.transport.abort()
+
     async def wait_until(self, settled: Callable[[], bool], what: str) -> None:
         """Block until this server has seen what a case is about to assert on.
 

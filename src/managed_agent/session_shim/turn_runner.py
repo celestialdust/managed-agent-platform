@@ -19,7 +19,10 @@ notification does not notify: the pod is the thing that just went quiet, and ask
 to ship state out is asking the wrong process.
 """
 
+import asyncio
+import time
 from collections.abc import AsyncIterator, Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
 from uuid import UUID, uuid5
@@ -401,6 +404,114 @@ def _reported_failure(body: dict[str, object]) -> bool:
     return bool(reported.get("status") == _RUNTIME_STATUS_FAILED)
 
 
+_PROGRESS_INTERVAL_S: Final = 30.0
+"""How often a running Turn says what it is doing, whatever the runtime is doing.
+
+Thirty seconds is chosen from the two costs it sits between, and neither is subtle. Too
+long and the control plane waits that much longer before it can tell a wedged pod from
+a busy one, because the sweep can only ever act on the last report it has. Too short
+and a long Turn writes a row a second into a log the platform retains and every later
+fold re-reads -- an hour-long Turn at this interval adds 120 rows, which is small
+beside the per-token deltas the same Turn already writes.
+
+**It is deliberately not derived from any deadline.** A reporting interval and a
+give-up threshold are two different decisions, and tying them would mean that making
+the platform more patient also made it blinder. The sweep decides how many missed
+reports it will tolerate; this decides only how often the truth is available.
+"""
+
+
+@dataclass(slots=True)
+class _Progress:
+    """The monotonic facts one Turn has accumulated, as the ticker reads them.
+
+    Mutable, and the one mutable thing in this module, because it is a counter: the
+    loop bumps it and the ticker reads it, and a frozen value passed between them would
+    be a snapshot that stopped being true the moment it was taken.
+
+    Both counts only ever rise, which is what makes them usable as evidence of
+    progress. A reader comparing two reports of the same Turn can conclude that work
+    happened between them if either number moved, and that none did if neither moved --
+    a conclusion no single report can support on its own.
+    """
+
+    frames: int = 0
+    answer_bytes: int = 0
+    last_frame_at: float = 0.0
+
+
+async def _report_progress(
+    session_id: SessionId,
+    turn_id: TurnId,
+    attribution: dict[str, object],
+    progress: _Progress,
+    log: EventLogAppend,
+    interval_s: float,
+) -> None:
+    """Append what this Turn is doing, every `interval_s`, until cancelled.
+
+    Runs as its own task beside the notification loop, which is the only place in this
+    module that appends off the loop's own thread of control. The module docstring
+    insists appends are awaited in order so a reader cannot see a reordered stream, and
+    this does not weaken that: a progress report carries no part of the answer and
+    holds no position in it, so where it lands among the deltas is not information. The
+    ordering rule protects the sequence of the Turn's *content*, and this is not
+    content.
+
+    `idle_ms` is the report's most useful field and the one that needs saying out loud:
+    it is how long the runtime has been silent, and a large value here is a **named**
+    state rather than an absence. A Turn blocked on a slow model for ninety seconds
+    reports that it has been blocked for ninety seconds, which is a healthy Turn
+    describing itself -- the distinction the retired inter-byte deadline could not draw,
+    because it inferred both liveness and progress from the same missing bytes.
+
+    Cancellation is the only way out, and it is what the caller's `finally` does. A
+    ticker outliving its Turn would append to a Turn that has already ended, for as long
+    as the process ran.
+    """
+    while True:
+        await asyncio.sleep(interval_s)
+        idle_ms = int((time.monotonic() - progress.last_frame_at) * 1000)
+        try:
+            await append_in_order(
+                log,
+                session_id,
+                turn.TURN_PROGRESS,
+                {
+                    "turn_id": str(turn_id),
+                    **attribution,
+                    "frames": progress.frames,
+                    "answer_bytes": progress.answer_bytes,
+                    "idle_ms": idle_ms,
+                },
+            )
+        except Exception:  # noqa: BLE001 - see below; this must not end the Turn
+            # A refused report is dropped and the next one is attempted. This is the
+            # one place in this module where swallowing is right, and it is right for
+            # a specific reason rather than for convenience: these reports are a
+            # running commentary in which **only the newest one is read**
+            # (`abandoned_turns.latest_idle_ms` scans backwards and stops at the first
+            # match), so a report that never lands loses nothing the next one does not
+            # carry thirty seconds later.
+            #
+            # What the alternative costs was measured rather than argued. This ran as
+            # a bare `await` inside a bare `create_task` that nothing supervises, so a
+            # single failed append ended the *task*, not the iteration: the Turn then
+            # reported nothing for the rest of its life while working perfectly, which
+            # is exactly the state the sweep's only live-pod signal cannot see -- and
+            # since the hour-long ceiling was removed, nothing else closes it either.
+            # Worse, the dead task held its exception until `run_turn`'s `finally`
+            # awaited it, where `suppress` catches only `CancelledError`; a finished
+            # Turn therefore raised out of `run_turn` and never appended
+            # `turn.completed`. A transient blip on the control plane destroyed
+            # completed work.
+            #
+            # `Exception` and not `BaseException`: `CancelledError` derives from
+            # `BaseException`, and cancellation is the one way out of this loop that
+            # must keep working -- the caller's `finally` depends on it.
+            continue
+
+
 async def run_turn(
     session_id: SessionId,
     turn_id: TurnId,
@@ -409,6 +520,7 @@ async def run_turn(
     connection: RuntimeConnection,
     log: EventLogAppend,
     on_completed: TurnCompleted,
+    progress_interval_s: float = _PROGRESS_INTERVAL_S,
 ) -> None:
     """Run one Turn and append every event it produced, in the order they arrived.
 
@@ -443,7 +555,73 @@ async def run_turn(
     root_thread = _issued(session_id, {"thread_id": thread_id})
     answer: list[str] = []
     completed = False
+    progress = _Progress(last_frame_at=time.monotonic())
+    ticker = asyncio.create_task(
+        _report_progress(
+            session_id, turn_id, root_thread, progress, log, progress_interval_s
+        )
+    )
+    try:
+        completed = await _drive(
+            session_id,
+            turn_id,
+            thread_id,
+            root_thread,
+            connection,
+            log,
+            answer,
+            progress,
+        )
+    finally:
+        # Cancelled and then awaited, so the task is finished before this returns. A
+        # bare `cancel()` only requests it, and the report already inside its append
+        # would land after the Turn's terminal event -- the one ordering this module
+        # genuinely cannot allow, because a reader folding the log would see a Turn
+        # still working after it had ended.
+        ticker.cancel()
+        with suppress(asyncio.CancelledError):
+            await ticker
+
+    if not completed:
+        await append_in_order(
+            log,
+            session_id,
+            turn.TURN_FAILED,
+            {
+                "turn_id": str(turn_id),
+                **root_thread,
+                "cause": turn.TurnFailureCause.RUNTIME_LOST.value,
+            },
+        )
+        return
+    await on_completed.turn_completed(session_id, turn_id)
+
+
+async def _drive(
+    session_id: SessionId,
+    turn_id: TurnId,
+    thread_id: str,
+    root_thread: dict[str, object],
+    connection: RuntimeConnection,
+    log: EventLogAppend,
+    answer: list[str],
+    progress: _Progress,
+) -> bool:
+    """Consume the notification channel until this Turn ends. Returns whether it did.
+
+    Split out of `run_turn` so the ticker's `finally` wraps one expression instead of
+    the whole body: the loop below appends the Turn's terminal event, and that append
+    has to happen while the ticker is still cancellable but before it is awaited.
+
+    Every frame bumps `progress.frames`, mapped or not. That is deliberate and it is
+    the widest signal available here -- a notification this module drops is still
+    evidence the runtime is producing something, and dropping it from the count as well
+    as from the log would make the shim blind to exactly the work it does not publish.
+    """
+    completed = False
     async for frame in connection.notifications():
+        progress.frames += 1
+        progress.last_frame_at = time.monotonic()
         note = _notification_of(frame)
         if note.method == _RUNTIME_TURN_COMPLETED:
             if not _completes_this_turn(note.body, thread_id):
@@ -483,7 +661,9 @@ async def run_turn(
         if carried is None:
             continue
         if type_ == turn.TURN_MESSAGE_DELTA:
-            answer.append(str(carried["text"]))
+            text = str(carried["text"])
+            answer.append(text)
+            progress.answer_bytes += len(text.encode())
         # `carried` is spread last so an extractor always outranks the central
         # attribution. That matters for `thread/started`, whose nested thread id is the
         # authoritative one and whose beside-it id may name the spawner instead.
@@ -497,16 +677,4 @@ async def run_turn(
             ),
         )
 
-    if not completed:
-        await append_in_order(
-            log,
-            session_id,
-            turn.TURN_FAILED,
-            {
-                "turn_id": str(turn_id),
-                **root_thread,
-                "cause": turn.TurnFailureCause.RUNTIME_LOST.value,
-            },
-        )
-        return
-    await on_completed.turn_completed(session_id, turn_id)
+    return completed

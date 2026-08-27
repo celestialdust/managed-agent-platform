@@ -1,8 +1,10 @@
 """Resource event types: what a Session holds after creation named something else.
 
 Its own family rather than a member of `lifecycle`, because an attach moves no state.
-The projection's table maps a lifecycle type to a `SessionState`, and a type sitting in
-that module with no row there reads as a transition somebody forgot to write.
+Every type declared in that module has a row in the projection's table, so one sitting
+there with no row reads as a transition somebody forgot to write. The table also folds
+part of the turn family now, which does not change the reading -- an attach neither
+opens a unit of work nor ends one, so it belongs to neither family.
 """
 
 from pydantic import BaseModel, ConfigDict

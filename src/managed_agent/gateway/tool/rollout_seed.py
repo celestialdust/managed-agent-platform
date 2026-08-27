@@ -49,9 +49,10 @@ from managed_agent.core.session.session_token import SessionContext
 ROLLOUT_SEED_PATH: Final[str] = "/v1/session/rollout"
 """Where the calling Session's restored Rollout is served, whole and at one path.
 
-One object and no listing, unlike the working lane beside it: a Session has exactly one
-Rollout, replaced wholesale at each completed Turn, so there is nothing to enumerate and
-no path for a caller to compose.
+One object and no listing: a Session has exactly one Rollout, replaced wholesale at
+each completed Turn, so there is nothing to enumerate and no path for a caller to
+compose. This is the only surface a seeding pod reads through, which is what keeps that
+true -- a listing added here would be a second shape for one object.
 """
 
 _NDJSON: Final[str] = "application/x-ndjson"
@@ -124,12 +125,10 @@ def rollout_seed_endpoint(
         who = calling_session()
         restored = await rollouts.restore_for_resume(who.session_id)
         if restored is None:
-            # At INFO rather than WARNING, and the difference from the working lane's
-            # empty listing beside it is deliberate: a Session with nothing stored is
-            # the ordinary first placement here, where an empty working lane is at
-            # least as likely to be a lane this process could not read. The caller
-            # does not act on absence blindly either -- it knows whether this Session
-            # has run before, and refuses when the two disagree.
+            # At INFO rather than WARNING: a Session with nothing stored is the
+            # ordinary first placement, not a fault. The caller does not act on absence
+            # blindly either -- it knows whether this Session has run before, and
+            # refuses when the two disagree.
             _log.info(
                 "session %s has no stored Rollout, so a pod seeded from this answer "
                 "opens a new thread",

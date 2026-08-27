@@ -606,7 +606,7 @@ class Placement:
         can actually serve a Turn rather than pods that exist. A pod still starting is
         capacity that has been paid for and is not yet available, and counting it would
         make the fleet look able to serve Turns it would refuse -- the same distinction
-        `PodTurnDispatch` makes before it dials one.
+        `HttpPodDispatch` makes before it posts a Turn to one.
 
         A runner that cannot enumerate pods reports zero rather than `None`, and the
         asymmetry with the node fields is deliberate. `PlacedPods` is implemented by the

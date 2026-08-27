@@ -90,7 +90,7 @@ def _create_body(definition_id: str, environment_id: str) -> dict[str, object]:
     return {
         "definition_id": definition_id,
         "environment_id": environment_id,
-        "grant": ["fs.read"],
+        "grant": [],
         "scope": {"repository": "acme/widgets"},
         "budget_minor_units": 500,
         "budget_currency": "USD",

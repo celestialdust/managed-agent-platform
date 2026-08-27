@@ -45,7 +45,6 @@ from managed_agent.core.session.session_token import (
     SessionContext,
     verify_session_token,
 )
-from managed_agent.core.vfs.session_vfs import SessionFiles
 from managed_agent.gateway.tool.credential_broker import ToolCredentialBroker
 from managed_agent.gateway.tool.evidence_capture import EvidenceCapture
 from managed_agent.gateway.tool.mcp_proxy import (
@@ -60,7 +59,6 @@ from managed_agent.gateway.tool.rollout_seed import (
     SessionRollouts,
     rollout_seed_endpoint,
 )
-from managed_agent.gateway.tool.working_lane import working_lane_endpoints
 
 MCP_PATH: Final[str] = "/mcp"
 """Where the one MCP endpoint is served, exactly.
@@ -370,7 +368,6 @@ async def _sweep_forever(sessions: GatewaySessions) -> None:
 def create_gateway_app(
     sessions: GatewaySessions,
     token_key: bytes,
-    files: SessionFiles,
     rollouts: SessionRollouts,
 ) -> FastAPI:
     """The whole service: two token-checked surfaces, plus a liveness path.
@@ -383,26 +380,14 @@ def create_gateway_app(
     because what it serves is a whole ASGI application — the token middleware wrapping
     the protocol manager — and there is no request-and-response function to decorate.
 
-    `files` is the Session VFS the working-lane routes read. Required rather than
-    defaulted, because the alternative to a wired store is a surface that refuses
-    in production for as long as it takes somebody to notice — and a
-    Gateway that starts happily while half of what it serves cannot work is the
-    silent nothing this codebase has paid for more than once. A caller with no
-    store to hand it has no business serving this app.
-
-    The working-lane routes are appended the same way and wrapped in the same
-    middleware, so what is behind the token check is decided in this one function.
-    They are GET-only: the surface exists to hand a pod back its own earlier
-    workspace, and a write door onto a lane the pod already writes through its own
-    sync would be a second way in with a different check behind it.
-
-    `rollouts` is where a Session's resume state is read back from, and it is required
-    on the same terms and for a sharper version of the same reason. Left unwired, this
-    service would answer "no Rollout" to every seeding pod, every resuming Session
-    would then open a fresh thread over a record it should have continued, and the
-    platform would replay folded history and report success -- the one failure the
-    whole resume path exists to prevent (ADR-004). A caller with no store to hand it
-    has no business serving this app.
+    `rollouts` is where a Session's resume state is read back from. Required rather
+    than defaulted, because the alternative to a wired store is a surface that refuses
+    in production for as long as it takes somebody to notice -- and here the refusal is
+    not even visible. Left unwired, this service would answer "no Rollout" to every
+    seeding pod, every resuming Session would then open a fresh thread over a record it
+    should have continued, and the platform would replay folded history and report
+    success -- the one failure the whole resume path exists to prevent (ADR-004). A
+    caller with no store to hand it has no business serving this app.
     """
     mcp_server = build_mcp_server(sessions)
     manager = StreamableHTTPSessionManager(app=mcp_server, stateless=True)
@@ -436,15 +421,11 @@ def create_gateway_app(
         )
     )
     seed_path, seed_endpoint = rollout_seed_endpoint(rollouts, _CURRENT.get)
-    for path, endpoint in (
-        *working_lane_endpoints(files, _CURRENT.get),
-        (seed_path, seed_endpoint),
-    ):
-        app.router.routes.append(
-            Route(
-                path,
-                endpoint=SessionTokenMiddleware(endpoint, token_key),
-                methods=["GET"],
-            )
+    app.router.routes.append(
+        Route(
+            seed_path,
+            endpoint=SessionTokenMiddleware(seed_endpoint, token_key),
+            methods=["GET"],
         )
+    )
     return app

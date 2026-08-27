@@ -51,3 +51,38 @@ store refuses it and the Turn is refused saying so. A Turn that re-offers the id
 bytes appends nothing at all, so a tenant polling this log is never told a document was
 produced again on a Turn that did not touch it.
 """
+
+OUTPUT_PARTIAL = declare("output.partial", FAMILY)
+"""Not everything the agent has produced is in the artifacts lane yet, and here is why.
+
+**Not a failure and not a refusal**, which is the whole reason it exists. A Turn that
+did the work and wrote the documents must not be failed for how many there were --
+that would make the platform's own bound read as the agent's error, and it would repeat
+on every Turn afterwards, because nothing removes a file from a pod. So ship-out takes
+what fits, in sorted order so two runs over one tree take the same prefix, and says here
+what it left.
+
+`paths_shipped` and `paths_left` count this Turn's NEW files only; a path already
+delivered was never weighed. The two ceilings are carried so a tenant reading this knows
+which one bound them without having to know the platform's constants.
+
+**What was left behind is still in the pod's output directory and is offered again on
+the next Turn**, where it costs nothing already delivered and is taken by the same
+sorted prefix -- so a large batch drains over successive Turns rather than being lost.
+Two things that does not cover, and both are the tenant's to act on: a Session whose
+last Turn was this one never drains the tail, and a single file larger than the whole
+byte budget is left behind every Turn forever, because no prefix holding it ever fits.
+This event is the only place either becomes visible.
+
+`tree_truncated` is the third and the worst, and it is a different fact from the other
+two. It says the pod stopped walking the output directory at `tree_ceiling` entries, so
+the counts above are of what it *listed* and there are further paths nobody here has
+seen. Those do not drain: the walk is sorted, so a name beyond the cut is beyond it on
+every Turn, and no amount of waiting brings it in. The move is to stop adding paths --
+collect into fewer, larger files, or start a new Session -- and it is the tenant's move
+because the platform will not walk further and holds no grant to delete out of a pod.
+
+It is appended whenever that is true, including on a Turn where everything listed was
+already delivered and `paths_left` is zero. That Turn is the steady state of a Session
+past the bound, and it is the one that would otherwise look perfect.
+"""

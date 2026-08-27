@@ -364,6 +364,15 @@ def _probe(url: str, image: str, method: str = "GET") -> tuple[int, str]:
 
     The answer is parsed out of the pod's own stdout as JSON, so a pod that failed to
     start or an httpx exception fails this rather than reading as a status of zero.
+
+    IT WEARS `map.role: session-pod`, and that is a correctness requirement rather than
+    decoration. Since 2026-08-26 this namespace is default-deny, and the Model Gateway's
+    ingress admits exactly one client: a Session pod -- which is the point of that
+    document, since this is the process holding the provider credential no pod holds. An
+    unlabelled probe is refused twice over, by the floor and by that ingress, so before
+    the label this measured a caller production never has. It also collapses the tier 2
+    / tier 3 distinction above in the one way that matters: both tiers now dial as the
+    client the Service actually serves, and the image is still what separates them.
     """
     program = (
         "import httpx,sys,json;"
@@ -376,6 +385,8 @@ def _probe(url: str, image: str, method: str = "GET") -> tuple[int, str]:
         _PROBE_POD,
         "--image",
         image,
+        "--labels",
+        "map.role=session-pod",
         "--restart=Never",
         "--command",
         "--",

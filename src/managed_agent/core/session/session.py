@@ -28,10 +28,19 @@ from managed_agent.core.registration.environment import EnvironmentId
 
 
 class SessionState(StrEnum):
-    """The states a fold over the Event Log can arrive at. Never persisted."""
+    """The states a fold over the Event Log can arrive at. Never persisted.
+
+    One axis, and it answers one question: is a Turn executing on this Session right
+    now. `RUNNING` says yes, `IDLE` says no and the Session is alive and takeable.
+
+    Whether a pod is currently placed is deliberately *not* on this axis. A Session
+    outlives every pod it is given and the pod cycle may run many times without the
+    Session moving here at all, so folding the two together would make a routine
+    reclamation read as a change in what the Session can do (ADR-032).
+    """
 
     RUNNING = "running"
-    SUSPENDED = "suspended"
+    IDLE = "idle"
     TAKEN_OVER = "taken_over"
     STOPPED = "stopped"
 
@@ -41,8 +50,14 @@ class SessionState(StrEnum):
         The state answers this rather than each caller deciding for itself, so
         the projection that computed the state and the component about to start a
         Turn cannot reach different verdicts about the same Session.
+
+        `IDLE` and not "anything but stopped", which is what makes this a narrower
+        question than "is this Session alive". A Session already running a Turn refuses
+        a second one, because the runtime behind it serves a single thread of work and
+        two Turns admitted at once would interleave into it with nothing recording
+        which output belonged to which submission.
         """
-        return self is SessionState.RUNNING
+        return self is SessionState.IDLE
 
 
 MAX_FILES_PER_SESSION = 16

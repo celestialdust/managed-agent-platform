@@ -79,7 +79,7 @@ from managed_agent.core.registration.scope_binding import (
     RegisteredTool,
     ServerRegistration,
 )
-from managed_agent.core.session.session import SessionRecord, SessionState
+from managed_agent.core.session.session import SessionRecord
 from managed_agent.core.vocabulary import lifecycle, turn
 
 _TENANT = TenantId(uuid4())
@@ -319,7 +319,7 @@ class UnusedWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         raise AssertionError("a test in this file registered a webhook")
@@ -331,9 +331,9 @@ class UnusedWebhooks:
         raise AssertionError("a test in this file deleted a webhook")
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        raise AssertionError("a test in this file asked what watches a state")
+        raise AssertionError("a test in this file asked what watches a type")
 
 
 # --------------------------------------------------------------------------------------
@@ -383,7 +383,7 @@ def _create_body() -> dict[str, object]:
     return {
         "definition_id": str(uuid4()),
         "environment_id": str(uuid4()),
-        "grant": ["fs.read"],
+        "grant": [],
         "scope": {"repo": "acme/widgets"},
         "budget_minor_units": 500,
         "budget_currency": "USD",
@@ -670,7 +670,7 @@ def test_an_empty_update_reports_the_current_state_and_writes_nothing(
     response = client.post(f"/v1/sessions/{session_id}", json={})
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"id": str(session_id), "state": "running", "seq": 4}
+    assert response.json() == {"id": str(session_id), "state": "idle", "seq": 4}
     assert log.appends == appends
     assert pods.held == {session_id}, "an update took a pod away"
 

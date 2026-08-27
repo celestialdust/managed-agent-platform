@@ -18,6 +18,27 @@ with a Session placed between the readings, and what is asserted is the *differe
 decision and takes a minute -- so it is graded against the ceiling beside it, which
 comes from a different source entirely.
 
+**The second reading is taken while the Turn is still running, and it has to be.** A pod
+is leased for exactly one Turn and given back when that Turn ends (ADR-041), and the API
+holds the submission's response until then -- so `session_pods_running` is now the count
+of Turns actually in flight, and outside that window there is no pod of ours to count.
+This file used to submit the Turn, wait for the API to answer and then start looking for
+a Running pod, which under the lease is looking for one the platform has already
+deleted. The submission therefore runs on a thread that is not joined until the second
+reading has been taken.
+
+That is also the sharper claim. The field counts the same objects by the same
+arithmetic and means something else for it: while a Session held a pod for its whole
+life the number read as headroom, and under the lease every running pod is already
+carrying a Turn, so it reads as utilisation. The difference this file asserts is
+therefore one concurrent Turn rather than one more Session that could take one.
+
+**Which is why the wait below is for RUNNING and must stay that way.** A pod that is
+still starting belongs to a Turn that is queued, and that Turn is already counted in
+`turns_awaiting_placement`; relaxing this to "the pod exists" would take the second
+reading while the same Turn was being counted in two fields an operator reads against
+each other, and the `+ 1` would then be measuring the race rather than the count.
+
 NO KEY OR TOKEN VALUE IS PRINTED OR ASSERTED ON. A reviewer token has to be minted to
 reach this route at all, and the key it is minted with is read out of the deployed
 Secret into a local and never rendered: not into an assertion message, not into a repr,
@@ -32,6 +53,7 @@ import os
 import subprocess
 import time
 from collections.abc import Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Final
 from uuid import UUID, uuid4
 
@@ -130,16 +152,15 @@ def _created(answered: httpx.Response) -> dict[str, Any]:
     return body
 
 
-def _place_one_session(base: str, tenant_id: str) -> SessionId:
-    """One Session with one Turn submitted, returning its id. Does not wait.
+def _register_a_session(base: str, tenant_id: str) -> SessionId:
+    """An environment, a definition and a Session, over the REST API. Places nothing.
 
-    The submission is not awaited to completion because what this file counts is a pod
-    that exists, and a pod exists as soon as placement is done -- waiting for the model
-    to answer adds a round trip to every run for a number no case here reads. The Turn
-    is submitted rather than skipped because placement is a first-Turn step: a Session
-    created and never run has no pod to count.
+    Split from the submission below because the two now have to happen on different
+    threads. Registering a Session creates no pod -- placement is a step a Turn pays for
+    -- so this part can block the caller, and the part that cannot is the Turn.
 
-    A one-word prompt for the same reason. Nothing reads the answer."""
+    Everything here is through the API, which is what makes the pod counted later the
+    deployed process's doing rather than this run's."""
     stamp = uuid4().hex[:8]
     caller = httpx.Client(
         base_url=base, timeout=_SUBMIT_TIMEOUT_S, headers={TENANT_HEADER: tenant_id}
@@ -177,34 +198,97 @@ def _place_one_session(base: str, tenant_id: str) -> SessionId:
                 },
             )
         )
-        session_id = SessionId(UUID(session["id"]))
+        return SessionId(UUID(session["id"]))
+
+
+_ENDED: Final = frozenset({"turn.completed", "turn.failed"})
+"""Either of which means the Turn is over and its pod has been released."""
+
+
+def _submit_a_turn(base: str, tenant_id: str, session_id: SessionId) -> None:
+    """Submit one Turn and block until it has ended.
+
+    Run on a thread by its only caller, and that is the whole shape of this file now.
+    The lease deletes the pod when the Turn ends, so a caller that waited for the Turn
+    on the main thread would have nothing left to count by the time it looked.
+
+    **The block is this function's own polling, not the API's.** The route held its
+    response until the dispatch returned once, and this simply returned the POST. It
+    answers 202 the moment the Turn is admitted and runs it on a background task now, so
+    a caller that returns on the POST reports the Turn finished while the pod is still
+    being placed -- and the fixture's teardown then deletes the pod out from under the
+    Turn, which reaches the log as `runtime_did_not_start: the pod ... is gone`. The
+    Turn's end is only readable out of its Session's events.
+
+    A one-word prompt because nothing reads the answer. What is being counted is that a
+    pod is up and serving, and the cheapest Turn that gets one there is the right one to
+    ask for."""
+    caller = httpx.Client(
+        base_url=base, timeout=_SUBMIT_TIMEOUT_S, headers={TENANT_HEADER: tenant_id}
+    )
+    with caller:
         submitted = caller.post(
             f"/v1/sessions/{session_id}/events",
             json={"prompt": "Reply with the single word ready and nothing else."},
             headers={"Idempotency-Key": uuid4().hex},
         )
-    assert submitted.status_code == 202, submitted.text
-    return session_id
+        assert submitted.status_code == 202, submitted.text
+        deadline = time.monotonic() + _SUBMIT_TIMEOUT_S
+        while time.monotonic() < deadline:
+            answered = caller.get(f"/v1/sessions/{session_id}/events")
+            assert answered.status_code == 200, answered.text
+            seen = [one["type"] for one in answered.json()["events"]]
+            if _ENDED.intersection(seen):
+                return
+            time.sleep(2)
+        raise AssertionError(
+            f"the Turn on session {session_id} did not end in {_SUBMIT_TIMEOUT_S}s; "
+            f"its events were {seen}"
+        )
 
 
 def _running(session_id: SessionId) -> bool:
-    """Whether this Session's pod is in `Running`, by asking the cluster.
+    """Whether this Session's pod is one the route would count, by asking the cluster.
 
     Asked of the cluster rather than of the route under test. A poll that waited on
     `session_pods_running` to rise would be waiting for the number it then asserts,
     which passes on a route that returns a rising constant and fails on nothing.
 
+    **Every container ready, and not the pod phase alone.** The route counts what
+    `_phase_of` calls RUNNING, which is the phase *and* every container ready -- a
+    Session is served by the runtime and the shim together and neither serves a Turn
+    alone. Reading the phase by itself made this poll a weaker condition than the thing
+    it was gating, so it returned during the seconds when the pod says Running and its
+    containers are still coming up, and the reading taken right after found the route
+    counting nothing. Measured on `map-dev`: `session_pods_running` 0 alongside
+    `sessions_placing` 1, which is the control plane still inside its placement wait and
+    is the route being right rather than late.
+
+    That gap was always there and used to be invisible: a pod outlived the Turn that
+    placed it, so anything reading afterwards found it long since ready. Under the lease
+    the pod exists only while its Turn does, and the window this poll opens is the
+    whole of what there is to measure.
+
+    The emptiness check is why this is not a bare `all()`. `all(())` is true, so a pod
+    whose container statuses have not been reported yet -- which is every pod for its
+    first moment -- would otherwise read as ready, which is the same bug one layer down.
+
     `check=False` so an absent pod reads as not-running rather than raising: this is
-    called in a loop whose whole purpose is the window before the pod exists."""
-    phase = kubectl(
+    called in a loop whose whole purpose is the window before the pod exists. Under the
+    lease there is a window after it too -- the pod is deleted when its Turn ends -- so
+    a False here is "not yet" or "not any more", and only the caller, which knows
+    whether the Turn is still in flight, can tell those apart."""
+    reading = kubectl(
         "get",
         "pod",
         pod_name_for(session_id),
         "-o",
-        "jsonpath={.status.phase}",
+        "jsonpath={.status.phase}|{.status.containerStatuses[*].ready}",
         check=False,
     ).strip()
-    return phase == "Running"
+    phase, _, readiness = reading.partition("|")
+    ready = readiness.split()
+    return phase == "Running" and bool(ready) and all(r == "true" for r in ready)
 
 
 def _clean_up(session_id: SessionId) -> None:
@@ -216,30 +300,71 @@ def _clean_up(session_id: SessionId) -> None:
         )
 
 
+def _await_running_while_in_flight(session_id: SessionId, flying: Future[None]) -> None:
+    """Block until this Session's pod is Running, while its Turn is still being carried.
+
+    Polled against the submission and not against a clock alone, because the pod belongs
+    to that Turn: it appears once the placement is done and is deleted the moment the
+    Turn ends. A wait that outlived the submission would spend the rest of its deadline
+    looking for a pod that is correctly gone, and then report the platform as having
+    placed nothing.
+
+    Fails here rather than handing back a verdict. If no pod of ours was ever Running
+    there is nothing for the route to count, and the difference the cases below assert
+    would be a difference between two readings of an unchanged cluster -- which is
+    exactly what a route returning a constant produces."""
+    deadline = time.monotonic() + _TURN_DEADLINE_S
+    while time.monotonic() < deadline:
+        if _running(session_id):
+            return
+        if flying.done():
+            # Whatever the submission did comes first. A Turn refused at admission and a
+            # Turn whose pod never started leave the same absence here and are two
+            # different people's problems; this re-raises the first, names the second.
+            flying.result(timeout=0)
+            pytest.fail(
+                f"the Turn for session {session_id} ended before its pod was ever "
+                "Running, so there was never a pod of ours here to count. The Turn was "
+                "answered, so what failed is the pod starting rather than the Turn "
+                "being accepted."
+            )
+        time.sleep(2)
+    pytest.fail(
+        f"no pod for session {session_id} reached Running in {_TURN_DEADLINE_S}s, so "
+        "nothing here can be counted"
+    )
+
+
 @pytest.fixture(scope="module")
 def readings() -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
-    """The route before a Session is placed and again once its pod is Running.
+    """The route before a Session takes a Turn, and again while that Turn is running.
 
-    Module-scoped, so one placement serves every case. The pair is the unit rather than
-    two separate fixtures because the finding is the difference between them, and two
-    fixtures could sample it either side of a pod that had already gone.
+    Module-scoped, so one Turn serves every case. The pair is the unit rather than two
+    separate fixtures because the finding is the difference between them, and two
+    fixtures could sample it either side of a pod that had already gone -- which under
+    the lease is no longer a hypothetical: the pod goes away by itself, on the
+    platform's schedule rather than on this file's.
+
+    The submission is joined before anything is yielded, so no Turn is still running
+    while the cases read. Otherwise the teardown would delete a pod out from under a
+    Turn the platform was still carrying and this file would be the cause of a failure
+    it then reported.
 
     The teardown deletes the pod and its Secrets in a `finally`, including when the wait
-    above fails. A run that gave up on placement still created a Session the control
-    plane places a pod for."""
+    above fails. Ordinarily the lease has already deleted all four; what this covers is
+    the run that died mid-Turn, which leaves a pod nothing else will reap."""
     header = _reviewer_header()
+    tenant_id = str(uuid4())
     with forwarded(_CONTROL_PLANE, _CONTROL_PLANE_PORT) as base:
         before = _capacity(base, header)
-        session_id = _place_one_session(base, str(uuid4()))
+        session_id = _register_a_session(base, tenant_id)
         try:
-            deadline = time.monotonic() + _TURN_DEADLINE_S
-            while not _running(session_id) and time.monotonic() < deadline:
-                time.sleep(2)
-            assert _running(session_id), (
-                f"no pod for session {session_id} reached Running in "
-                f"{_TURN_DEADLINE_S}s, so nothing here can be counted"
-            )
-            yield before, _capacity(base, header)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                flying = pool.submit(_submit_a_turn, base, tenant_id, session_id)
+                _await_running_while_in_flight(session_id, flying)
+                after = _capacity(base, header)
+                flying.result(timeout=_SUBMIT_TIMEOUT_S + 60)
+            yield before, after
         finally:
             _clean_up(session_id)
 

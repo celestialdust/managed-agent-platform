@@ -210,12 +210,20 @@ async def _session_is_open(platform: Platform, session_id: SessionId) -> bool:
     "has a stop event" test would be a second answer to one question, and the first
     time the two disagreed a thread would read as running on a Session that had ended.
 
+    The question is which states are *closed*, not which one is running, and only
+    `STOPPED` is -- so it is the one this names. Asking `is RUNNING` instead answers the
+    narrower question "is this Session working right now", which is a different fact and
+    the wrong one here: a Session at rest and a Session a human has taken over are both
+    still appendable, and reporting their threads terminated tells a consumer to stop
+    reading a log that is still being written. Every other state is somewhere the
+    Session can move out of; a stop is the only one it cannot.
+
     A log with no creation event raises inside `project`. That cannot be reached from
     here -- the registry lookup every route does first is what proves the Session was
     created -- so there is nothing to catch and no fallback to write.
     """
     state, _ = project(await whole_log(platform.event_log_range, session_id))
-    return state is SessionState.RUNNING
+    return state is not SessionState.STOPPED
 
 
 @router.get(

@@ -1,4 +1,4 @@
-"""Webhook registrations, the once-per-state delivery claim, and the tail's watermark.
+"""Webhook registrations, the once-per-event delivery claim, and the tail's watermark.
 
 One class over three tables, because the dispatcher takes the registration query and the
 claim as two ports and both are answered by the same connection pool over rows that must
@@ -6,11 +6,16 @@ agree with each other: `undelivered` joins the claim to the registration for the
 the secret reference, and splitting the two would make that read a cross-adapter join
 performed in Python.
 
-The whole concurrency argument lives in `claim`. Two dispatchers reaching one state
-change at the same instant is the case that decides whether "one callback" is true, and
-it is decided by the primary key on `(webhook_id, session_id, state)` rather than by a
-read followed by a write -- there is no point between the two where a second caller can
-see the row absent and insert its own.
+The whole concurrency argument lives in `claim`. Two dispatchers reaching one event at
+the same instant is the case that decides whether "one callback" is true, and it is
+decided by the primary key on `(webhook_id, session_id, seq)` rather than by a read
+followed by a write -- there is no point between the two where a second caller can see
+the row absent and insert its own.
+
+The sequence is in that key and the event's type is not. A Session reaches a given state
+more than once -- created, suspended, resumed -- so a key naming what the event meant
+rather than where it sits would fold two separate events onto one row and deliver the
+later one as a retry of the earlier, or not at all.
 
 Bind parameter types are declared because these are textual statements and SQLAlchemy
 has no column metadata to infer from: without one asyncpg receives a bare Python object.
@@ -33,29 +38,28 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from managed_agent.control.webhooks.registry import CallbackUrl, WebhookRecord
 from managed_agent.core.ids import Seq, SessionId, TenantId
-from managed_agent.core.session.session import SessionState
 
 _RECORD_TYPES: dict[str, sa.types.TypeEngine[Any]] = {
     "id": sa.Uuid(),
     "tenant_id": sa.Uuid(),
     "url": sa.Text(),
-    "states": sa.ARRAY(sa.Text()),
+    "event_types": sa.ARRAY(sa.Text()),
     "secret_ref": sa.Text(),
     "created_at_ms": sa.BigInteger(),
 }
 
 _REGISTER = sa.text(
-    "INSERT INTO webhook (id, tenant_id, url, states, secret_ref)"
-    " VALUES (:wid, :tid, :url, :states, :ref)"
+    "INSERT INTO webhook (id, tenant_id, url, event_types, secret_ref)"
+    " VALUES (:wid, :tid, :url, :types, :ref)"
     " RETURNING created_at_ms"
 ).bindparams(
     sa.bindparam("wid", type_=sa.Uuid()),
     sa.bindparam("tid", type_=sa.Uuid()),
-    sa.bindparam("states", type_=sa.ARRAY(sa.Text())),
+    sa.bindparam("types", type_=sa.ARRAY(sa.Text())),
 )
 
 _SELECT_RECORD = (
-    "SELECT id, tenant_id, url, states, secret_ref, created_at_ms FROM webhook"
+    "SELECT id, tenant_id, url, event_types, secret_ref, created_at_ms FROM webhook"
 )
 
 _LIST_FOR_TENANT = (
@@ -64,13 +68,14 @@ _LIST_FOR_TENANT = (
     .columns(**_RECORD_TYPES)
 )
 
-# `:state = ANY(states)` rather than an overlap operator, because it is the form the GIN
-# index on `states` plans directly and because the question really is about one state.
+# `:type = ANY(event_types)` rather than an overlap operator, because it is the form the
+# GIN index on `event_types` plans directly and because the question really is about one
+# type.
 _WATCHING = (
-    sa.text(f"{_SELECT_RECORD} WHERE tenant_id = :tid AND :state = ANY(states)")
+    sa.text(f"{_SELECT_RECORD} WHERE tenant_id = :tid AND :type = ANY(event_types)")
     .bindparams(
         sa.bindparam("tid", type_=sa.Uuid()),
-        sa.bindparam("state", type_=sa.Text()),
+        sa.bindparam("type", type_=sa.Text()),
     )
     .columns(**_RECORD_TYPES)
 )
@@ -99,9 +104,9 @@ _ADVANCE_SCAN = sa.text(
 # between them.
 _CLAIM = sa.text(
     "INSERT INTO webhook_delivery"
-    " (webhook_id, session_id, state, seq, attempts)"
-    " VALUES (:wid, :sid, :state, :seq, 1)"
-    " ON CONFLICT (webhook_id, session_id, state) DO UPDATE"
+    " (webhook_id, session_id, event_type, seq, attempts)"
+    " VALUES (:wid, :sid, :type, :seq, 1)"
+    " ON CONFLICT (webhook_id, session_id, seq) DO UPDATE"
     " SET attempts = webhook_delivery.attempts + 1"
     " WHERE webhook_delivery.delivered_at_ms IS NULL"
     " AND webhook_delivery.attempts < :max_attempts"
@@ -109,28 +114,27 @@ _CLAIM = sa.text(
 ).bindparams(
     sa.bindparam("wid", type_=sa.Uuid()),
     sa.bindparam("sid", type_=sa.Uuid()),
-    sa.bindparam("state", type_=sa.Text()),
+    sa.bindparam("type", type_=sa.Text()),
 )
 
 _MARK_DELIVERED = sa.text(
     "UPDATE webhook_delivery"
     " SET delivered_at_ms = (extract(epoch from now()) * 1000)::bigint,"
     " last_response_code = :status"
-    " WHERE webhook_id = :wid AND session_id = :sid AND state = :state"
+    " WHERE webhook_id = :wid AND session_id = :sid AND seq = :seq"
 ).bindparams(
     sa.bindparam("wid", type_=sa.Uuid()),
     sa.bindparam("sid", type_=sa.Uuid()),
-    sa.bindparam("state", type_=sa.Text()),
 )
 
 # Ordered by attempts so a row that has failed least is tried first: a receiver that is
 # permanently gone otherwise crowds out one that was briefly down.
 _UNDELIVERED = sa.text(
     "SELECT d.webhook_id, w.tenant_id, w.url, w.secret_ref,"
-    " d.session_id, d.state, d.seq"
+    " d.session_id, d.event_type, d.seq"
     " FROM webhook_delivery d JOIN webhook w ON w.id = d.webhook_id"
     " WHERE d.delivered_at_ms IS NULL AND d.attempts < :max_attempts"
-    " ORDER BY d.attempts, d.webhook_id, d.session_id, d.state"
+    " ORDER BY d.attempts, d.webhook_id, d.session_id, d.seq"
     " LIMIT :limit"
 ).columns(
     webhook_id=sa.Uuid(),
@@ -138,7 +142,7 @@ _UNDELIVERED = sa.text(
     url=sa.Text(),
     secret_ref=sa.Text(),
     session_id=sa.Uuid(),
-    state=sa.Text(),
+    event_type=sa.Text(),
     seq=sa.BigInteger(),
 )
 
@@ -163,7 +167,7 @@ class PendingRow:
     url: str
     secret_ref: str
     session_id: SessionId
-    state: SessionState
+    event_type: str
     seq: Seq
 
 
@@ -177,7 +181,7 @@ class PostgresWebhookStore:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         """Write one registration and return it as stored.
@@ -185,7 +189,7 @@ class PostgresWebhookStore:
         The id is minted here rather than accepted from the caller: a tenant choosing
         its own would be choosing a key in a table it shares with every other tenant.
 
-        States are written sorted so two registrations of the same set store equal
+        Types are written sorted so two registrations of the same set store equal
         arrays -- a `frozenset`'s iteration order is not part of its value, and the
         stored array would otherwise differ run to run.
         """
@@ -198,7 +202,7 @@ class PostgresWebhookStore:
                         "wid": identifier,
                         "tid": tenant_id,
                         "url": str(url),
-                        "states": sorted(state.value for state in states),
+                        "types": sorted(event_types),
                         "ref": secret_ref,
                     },
                 )
@@ -207,7 +211,7 @@ class PostgresWebhookStore:
             id=identifier,
             tenant_id=tenant_id,
             url=url,
-            states=frozenset(states),
+            event_types=frozenset(event_types),
             secret_ref=secret_ref,
             created_at_ms=int(created),
         )
@@ -238,12 +242,12 @@ class PostgresWebhookStore:
             return result.rowcount == 1
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        """This tenant's registrations naming this state."""
+        """This tenant's registrations naming this event type."""
         async with self._engine.connect() as conn:
             result = await conn.execute(
-                _WATCHING, {"tid": tenant_id, "state": state.value}
+                _WATCHING, {"tid": tenant_id, "type": event_type}
             )
             return [_record(row) for row in result]
 
@@ -261,7 +265,7 @@ class PostgresWebhookStore:
         self,
         webhook_id: UUID,
         session_id: SessionId,
-        state: SessionState,
+        event_type: str,
         seq: Seq,
         max_attempts: int,
     ) -> int | None:
@@ -273,6 +277,10 @@ class PostgresWebhookStore:
         apart would need a second read that the racing dispatcher could invalidate
         between the two.
 
+        `event_type` is written on the row and is not part of what makes it unique. Two
+        events on one Session are two claims because their sequences differ, whatever
+        they are called; a type in the key would let one event be claimed twice.
+
         The returned number is which attempt this is, counting from 1.
         """
         async with self._engine.begin() as conn:
@@ -282,7 +290,7 @@ class PostgresWebhookStore:
                     {
                         "wid": webhook_id,
                         "sid": session_id,
-                        "state": state.value,
+                        "type": event_type,
                         "seq": seq,
                         "max_attempts": max_attempts,
                     },
@@ -291,16 +299,21 @@ class PostgresWebhookStore:
         return None if attempts is None else int(attempts)
 
     async def mark_delivered(
-        self, webhook_id: UUID, session_id: SessionId, state: SessionState, status: int
+        self, webhook_id: UUID, session_id: SessionId, seq: Seq, status: int
     ) -> None:
-        """Stamp this callback delivered, taking it out of the retry set."""
+        """Stamp this callback delivered, taking it out of the retry set.
+
+        Named by the key rather than by what the callback said: the type is on the row
+        and would narrow nothing, and passing one would let a caller that spelled it
+        differently leave a delivered row looking owed.
+        """
         async with self._engine.begin() as conn:
             await conn.execute(
                 _MARK_DELIVERED,
                 {
                     "wid": webhook_id,
                     "sid": session_id,
-                    "state": state.value,
+                    "seq": seq,
                     "status": status,
                 },
             )
@@ -318,7 +331,7 @@ class PostgresWebhookStore:
                     url=str(row.url),
                     secret_ref=str(row.secret_ref),
                     session_id=SessionId(row.session_id),
-                    state=SessionState(row.state),
+                    event_type=str(row.event_type),
                     seq=Seq(int(row.seq)),
                 )
                 for row in result
@@ -337,7 +350,7 @@ def _record(row: Any) -> WebhookRecord:
         id=UUID(str(row.id)),
         tenant_id=TenantId(row.tenant_id),
         url=CallbackUrl(str(row.url)),
-        states=frozenset(SessionState(state) for state in row.states),
+        event_types=frozenset(str(name) for name in row.event_types),
         secret_ref=str(row.secret_ref),
         created_at_ms=int(row.created_at_ms),
     )

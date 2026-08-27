@@ -15,6 +15,7 @@
         "elasticloadbalancing:*",
         "logs:*",
         "s3files:*",
+        "events:*",
         "elasticfilesystem:*",
         "ssm:GetParameter",
         "ssm:GetParameters",
@@ -105,6 +106,16 @@
         "iam:DeleteOpenIDConnectProvider"
       ],
       "Resource": "*"
+    },
+    {
+      "Sid": "ProveTheNodegroupServiceLinkedRoleExistsBecauseEksAsksUsTo",
+      "Effect": "Allow",
+      "Action": [
+        "iam:GetRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::*:role/aws-service-role/eks-nodegroup.amazonaws.com/AWSServiceRoleForAmazonEKSNodegroup"
+      ]
     },
     {
       "Sid": "ReadEnoughToCheckAClaimInsteadOfInferringIt",

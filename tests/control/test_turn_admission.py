@@ -35,6 +35,7 @@ from managed_agent.control.session.lifecycle import (
     admit_turn,
 )
 from managed_agent.core.ids import FIRST_SEQ, Seq, SessionId, new_session_id
+from managed_agent.core.session.projection import project
 from managed_agent.core.session.session import SessionState
 from managed_agent.core.vocabulary import turn
 
@@ -180,13 +181,20 @@ async def test_a_different_key_in_the_same_session_is_a_different_turn() -> None
 
     Without this, an implementation that replayed *any* prior submission would pass
     every case above -- and a Session would be able to run exactly one Turn ever.
+
+    The first Turn is closed before the second is submitted, which is required rather
+    than tidy: a Session already running a Turn refuses a second concurrent one, so
+    submitting both at once would grade that refusal instead of the key scoping this is
+    about.
     """
     log = InMemoryLog()
     session_id = _running(log)
     first = await admit_turn(session_id, _KEY, _PROMPT, log, log)
+    assert isinstance(first, TurnAdmitted)
+    log.add(session_id, "turn.completed", {"turn_id": str(first.turn_id)})
+
     second = await admit_turn(session_id, "another-key-0002", _PROMPT, log, log)
 
-    assert isinstance(first, TurnAdmitted)
     assert isinstance(second, TurnAdmitted)
     assert second.turn_id != first.turn_id
 
@@ -208,12 +216,18 @@ async def test_one_key_under_two_sessions_names_two_unrelated_submissions() -> N
     ("event", "state"),
     [
         ("session.stopped", SessionState.STOPPED),
-        ("session.suspended", SessionState.SUSPENDED),
+        ("turn.submitted", SessionState.RUNNING),
     ],
 )
 async def test_a_session_that_takes_no_turn_is_refused_and_nothing_is_written(
     event: str, state: SessionState
 ) -> None:
+    """The two ways a submission is turned away, and they are not the same refusal.
+
+    A stop is permanent. A Turn already executing is not -- the Session refuses a second
+    concurrent submission because the runtime behind it serves one thread of work, and
+    the caller's remedy is to wait or interrupt rather than to start a new Session.
+    """
     log = InMemoryLog()
     session_id = _running(log)
     log.add(session_id, event)
@@ -222,6 +236,60 @@ async def test_a_session_that_takes_no_turn_is_refused_and_nothing_is_written(
 
     assert admission == TurnRefused(state=state)
     assert log.appends == 0, "a refused submission was recorded as one"
+
+
+async def test_a_submission_does_not_refuse_itself_on_the_settled_read() -> None:
+    """The re-read after the append contains this call's own submission.
+
+    Once `turn.submitted` means the Session is `RUNNING`, the settled prefix folds to
+    `RUNNING` for every admission -- caused by the very event being admitted. A second
+    check asking "may a Turn start" would therefore refuse every Turn ever submitted,
+    and it would do it while the submission sat recorded in the log, so the tenant would
+    see a refusal for work the platform had already accepted. The settled read asks only
+    whether something ended the Session across the window.
+    """
+    log = InMemoryLog()
+    session_id = _running(log)
+
+    admission = await admit_turn(session_id, _KEY, _PROMPT, log, log)
+
+    assert isinstance(admission, TurnAdmitted), admission
+    settled = await log.read(session_id, FIRST_SEQ, admission.seq, limit=admission.seq)
+    assert project(settled)[0] is SessionState.RUNNING, (
+        "the submission really did move the state, which is what makes this a trap"
+    )
+
+
+async def test_a_session_whose_pod_was_reclaimed_still_admits_a_turn() -> None:
+    """The reason this state machine was changed at all.
+
+    A suspension says the pod was handed back, which happens on a fifteen-minute clock
+    and says nothing about whether the Session will work again. The submission is
+    admitted, and it is the placement path underneath that notices there is no pod and
+    compiles one. Refusing here is what used to make a routine reclamation permanent.
+    """
+    log = InMemoryLog()
+    session_id = _running(log)
+    log.add(session_id, "session.suspended")
+
+    admission = await admit_turn(session_id, _KEY, _PROMPT, log, log)
+
+    assert isinstance(admission, TurnAdmitted), admission
+    assert log.appends == 1
+
+
+async def test_a_completed_turn_leaves_the_session_ready_for_the_next_one() -> None:
+    """`RUNNING` has to be released by the closure or a Session would be single-Turn."""
+    log = InMemoryLog()
+    session_id = _running(log)
+    first = await admit_turn(session_id, _KEY, _PROMPT, log, log)
+    assert isinstance(first, TurnAdmitted)
+    log.add(session_id, "turn.completed", {"turn_id": str(first.turn_id)})
+
+    second = await admit_turn(session_id, "second-key-0002", _PROMPT, log, log)
+
+    assert isinstance(second, TurnAdmitted), second
+    assert second.turn_id != first.turn_id
 
 
 async def test_a_retry_that_crosses_a_stop_still_gets_back_the_turn_it_started() -> (

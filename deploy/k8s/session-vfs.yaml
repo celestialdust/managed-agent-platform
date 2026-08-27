@@ -1,0 +1,116 @@
+# The durable workspace every Session pod mounts: one PersistentVolume over the S3 Files
+# file system `deploy/terraform/session_vfs.tf` declares, and one PersistentVolumeClaim
+# that binds it.
+#
+# ONE OF EACH, FOR EVERY SESSION ON THE CLUSTER, and that is the design rather than a
+# shortcut. Per-Session isolation is the `subPath` on each of session-pod.yaml's
+# volumeMounts -- `<tenant_id>/<session_id>` beneath this volume's root -- not a
+# PersistentVolume per Session. A pod is given exactly one subtree and the rest of the
+# volume is mapped into no namespace it can name, so a traversal out of it has nowhere to
+# arrive; measured, a pod mounting `tenant-beta/session-9999` gets `No such file or
+# directory` walking toward `tenant-alpha`. The tenant segment is COMPOSED into the path
+# rather than compared afterwards, which is the same principle the artifacts route already
+# uses and the reason there is no arrangement of inputs that reaches another tenant.
+#
+# A PV per Session would be the obvious alternative and it is worse in every direction: a
+# cluster-scoped object created and destroyed per Session, at Session rates, by the
+# control plane -- which today holds no cluster-scoped write authority at all and would
+# have to be granted some (cluster-bootstrap.yaml's Role is namespaced on purpose). It
+# would also bind a pod to a Session before the pod exists, which is the property ADR-041
+# is trying not to need.
+#
+# WHY THE `s3files:` PREFIX ON THE volumeHandle IS LOAD-BEARING. The EFS CSI driver parses
+# the file-system TYPE out of the handle itself -- the four fields are
+# `{fsType}:{fsId}:{mountPath}:{accessPointId}` -- and with the prefix absent it reads the
+# handle as plain EFS, mounts it as EFS, and the pod hangs in ContainerCreating forever
+# with no error naming the cause. Measured on this cluster. The empty third field is the
+# mount path, which the access point below already fixes, so there is nothing to put there.
+#
+# The two ids are this account's live objects: `fs-020803f2d361c20c6` is
+# `aws_s3files_file_system.session_vfs` and `fsap-091907e0af59c1b50` is
+# `aws_s3files_access_point.session_workspaces`. They are literals here because a manifest
+# is not Terraform and has nothing to read them off; `session_vfs.tf` publishes both as
+# outputs (`session_vfs_file_system_id`, `session_workspaces_access_point_id`) so the pair
+# can be checked against the account rather than remembered.
+#
+# WHICH ACCESS POINT, AND WHY NOT THE OTHER ONE. `session_workspaces`, whose root is
+# `/workspaces` -- NOT `session_vfs`, whose root is `/`. That access point roots at a
+# prefix S3 Files CREATES, owned 10001:10001 mode 0755, and its own resource comment says
+# why at length: `creation_permissions` applies only when the prefix does not already
+# exist, so an access point pointed at a prefix synthesised from existing S3 objects
+# inherits uid 0 / gid 0 and the mount comes up unwritable. The kubelet creates each
+# volumeMount's `subPath` directory at mount time THROUGH this access point as uid 10001,
+# so a root-owned root directory fails the pod at `CreateContainerConfigError` before its
+# first container starts. Every per-Session directory below `/workspaces` inherits
+# 10001:10001 by being created by a process the access point has already squashed.
+#
+# A Session's workspace is therefore bucket key `workspaces/<tenant_id>/<session_id>/`.
+#
+# WHAT THIS COSTS. About four seconds on pod start, measured. Against that, ADR-035
+# returns the 120 s the restore init container spent refilling an empty disk on every
+# placement, and a pod that dies now loses nothing that was written before it died.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  # Cluster-scoped, so the name carries the cluster's prefix the way the IAM roles and the
+  # security group in session_vfs.tf do. The claim below is namespaced and does not.
+  name: map-session-workspaces
+spec:
+  # A required field that this backend does not enforce, and saying so is the honest
+  # thing to do with it. Capacity is a scheduling and binding input for volumes that have
+  # a size -- an EBS volume is provisioned at this number and fills at it -- but the
+  # backend here is a bucket, which has no size, and nothing on either side of the mount
+  # will ever refuse a write for exceeding this. It exists because the API server rejects
+  # a PersistentVolume without it, and because a claim binds only to a volume whose
+  # capacity is at least what the claim requests, so the two numbers have to agree with
+  # each other and with nothing in the world.
+  #
+  # 1Ti rather than a small number, so it never becomes the thing a claim fails to bind
+  # against. Do NOT read it as a quota: what actually bounds a tenant's workspace is the
+  # bucket's own lifecycle and billing, and if a real ceiling is ever wanted it has to be
+  # built where the writes are, not here.
+  capacity: { storage: 1Ti }
+  volumeMode: Filesystem
+  # Every Session pod on the cluster mounts this one volume at once, so it is many-node
+  # read-write by construction. ReadWriteOnce would bind the first pod and leave every
+  # later Session pending -- and it would be a lie about NFS, which is multi-writer.
+  accessModes: [ReadWriteMany]
+  # Retain, because Delete on this object would mean the CSI driver deleting the file
+  # system holding every tenant's workspace. There is nothing this manifest could be
+  # asked to do that is worth that being reachable by deleting a claim. The consequence
+  # is accepted and named: a released PV does not rebind on its own, so recreating the
+  # claim below also means clearing `spec.claimRef` on this volume by hand.
+  persistentVolumeReclaimPolicy: Retain
+  # The empty string, not an omitted field, and the difference is the whole binding.
+  # Omitted, the volume is eligible for the cluster's default StorageClass and a
+  # dynamic provisioner may claim it; "" means "no class", which is what a statically
+  # provisioned volume is. The claim below says "" for the same reason and the two must
+  # match or the claim stays Pending with no useful event.
+  storageClassName: ""
+  csi:
+    driver: efs.csi.aws.com
+    volumeHandle: "s3files:fs-020803f2d361c20c6::fsap-091907e0af59c1b50"
+---
+# The claim `deploy/k8s/session-pod.yaml` names, and the only object in this file a
+# Session pod refers to by name.
+#
+# Namespaced, so it and the pods that mount it are in `map-dev` together -- a claim is
+# not reachable from another namespace, which is what keeps a pod somebody schedules
+# elsewhere from mounting tenant workspaces by naming this.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: session-workspaces
+  namespace: map-dev
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: ""
+  # Named explicitly rather than left to the selector matching. With `volumeName` absent
+  # this claim would bind to whatever unbound volume happened to satisfy its class,
+  # capacity and access modes -- and on a cluster with exactly one such volume that is
+  # the same outcome, right up until the day it is not. Naming it makes the binding a
+  # fact this file states instead of one the control loop arrives at.
+  volumeName: map-session-workspaces
+  # At most the volume's capacity, or the claim never binds. It is the same
+  # non-enforcing number as above and bounds nothing; see the PersistentVolume's comment.
+  resources: { requests: { storage: 1Ti } }

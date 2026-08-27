@@ -10,7 +10,12 @@
         "s3:PutObject",
         "s3:DeleteObject"
       ],
-      "Resource": "arn:aws:s3:::map-dev-000000000000-us-east-1-an/*"
+      "Resource": [
+        "arn:aws:s3:::map-dev-000000000000-us-east-1-an/evidence/*",
+        "arn:aws:s3:::map-dev-000000000000-us-east-1-an/rollouts/*",
+        "arn:aws:s3:::map-dev-000000000000-us-east-1-an/sessions/*",
+        "arn:aws:s3:::map-dev-000000000000-us-east-1-an/uploads/*"
+      ]
     },
     {
       "Sid": "FindThemAgain",

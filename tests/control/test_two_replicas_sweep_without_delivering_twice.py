@@ -9,7 +9,7 @@ as though the delivery claim settles that -- "another dispatcher holds this atte
 "lost the race" -- and it does not. The claim is
 
     INSERT INTO webhook_delivery (...) VALUES (...)
-    ON CONFLICT (webhook_id, session_id, state) DO UPDATE
+    ON CONFLICT (webhook_id, session_id, seq) DO UPDATE
       SET attempts = webhook_delivery.attempts + 1
       WHERE webhook_delivery.delivered_at_ms IS NULL
         AND webhook_delivery.attempts < :max_attempts
@@ -21,7 +21,7 @@ a runner. So the delivery sweep takes a lease and the pod sweep does not, and th
 case below is the evidence for that split rather than a re-reading of the SQL.
 
 **Why the existing race case does not already cover this.**
-`test_two_dispatchers_claiming_one_state_change_produce_exactly_one_winner` in
+`test_two_dispatchers_claiming_one_event_produce_exactly_one_winner` in
 `test_webhook_signed_no_credential.py` passes `max_attempts=1`, where the `DO UPDATE`'s
 own `WHERE` refuses the second caller and there genuinely is one winner. The dispatcher
 passes `MAX_ATTEMPTS`, which is five. That case is green, correct about the cap it
@@ -42,7 +42,7 @@ from managed_agent.adapters.postgres.webhook_store import PostgresWebhookStore
 from managed_agent.control.webhooks.dispatcher import MAX_ATTEMPTS
 from managed_agent.control.webhooks.registry import CallbackUrl
 from managed_agent.core.ids import Seq, TenantId, new_session_id
-from managed_agent.core.session.session import SessionState
+from managed_agent.core.vocabulary import lifecycle
 
 _A_SWEEP = "webhook-delivery"
 _ANOTHER_SWEEP = "session-pods"
@@ -67,14 +67,16 @@ async def test_the_delivery_claim_grants_two_replicas_the_same_undelivered_callb
     hook = await store.register(
         TenantId(uuid4()),
         CallbackUrl("https://hooks.example.com/two-replicas"),
-        frozenset({SessionState.STOPPED}),
+        frozenset({lifecycle.SESSION_STOPPED}),
         "signing-two-replicas",
     )
     session_id = new_session_id()
 
     granted = await asyncio.gather(
         *(
-            store.claim(hook.id, session_id, SessionState.STOPPED, Seq(3), MAX_ATTEMPTS)
+            store.claim(
+                hook.id, session_id, lifecycle.SESSION_STOPPED, Seq(3), MAX_ATTEMPTS
+            )
             for _ in range(2)
         )
     )

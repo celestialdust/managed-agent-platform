@@ -92,3 +92,16 @@ tests/spike/test_report_shape.py
 # arrives through `-backend-config`. `.example` files beside these carry the shape.
 deploy/terraform/backend.hcl
 *.tfvars
+
+# Key material, of every kind this repository can produce. The internal CA's private
+# key is generated at the repository root by the command that mints it, one `git add`
+# away from a commit -- and a private key that reaches history is a rotated key, not a
+# removed one, because every clone already has it. Ignored by extension rather than by
+# name so a key written under a name nobody predicted is covered too. Nothing tracked
+# matches these; `test_no_private_key_can_be_committed_from_the_repository_root` is
+# what keeps that true.
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx

@@ -48,14 +48,16 @@ ALLOWED_LITERAL_VARIABLES: Final = frozenset(
         "MAP_OBJECT_BUCKET",
         "MAP_ROLLOUT_BUCKET",
         "MAP_SWEEP_INTERVAL_S",
+        "MAP_SESSION_WORKSPACE_MOUNT",
     }
 )
 """The environment variables in this manifest that may carry a `value:`.
 
 Addresses, paths, bucket names and durations -- a namespace, a mounted file, the two
 gateway Services, the bucket uploads and Evidence go to, the bucket Rollouts go to, how
-long a Session's token stays valid, and how long the in-process sweeps wait between
-passes. Named rather than counted, deliberately: a count written here is a second copy
+long a Session's token stays valid, how long the in-process sweeps wait between passes,
+and where the workspace volume every Session writes is mounted for reading. Named
+rather than counted, deliberately: a count written here is a second copy
 of `len(ALLOWED_LITERAL_VARIABLES)`, and this docstring carried two of them that
 disagreed -- one updated when an entry was added and one not, with the stale number in
 the more quotable sentence. A reader who wants the count reads the set.
@@ -395,6 +397,29 @@ def test_the_container_cannot_escalate_write_its_root_or_keep_a_capability() -> 
     assert security["capabilities"]["drop"] == ["ALL"]
 
 
+def test_a_rollout_gives_an_in_flight_turn_time_to_finish() -> None:
+    """A Turn runs inside the tenant's POST, and killing one wedges its Session.
+
+    Nothing appends `turn.failed` outside the request path and nothing reconciles an
+    open Turn at startup, so a Turn cut off mid-stream stays open -- which refuses the
+    Session's next Turn, refuses its archive, and pins the sweep that would collect its
+    pod. At Kubernetes' 30-second default that was reachable by ordinary operations
+    rather than by a crash: every rollout of this Deployment takes a replica down, and a
+    first Turn's placement alone has been measured at 660 seconds.
+
+    Asserted as a floor rather than an equality, because the number is a ceiling on how
+    long a draining replica may take and raising it costs a rollout nothing when no Turn
+    is in flight -- uvicorn exits as soon as it has drained. A future reader shortening
+    it below the placement wait would be reintroducing the defect, which is the change
+    this refuses.
+    """
+    pod = _load(_DEPLOYMENT)[0]["spec"]["template"]["spec"]
+    assert pod.get("terminationGracePeriodSeconds", 30) >= 660, (
+        "a replica that is serving a Turn must outlive the longest placement this "
+        "platform has measured, or the rollout wedges that Turn's Session"
+    )
+
+
 def test_the_pod_takes_none_of_the_host() -> None:
     pod = _load(_DEPLOYMENT)[0]["spec"]["template"]["spec"]
     assert "hostNetwork" not in pod
@@ -446,6 +471,19 @@ def _actions_of(statement: dict[str, Any]) -> list[str]:
     return [action] if isinstance(action, str) else list(action)
 
 
+def _resources_of(statement: dict[str, Any]) -> list[str]:
+    """A statement's resources, whether it spells them as one string or as a list.
+
+    The same defence `_actions_of` applies to `Action`, for the same reason and one
+    more. The object grant became a list on 2026-08-26, when it was narrowed from the
+    whole bucket to the four prefixes this platform composes keys under -- so a helper
+    that only understood the bare-string spelling would have read the narrowed policy
+    as granting no objects at all.
+    """
+    resource = statement["Resource"]
+    return [resource] if isinstance(resource, str) else list(resource)
+
+
 def _s3_statements() -> list[dict[str, Any]]:
     """Every statement in this role's policy that grants anything in S3.
 
@@ -476,7 +514,7 @@ def _s3_statement() -> dict[str, Any]:
     statements = [
         statement
         for statement in _s3_statements()
-        if str(statement["Resource"]).endswith("/*")
+        if any(resource.endswith("/*") for resource in _resources_of(statement))
     ]
     assert len(statements) == 1, (
         f"{_POLICY.relative_to(_ROOT)} holds {len(statements)} statements granting S3 "
@@ -499,12 +537,25 @@ def test_the_object_bucket_it_names_is_the_one_this_role_is_granted() -> None:
     statement was dropped or re-scoped fails here, instead of leaving an assertion that
     compares the manifest against a bucket nothing grants.
     """
-    granted = _s3_statement()["Resource"]
-    assert granted.startswith("arn:aws:s3:::") and granted.endswith("/*"), (
-        f"{granted} is not an objects-in-one-bucket ARN, so the bucket the manifest "
-        "must name cannot be read out of it"
+    granted = _resources_of(_s3_statement())
+    buckets = set()
+    for arn in granted:
+        assert arn.startswith("arn:aws:s3:::") and arn.endswith("/*"), (
+            f"{arn} is not an objects-in-one-bucket ARN, so the bucket the manifest "
+            "must name cannot be read out of it"
+        )
+        head, _, _ = arn.removeprefix("arn:aws:s3:::").partition("/")
+        buckets.add(head)
+
+    # One bucket across every resource in the grant, not the first one. The statement
+    # names four prefixes since the 2026-08-26 narrowing, and a policy whose prefixes
+    # straddled two buckets would let this case derive whichever the file listed first
+    # -- checking the manifest against a bucket only some of the grant covers.
+    assert len(buckets) == 1, (
+        f"the object grant spans {sorted(buckets)}; the manifest names one bucket and "
+        "this case cannot say which of them it must name"
     )
-    bucket = granted.removeprefix("arn:aws:s3:::").removesuffix("/*")
+    bucket = buckets.pop()
 
     named = {
         entry["value"]
@@ -568,7 +619,7 @@ def test_the_bucket_itself_is_listable_and_nothing_more() -> None:
     listing = [
         statement
         for statement in _s3_statements()
-        if not str(statement["Resource"]).endswith("/*")
+        if not any(resource.endswith("/*") for resource in _resources_of(statement))
     ]
     assert len(listing) == 1, (
         f"{len(listing)} statements grant a bucket-level S3 action; the case below "
@@ -580,10 +631,15 @@ def test_the_bucket_itself_is_listable_and_nothing_more() -> None:
         "exactly ListBucket to enumerate a lane; anything else here is reach over the "
         "whole bucket that no code path in this process asks for"
     )
-    objects = str(_s3_statement()["Resource"])
-    assert str(listing[0]["Resource"]) == objects.removesuffix("/*"), (
-        f"the bucket grant names {listing[0]['Resource']} and the object grant names "
-        f"{objects}; a ListBucket on any other bucket is a listing of somebody else's"
+    # The object grant names four prefixes since the 2026-08-26 narrowing, so the
+    # comparison is against the bucket each of them sits under rather than against the
+    # grant spelled whole. Every one of them, not the first: a prefix ARN pointing at
+    # another bucket would otherwise ride along unread.
+    objects = _resources_of(_s3_statement())
+    listable = str(listing[0]["Resource"])
+    assert all(arn.startswith(f"{listable}/") for arn in objects), (
+        f"the bucket grant names {listable} and the object grant names {objects}; a "
+        "ListBucket on any other bucket is a listing of somebody else's"
     )
 
 
@@ -831,3 +887,117 @@ def test_the_job_does_not_retry() -> None:
     failure is then something only the pod list remembers."""
     assert _load(_JOB)[0]["spec"]["backoffLimit"] == 0
     assert _load(_JOB)[0]["spec"]["template"]["spec"]["restartPolicy"] == "Never"
+
+
+def _workspace_claim_name() -> str:
+    """The claim `deploy/k8s/session-vfs.yaml` declares, read from that file.
+
+    Read rather than written here because the name is the join between three documents
+    -- the claim, the Session pod that mounts it, and the control plane below -- and a
+    fourth copy is free to disagree with the other three exactly when somebody renames
+    it.
+    """
+    claims = [
+        document
+        for document in _load(_K8S / "session-vfs.yaml")
+        if document["kind"] == "PersistentVolumeClaim"
+    ]
+    assert len(claims) == 1, (
+        f"expected one claim in session-vfs.yaml, got {len(claims)}"
+    )
+    name: str = claims[0]["metadata"]["name"]
+    return name
+
+
+def _workspace_mount() -> dict[str, Any]:
+    """The control plane's volumeMount for the workspace volume."""
+    container = _container(_DEPLOYMENT)
+    volumes = _only(_DEPLOYMENT, "Deployment")["spec"]["template"]["spec"]["volumes"]
+    backed_by_the_claim = [
+        volume["name"]
+        for volume in volumes
+        if volume.get("persistentVolumeClaim", {}).get("claimName")
+        == _workspace_claim_name()
+    ]
+    assert len(backed_by_the_claim) == 1, (
+        f"expected exactly one volume backed by claim {_workspace_claim_name()!r}, "
+        f"found {backed_by_the_claim}"
+    )
+    mounts = [
+        mount
+        for mount in container["volumeMounts"]
+        if mount["name"] == backed_by_the_claim[0]
+    ]
+    assert len(mounts) == 1, f"expected one mount of that volume, found {mounts}"
+    return dict(mounts[0])
+
+
+def test_the_control_plane_mounts_the_workspace_it_serves_reads_of() -> None:
+    """The browse route reads a mounted filesystem, so this process must have one.
+
+    `control/api/routes/workspace.py` answers from the mount and never from the S3 API,
+    because S3 Files exports on sixty seconds of write INACTIVITY -- so during an active
+    Turn the bucket lags the disk by the length of the write burst, and a route reading
+    the bucket would show a tenant a stale tree while telling them it was current.
+
+    Without this volume the route still answers, with a 500 saying no workspace is
+    mounted. That is honest and it is not serving: the endpoint is published in the REST
+    surface, so a deployment missing this mount ships a route that can only fail.
+    """
+    mount = _workspace_mount()
+    assert mount["mountPath"], mount
+
+
+def test_the_control_plane_mounts_the_workspace_read_only() -> None:
+    """It reads workspaces and must never write one, and the mount is what enforces it.
+
+    This is the same hazard ADR-035 removed `workspace_sync.py` for, arriving by the
+    other door. S3 Files resolves a bucket-versus-filesystem conflict in the BUCKET's
+    favour and moves the filesystem's copy to `.s3files-lost+found-<fs-id>`, which sits
+    above the access point root and is therefore invisible to both the agent's pod and
+    the very route this mount exists for. A write from here would discard an agent's
+    live workspace with nothing anywhere reporting it.
+
+    `readOnly` on the mount is a stronger guarantee than the route's own behaviour,
+    which is the point: it holds for code that has not been written yet.
+    """
+    mount = _workspace_mount()
+    assert mount.get("readOnly") is True, (
+        f"the workspace mount must be readOnly; got {mount}"
+    )
+
+
+def test_the_control_plane_mounts_every_tenants_workspace_and_not_one() -> None:
+    """No `subPath`, because this process serves whichever Session is asked for.
+
+    A Session pod mounts `subPath: <tenant>/<session>` and that subPath is the whole of
+    its isolation. This process is the opposite case: it resolves the tenant from the
+    request header and the Session from the URL, then composes those two segments under
+    the mount itself. A subPath here would pin it to one Session forever, and the route
+    would answer every other Session with an empty directory rather than an error.
+    """
+    mount = _workspace_mount()
+    assert "subPath" not in mount, (
+        f"the control plane must mount the volume root, not a subPath; got {mount}"
+    )
+
+
+def test_the_named_mount_path_is_the_path_it_is_actually_mounted_at() -> None:
+    """The env var the route reads and the mountPath the kubelet honours must agree.
+
+    They are two independent strings in one document, and nothing else compares them.
+    Disagreeing, the route reads a directory that does not exist and reports every
+    Session's workspace as absent -- which reads to a tenant as lost work rather than as
+    a typo in a manifest.
+    """
+    from managed_agent.control.api.routes.workspace import WORKSPACE_MOUNT_ENV_VAR
+
+    named = [
+        entry["value"]
+        for entry in _container(_DEPLOYMENT)["env"]
+        if entry["name"] == WORKSPACE_MOUNT_ENV_VAR
+    ]
+    assert len(named) == 1, (
+        f"expected {WORKSPACE_MOUNT_ENV_VAR} to be set exactly once, found {named}"
+    )
+    assert named[0] == _workspace_mount()["mountPath"]

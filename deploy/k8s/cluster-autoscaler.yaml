@@ -187,14 +187,23 @@ spec:
             # them itself, PropagateAtLaunch true -- so nothing declares them.
             - "--node-group-auto-discovery=asg:tag=k8s.io/cluster-autoscaler/enabled,k8s.io/cluster-autoscaler/map-dev"
             # What THIS controller will do unattended, as against the ceiling
-            # the group may be grown to by anything (eks.tf says 8). The smaller
-            # binds, and it is smaller for two measured reasons: nothing in this
-            # cluster refuses a Session -- no LimitRange, no ResourceQuota, and
-            # Session pods request nothing -- so a runaway scales on pod count
-            # alone with only this number in its way; and the account's on-demand
-            # vCPU usage has been seen to reach 6, proving the quota is at least
-            # 6, while nothing readable here proves 16.
-            - "--max-nodes-total=4"
+            # the group may be grown to by anything (eks.tf says 8). It now equals
+            # that ceiling, and the first of the two reasons it used to be smaller
+            # was retired rather than overruled: Session pods declared nothing, so
+            # a runaway scaled on pod count alone with only this number in its way.
+            # session-pod.yaml declares requests as of 2026-08-25, so the scheduler
+            # refuses on memory well before a runaway reaches a node count.
+            #
+            # The second reason stands, and raising past it is accepted rather than
+            # answered: the account's on-demand vCPU usage has been seen to reach 6,
+            # proving the quota is at least 6, while nothing readable here proves
+            # 16. A quota that binds makes the autoscaler fail to launch and say so,
+            # which is a visible stall rather than a silent one.
+            #
+            # ADR-040 moves this group to m6i.xlarge, where eight nodes is 32 vCPU
+            # and the reasoning above stops covering it. If the raise is refused
+            # there, lower this number rather than the machine -- six nodes is 24.
+            - "--max-nodes-total=8"
             # v=4 because the first thing anyone needs from this pod is which
             # pod it saw and what it decided; the checkpoint reads that log.
             - "--v=4"

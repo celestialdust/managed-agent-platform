@@ -37,6 +37,8 @@ from tool_gateway_harness import (
 
 from managed_agent.core.errors import ErrorCode
 from managed_agent.core.ids import DefinitionId, SessionId, TenantId
+from managed_agent.core.ports import SessionNotVisible
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.registration.scope_binding import (
     ParameterType,
     RegisteredTool,
@@ -50,6 +52,9 @@ from managed_agent.gateway.tool.mcp_proxy import McpProxy, SessionUpstreams
 SESSION: Final = SessionId(uuid4())
 IN_SCOPE: Final = "acme/widgets"
 """What the Session is bounded to. The model never gets to name anything else."""
+
+PROBED: Final = "someone-else/private"
+"""What a model supplies when it is guessing at the Scope rather than working."""
 
 
 class OneScope:
@@ -71,7 +76,12 @@ class OneScope:
             tenant_id=tenant_id,
             definition_id=DefinitionId(uuid4()),
             definition_revision="0" * 40,
-            grant=frozenset({"echo_arguments"}),
+            # The advertised name, not the bare one. What the Grant names is what the
+            # model is offered and what it calls -- and since tool names became scoped
+            # to their server, the two are the joined pair.
+            grant=frozenset(
+                {advertised_name_for("conformance_stdio", "echo_arguments")}
+            ),
             scope=tuple(self.scope.items()),
             budget_minor_units=1_000,
             budget_currency="USD",
@@ -110,6 +120,7 @@ def _echo_tool(*bindings: ScopeBinding) -> RegisteredTool:
     """`echo_arguments`, bound however the case needs, over the real stdio server."""
     return RegisteredTool(
         name="echo_arguments",
+        advertised_name=advertised_name_for("conformance_stdio", "echo_arguments"),
         remote_name="echo_arguments",
         parameters={
             "repo_name": ParameterType.STRING,
@@ -158,8 +169,21 @@ def _echoed(result: CallToolResult) -> dict[str, object]:
 
 
 @pytest.mark.anyio
-async def test_the_outbound_call_carries_the_scope_value_not_the_models() -> None:
-    """The model asked about somebody else's repository and did not get it."""
+async def test_a_call_supplying_the_bound_argument_never_reaches_the_server() -> None:
+    """The model asked about somebody else's repository and no call was made.
+
+    The refusal is asserted alongside the vault's silence because the result alone
+    cannot tell this apart from the thing it replaced. An overwrite reached this
+    server, carried the Scope's value, and came back a success -- so a test reading
+    only `is_error` would pass against a Gateway that still redirected the call and
+    happened to refuse afterwards. No credential read means no transport opened, which
+    means nothing was sent anywhere on the way to this refusal.
+
+    `echo_arguments` declares `{"type": "object", "additionalProperties": true}`, so
+    this is the case where stripping the schema can remove nothing at all -- the
+    server offers no property to take away. That is exactly why the refusal is the
+    enforcement and the stripping is not.
+    """
     vault = CountingVault()
     async for proxy in _proxy_over(_echo_tool(), {"repository": IN_SCOPE}, vault):
         result = await proxy.call_tool(
@@ -167,10 +191,31 @@ async def test_the_outbound_call_carries_the_scope_value_not_the_models() -> Non
             {"repo_name": "someone-else/private", "question": "what is this"},
         )
 
-    assert result.is_error is not True, result.content
-    carried = _echoed(result)
-    assert carried["repo_name"] == IN_SCOPE
-    assert carried["question"] == "what is this"
+    assert result.is_error is True
+    assert vault.fetches == []
+
+
+@pytest.mark.anyio
+async def test_the_refusal_names_the_argument_and_neither_value() -> None:
+    """What the model may read back, and the two strings that would reopen the oracle.
+
+    The Scope's value is the answer a probing model is after, and the value it just
+    attempted is how it would tell one refusal from another -- echoing either into
+    something the model reads back would hand it the oracle in one call. What is left
+    is the argument's own name, which the caller supplied and which is the only thing
+    it needs in order to stop supplying it.
+    """
+    vault = CountingVault()
+    async for proxy in _proxy_over(_echo_tool(), {"repository": IN_SCOPE}, vault):
+        result = await proxy.call_tool(
+            "echo_arguments", {"repo_name": PROBED, "question": "what is this"}
+        )
+
+    said = "".join(getattr(part, "text", "") for part in result.content)
+    assert ErrorCode.TOOL_OUT_OF_SCOPE.value in said
+    assert "repo_name" in said
+    assert IN_SCOPE not in said
+    assert PROBED not in said
 
 
 @pytest.mark.anyio
@@ -198,6 +243,36 @@ async def test_a_session_scope_missing_the_dimension_is_refused() -> None:
     assert ErrorCode.TOOL_OUT_OF_SCOPE.value in said
     assert "repository" in said
     assert "echo_arguments" in said
+
+
+@pytest.mark.anyio
+async def test_a_scope_dimension_the_tool_binds_nothing_to_refuses_the_call() -> None:
+    """The wide half, closed, and proved where it would actually have gone out.
+
+    This Session is bounded to a repository *and* an environment; `echo_arguments`
+    binds only the repository. Before ADR-034 part 2 the call left here narrowed on
+    `repo_name` and silent about the environment -- and the server would have answered
+    it, across whatever the credential reaches, with the result reading to the agent
+    exactly like a properly narrowed one. That is why the vault is asserted alongside
+    the refusal: a call that never opened a transport is one that reached no server,
+    and it is the only evidence here that distinguishes "refused" from "sent and
+    answered".
+
+    The message names the dimension nothing could hold the call to and neither value,
+    on the same terms as its mirror image above.
+    """
+    vault = CountingVault()
+    scope = {"repository": IN_SCOPE, "environment": "production"}
+    async for proxy in _proxy_over(_echo_tool(), scope, vault):
+        result = await proxy.call_tool("echo_arguments", {"question": "what"})
+
+    assert result.is_error is True
+    assert vault.fetches == []
+    said = "".join(getattr(part, "text", "") for part in result.content)
+    assert ErrorCode.TOOL_OUT_OF_SCOPE.value in said
+    assert "environment" in said
+    assert IN_SCOPE not in said
+    assert "production" not in said
 
 
 @pytest.mark.anyio
@@ -313,3 +388,62 @@ async def test_a_scope_that_cannot_be_read_fails_the_call_closed_and_says_nothin
     said = "".join(getattr(part, "text", "") for part in result.content)
     assert "internal-host-7" not in said
     assert "psycopg" not in said
+
+
+class SweptScope:
+    """A Session registry answering "no such Session", the way a swept row does not.
+
+    `SessionNotVisible` is the store's one answer for a Session that is not there and
+    for one that belongs to somebody else, and a Session whose retention window has
+    passed becomes the first of those while its pod is still holding a token. So this
+    is a routine tenant-side condition rather than an outage: nothing is broken, and
+    the Scope simply cannot be read.
+    """
+
+    async def fetch(self, session_id: SessionId, tenant_id: TenantId) -> SessionRecord:
+        raise SessionNotVisible(str(session_id))
+
+
+@pytest.mark.anyio
+async def test_a_session_that_cannot_be_read_is_not_blamed_on_the_server() -> None:
+    """The refusal says what happened, and no server is accused of anything.
+
+    A Session the store will not hand back fails the call closed, which is the same
+    direction an outage fails it -- but it is not the same failure. No upstream was
+    opened, no credential was read, and nothing behind the tool was ever asked, so a
+    refusal claiming the registered server did not complete the call sends whoever
+    reads it to an upstream that never saw a request. The message is asserted for what
+    it must *not* say, because a sentence naming the wrong culprit is still a
+    well-formed sentence and would pass any check on the code alone.
+
+    Naming which of "no such Session" and "not yours" it was is equally forbidden: the
+    store fuses them so a caller holding an id cannot use a refusal to learn whether it
+    names somebody else's Session, and a refusal here that took them apart would reopen
+    exactly that.
+    """
+    vault = CountingVault()
+    upstreams = SessionUpstreams(
+        tenant_id=TENANT, broker=broker(vault), elicitation=Silent().ask
+    )
+    owner = asyncio.create_task(upstreams.run())
+    try:
+        proxy = McpProxy(
+            tenant_id=TENANT,
+            session_id=SESSION,
+            registry=FixedRegistry([_echo_tool()]),
+            upstreams=upstreams,
+            channel=Silent(),
+            evidence=capture(),
+            scopes=SweptScope(),
+        )
+        result = await proxy.call_tool("echo_arguments", {"question": "what"})
+    finally:
+        await upstreams.aclose()
+        await owner
+
+    assert result.is_error is True
+    assert vault.fetches == []
+    said = "".join(getattr(part, "text", "") for part in result.content)
+    assert ErrorCode.SESSION_NOT_FOUND.value in said
+    assert "the registered server" not in said
+    assert str(SESSION) not in said

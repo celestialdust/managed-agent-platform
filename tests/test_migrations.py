@@ -20,6 +20,7 @@ import asyncio
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -27,6 +28,8 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.ext.asyncio import create_async_engine
 from testcontainers.community.postgres import PostgresContainer
+
+from managed_agent.core.vocabulary import WEBHOOK_ELIGIBLE
 
 _ROOT = Path(__file__).resolve().parents[1]
 _URL_ENVS = ("MAP_DATABASE_URL", "DATABASE_URL")
@@ -150,6 +153,324 @@ def test_the_schema_can_be_rebuilt_after_a_full_downgrade(
         "rebuilding after a downgrade did not produce the same schema. A downgrade "
         "that leaves a function, a type or a rule behind fails the next upgrade rather "
         "than the one that wrote it."
+    )
+
+
+def _write(url: str, statements: list[tuple[str, dict[str, object]]]) -> None:
+    """Run statements against a database part-way up the chain.
+
+    Textual and unhelpfully raw on purpose: what these insert is a row in the shape a
+    *previous* revision stored, and the adapters only know how to write the current one.
+    """
+
+    async def _run() -> None:
+        engine = create_async_engine(url)
+        try:
+            async with engine.begin() as conn:
+                for sql, params in statements:
+                    await conn.execute(sa.text(sql), params)
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_run())
+
+
+def _read(url: str, sql: str, params: dict[str, object]) -> object:
+    async def _run() -> object:
+        engine = create_async_engine(url)
+        try:
+            async with engine.connect() as conn:
+                return (await conn.execute(sa.text(sql), params)).scalar_one()
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_run())
+
+
+def test_a_registration_written_before_the_rename_still_matches_its_events(
+    unmigrated_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename moves the column and leaves what is in it, which is the whole problem.
+
+    A registration stored before 0030 holds Session *states* -- `running`, `stopped` --
+    and after the rename those sit in a column the sweep now queries with event *type*
+    names. Nothing matches, so the registration stops firing: no error, no refusal, no
+    row anywhere saying a callback was owed. The tenant's evidence is an endpoint that
+    went quiet, which is indistinguishable from a platform that is not delivering.
+
+    `running` becomes two types and that is correct rather than a widening: a tenant who
+    asked to hear about a Session running was told on create and on resume, because both
+    folded to RUNNING. The translation is the inverse of the fold, so what they were
+    subscribed to is exactly what they stay subscribed to.
+
+    **Stops at 0030 rather than running to head**, because it grades that revision's
+    translation and 0031 later takes the `session.resumed` half back out -- for a reason
+    that has nothing to do with the fold. Asserting the two revisions' combined output
+    here would put two decisions behind one assertion, and a failure would not say which
+    of them moved. The end-to-end outcome for this same legacy row is graded by the case
+    that follows.
+    """
+    monkeypatch.setenv(_URL_ENV, unmigrated_url)
+    command.upgrade(_config(), "0029")
+    registration = uuid4()
+    _write(
+        unmigrated_url,
+        [
+            (
+                "INSERT INTO webhook (id, tenant_id, url, states, secret_ref)"
+                " VALUES (:wid, :tid, 'https://hooks.example.com/legacy',"
+                " ARRAY['running','stopped'], 'signing-legacy')",
+                {"wid": registration, "tid": uuid4()},
+            )
+        ],
+    )
+
+    command.upgrade(_config(), "0030")
+
+    carried = _read(
+        unmigrated_url,
+        "SELECT event_types FROM webhook WHERE id = :wid",
+        {"wid": registration},
+    )
+    assert sorted(carried) == [  # type: ignore[call-overload]
+        "session.created",
+        "session.resumed",
+        "session.stopped",
+    ], (
+        f"the registration now names {carried}, which the tail matches nothing "
+        "against. A rename that leaves state names in a column read as event types is "
+        "a subscription that has silently stopped."
+    )
+
+
+def test_a_subscription_to_a_type_nothing_appends_is_stripped_or_deleted(
+    unmigrated_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """0031, end to end, from the rows 0030 actually wrote.
+
+    Both registrations below are written in the pre-0030 spelling because that is where
+    these subscriptions came from: 0030 translated `running` into `session.created`
+    **and** `session.resumed`, and `suspended` into `session.suspended`, and nothing has
+    ever checked that column against the published vocabulary. So a tenant is holding a
+    subscription to a type this platform will never append again, and did not ask for
+    the half of it that is now dead.
+
+    The two rows take the two different endings, and the difference is the whole case. A
+    registration with something left keeps it and loses only what cannot fire. A
+    registration with nothing left is removed, because the alternative is a row that
+    reads back to its owner as a live callback, refuses to be registered again, and can
+    never deliver -- a subscription that has silently stopped, which is the failure
+    0030's own translation was written to prevent.
+    """
+    monkeypatch.setenv(_URL_ENV, unmigrated_url)
+    command.upgrade(_config(), "0029")
+    mixed, dead = uuid4(), uuid4()
+    _write(
+        unmigrated_url,
+        [
+            (
+                "INSERT INTO webhook (id, tenant_id, url, states, secret_ref)"
+                " VALUES (:wid, :tid, 'https://hooks.example.com/mixed',"
+                " ARRAY['running','stopped'], 'signing-mixed')",
+                {"wid": mixed, "tid": uuid4()},
+            ),
+            (
+                "INSERT INTO webhook (id, tenant_id, url, states, secret_ref)"
+                " VALUES (:wid, :tid, 'https://hooks.example.com/dead',"
+                " ARRAY['suspended'], 'signing-dead')",
+                {"wid": dead, "tid": uuid4()},
+            ),
+        ],
+    )
+
+    command.upgrade(_config(), "head")
+
+    kept = _read(
+        unmigrated_url,
+        "SELECT event_types FROM webhook WHERE id = :wid",
+        {"wid": mixed},
+    )
+    assert sorted(kept) == ["session.created", "session.stopped"], (  # type: ignore[call-overload]
+        f"the registration now names {kept}. A tenant who asked to hear about a "
+        "Session running keeps the half of that which still happens, and loses only "
+        "the half nothing will ever append."
+    )
+
+    survivors = _read(
+        unmigrated_url,
+        "SELECT count(*) FROM webhook WHERE id = :wid",
+        {"wid": dead},
+    )
+    assert survivors == 0, (
+        "a registration whose every event type is one nothing appends was left in "
+        "place. It cannot fire, it cannot be registered again, and it reads back to "
+        "its owner as a callback that is coming."
+    )
+
+
+def test_no_stored_subscription_survives_naming_a_type_a_tenant_cannot_register(
+    unmigrated_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gap that made 0031 necessary, turned into something that fails out loud.
+
+    Nothing ties `webhook.event_types` to the published vocabulary -- not the column,
+    not a constraint, not the store, and the one route that parses runs in front of new
+    registrations only. So a type leaving `WEBHOOK_ELIGIBLE` strands every stored
+    subscription naming it: the tail no longer scans for it, the row can never fire, and
+    a tenant's only evidence is an endpoint that goes quiet. Nothing reports it, which
+    is how `session.resumed` sat in live registrations from 0030 until it was found by
+    reading the code.
+
+    This is the assertion that would have failed on the day the eligibility flipped, and
+    it stays failing until the migration chain catches up. Read against the **live**
+    registry rather than a list frozen here, which is the opposite of what the migration
+    bodies do and is deliberate: a revision has to keep saying what it did on the day it
+    ran, and a guard has to say what is true now, or it cannot notice the next
+    retirement.
+
+    Seeded through the pre-0030 spelling so the row arrives the way production's did --
+    written by a translation, not by the door that parses.
+    """
+    monkeypatch.setenv(_URL_ENV, unmigrated_url)
+    command.upgrade(_config(), "0029")
+    _write(
+        unmigrated_url,
+        [
+            (
+                "INSERT INTO webhook (id, tenant_id, url, states, secret_ref)"
+                " VALUES (:wid, :tid, 'https://hooks.example.com/every-state',"
+                " ARRAY['running','suspended','stopped'], 'signing-every-state')",
+                {"wid": uuid4(), "tid": uuid4()},
+            )
+        ],
+    )
+
+    command.upgrade(_config(), "head")
+
+    stored = _read(
+        unmigrated_url,
+        "SELECT array_agg(DISTINCT name) FROM webhook, unnest(event_types) AS name",
+        {},
+    )
+    assert stored, "no registration survived, so the assertion below proves nothing"
+    unregisterable = sorted(set(stored) - WEBHOOK_ELIGIBLE)  # type: ignore[call-overload]
+    assert unregisterable == [], (
+        f"these are stored in webhook.event_types and the register route would refuse "
+        f"them: {unregisterable}. A type that stops being eligible needs a migration "
+        "stripping it, or every subscription naming it goes quiet with no error."
+    )
+
+
+def test_a_callback_still_owed_across_the_rename_is_rebuilt_with_the_events_own_type(
+    unmigrated_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An undelivered row is retried after the deploy, so its type reaches a tenant.
+
+    Recovered by joining the Event Log on `(session_id, seq)` rather than mapped from
+    the state, because the delivery row already records exactly which event it was for
+    and the map cannot answer: `running` is both a create and a resume, and guessing
+    would put a type on the wire that names something that did not happen.
+
+    A row already delivered keeps what it says. It is a record of what was sent, and
+    what was sent was the old spelling -- rewriting it would make the ledger claim a
+    callback nobody received.
+    """
+    monkeypatch.setenv(_URL_ENV, unmigrated_url)
+    command.upgrade(_config(), "0029")
+    registration, session = uuid4(), uuid4()
+    _write(
+        unmigrated_url,
+        [
+            (
+                "INSERT INTO webhook (id, tenant_id, url, states, secret_ref)"
+                " VALUES (:wid, :tid, 'https://hooks.example.com/owed',"
+                " ARRAY['stopped'], 'signing-owed')",
+                {"wid": registration, "tid": uuid4()},
+            ),
+            (
+                "INSERT INTO event_log (session_id, seq, type, payload)"
+                " VALUES (:sid, 3, 'session.stopped', '{}'::jsonb),"
+                " (:sid, 2, 'session.suspended', '{}'::jsonb)",
+                {"sid": session},
+            ),
+            (
+                "INSERT INTO webhook_delivery"
+                " (webhook_id, session_id, state, seq, attempts, delivered_at_ms)"
+                " VALUES (:wid, :sid, 'stopped', 3, 1, NULL),"
+                " (:wid, :sid, 'suspended', 2, 1, 1700000000000)",
+                {"wid": registration, "sid": session},
+            ),
+        ],
+    )
+
+    command.upgrade(_config(), "head")
+
+    owed = _read(
+        unmigrated_url,
+        "SELECT event_type FROM webhook_delivery"
+        " WHERE webhook_id = :wid AND session_id = :sid AND seq = 3",
+        {"wid": registration, "sid": session},
+    )
+    assert owed == "session.stopped", (
+        f"the callback still owed would be retried naming {owed!r}, which is not an "
+        "event type this platform publishes"
+    )
+
+    already_sent = _read(
+        unmigrated_url,
+        "SELECT event_type FROM webhook_delivery"
+        " WHERE webhook_id = :wid AND session_id = :sid AND seq = 2",
+        {"wid": registration, "sid": session},
+    )
+    assert already_sent == "suspended", (
+        "a delivered row was rewritten; it records what was sent, and what was sent "
+        "was the old spelling"
+    )
+
+
+def test_a_rollback_hands_a_registration_back_the_states_it_was_written_with(
+    unmigrated_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rolling back has to undo the translation too, or the column outlives its data.
+
+    A deploy that goes out and comes back leaves `webhook.states` holding event type
+    names, which the previous release matches nothing against -- the same silently-dead
+    subscription as the forward gap, arrived at from the other side and at the worst
+    possible moment, since a rollback is already an incident.
+
+    Two types fold onto one state going back, which is what the `DISTINCT` in 0030 is
+    for: `session.created` and `session.resumed` both become `running`. A registration
+    naming both cannot reach this point any more -- 0031 strips the second on the way up
+    and cannot put it back on the way down -- so what is graded here is that the round
+    trip still hands back the states the row was written with, not that the duplicate is
+    collapsed.
+    """
+    monkeypatch.setenv(_URL_ENV, unmigrated_url)
+    command.upgrade(_config(), "0029")
+    registration = uuid4()
+    _write(
+        unmigrated_url,
+        [
+            (
+                "INSERT INTO webhook (id, tenant_id, url, states, secret_ref)"
+                " VALUES (:wid, :tid, 'https://hooks.example.com/rollback',"
+                " ARRAY['running','stopped'], 'signing-rollback')",
+                {"wid": registration, "tid": uuid4()},
+            )
+        ],
+    )
+
+    command.upgrade(_config(), "head")
+    command.downgrade(_config(), "0029")
+
+    handed_back = _read(
+        unmigrated_url,
+        "SELECT states FROM webhook WHERE id = :wid",
+        {"wid": registration},
+    )
+    assert sorted(handed_back) == ["running", "stopped"], (  # type: ignore[call-overload]
+        f"the rollback left the registration naming {handed_back}, which the release "
+        "being rolled back to reads as Session states and matches nothing against"
     )
 
 
@@ -327,4 +648,114 @@ def test_a_migration_says_on_its_own_output_which_revisions_it_applied(
         f"{len(expected) - len(missing)} of them on stderr; {missing} left no trace. A "
         "migration Job whose logs do not say what it did is indistinguishable from one "
         "that did nothing."
+    )
+
+
+def _seed_a_tenant_with_one_tool_and_one_grant(
+    url: str, *, tenant: object, server: object, session: object
+) -> None:
+    """One server, one tool, one Session whose Grant names that tool, as 0031 stored it.
+
+    Written raw for the reason `_write` gives: these are rows in the shape a *previous*
+    revision stored, and the adapters only know how to write the current one.
+    """
+    _write(
+        url,
+        [
+            (
+                "INSERT INTO tool_server (id, tenant_id, server_name, endpoint)"
+                " VALUES (:sid, :tid, 'deepwiki', '{}'::jsonb)",
+                {"sid": server, "tid": tenant},
+            ),
+            (
+                "INSERT INTO registered_tool"
+                " (tenant_id, name, server_id, remote_name, parameters, scope_bindings)"
+                " VALUES (:tid, 'ask', :sid, 'ask', '{}'::jsonb,"
+                ' \'[{"parameter": "q", "scope": "query"}]\'::jsonb)',
+                {"tid": tenant, "sid": server},
+            ),
+            (
+                "INSERT INTO session (id, tenant_id, definition_id,"
+                " definition_revision, grant_tools, scope, budget_minor_units,"
+                " budget_currency, retention_days)"
+                " VALUES (:xid, :tid, :did, 'r1', '[\"ask\"]'::jsonb, '{}'::jsonb,"
+                " 1000, 'USD', 30)",
+                {"xid": session, "tid": tenant, "did": uuid4()},
+            ),
+        ],
+    )
+
+
+def test_the_rename_to_per_server_names_runs_against_a_registry_that_has_tools(
+    unmigrated_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """**0032 could not run against any database that had ever registered a tool.**
+
+    Its backfill is an `UPDATE registered_tool`, and 0005 put a trigger on that table
+    that refuses every update -- so the statement raises `restrict_violation` the moment
+    one row matches. Against an empty table it matches nothing and the trigger never
+    fires, which is why every migration case before this one passed: they all upgrade a
+    fresh database. The first deploy to a cluster holding 208 registered tools failed
+    here, ten minutes into a `kubectl wait`, with the schema left at 0031.
+
+    Seeding before the upgrade is the whole point of the case. A migration that alters
+    data is only exercised by data, and "upgrade head on an empty database" grades the
+    DDL and nothing else.
+    """
+    monkeypatch.setenv(_URL_ENV, unmigrated_url)
+    command.upgrade(_config(), "0031")
+    tenant, server, session = uuid4(), uuid4(), uuid4()
+    _seed_a_tenant_with_one_tool_and_one_grant(
+        unmigrated_url, tenant=tenant, server=server, session=session
+    )
+
+    command.upgrade(_config(), "0032")
+
+    assert (
+        _read(
+            unmigrated_url,
+            "SELECT advertised_name FROM registered_tool"
+            " WHERE tenant_id = :tid AND name = 'ask'",
+            {"tid": tenant},
+        )
+        == "deepwiki__ask"
+    )
+
+
+def test_a_grant_written_before_the_rename_still_names_the_tool_it_was_written_for(
+    unmigrated_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Grant holds the name the Gateway compares, and the rename moves that name.
+
+    Every Grant stored before 0032 holds a bare tool name, because that is what a tool
+    was called. After it, the Gateway checks membership against `advertised_name` --
+    `deepwiki__ask` -- so a Grant still saying `ask` matches nothing and the Session
+    silently loses every tool it was granted. Measured on the live database before the
+    roll: **146 of 146** Sessions with a non-empty Grant belong to tenants that have
+    registered tools, so every one of them was in that position.
+
+    Rewriting the Grant is a rename and not a widening, and the migration is where that
+    distinction can still be made safely: before 0032 a bare name was unique within a
+    tenant -- it was half the primary key -- so each entry maps to exactly one tool.
+    An entry matching no tool of that tenant is left exactly as it is: it granted
+    nothing before and grants nothing after, and inventing a qualified name for it would
+    be the one edit here that could widen a Grant.
+    """
+    monkeypatch.setenv(_URL_ENV, unmigrated_url)
+    command.upgrade(_config(), "0031")
+    tenant, server, session = uuid4(), uuid4(), uuid4()
+    _seed_a_tenant_with_one_tool_and_one_grant(
+        unmigrated_url, tenant=tenant, server=server, session=session
+    )
+
+    command.upgrade(_config(), "0032")
+
+    carried = _read(
+        unmigrated_url,
+        "SELECT grant_tools FROM session WHERE id = :xid",
+        {"xid": session},
+    )
+    assert carried == ["deepwiki__ask"], (
+        f"the Grant now names {carried}, which the Tool Gateway matches nothing "
+        "against. A Session that was granted a tool has silently lost it."
     )

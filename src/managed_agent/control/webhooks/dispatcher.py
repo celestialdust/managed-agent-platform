@@ -1,4 +1,4 @@
-"""Building, signing and delivering the one callback a Session state change earns.
+"""Building, signing and delivering the one callback a lifecycle event earns.
 
 A receiver has to answer two questions before acting: did this come from the platform,
 and is it fresh. So the timestamp is signed along with the body and travels in its own
@@ -23,7 +23,7 @@ returned value.
 
 import hashlib
 import hmac
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 from typing import Final, Protocol
 from uuid import UUID
@@ -32,12 +32,10 @@ import httpx
 from pydantic import BaseModel, ConfigDict
 
 from managed_agent.control.webhooks.registry import WebhookRecord
-from managed_agent.core.ids import FIRST_SEQ, Seq, SessionId, TenantId
-from managed_agent.core.ports import CredentialVault, EventRecord
-from managed_agent.core.session.projection import project
-from managed_agent.core.session.session import SessionState
+from managed_agent.core.ids import Seq, SessionId, TenantId
+from managed_agent.core.ports import CredentialVault
 from managed_agent.core.vault_names import scoped_vault_name
-from managed_agent.core.vocabulary import PUBLISHED, lifecycle
+from managed_agent.core.vocabulary import WEBHOOK_ELIGIBLE
 
 WEBHOOK_SECRET_PREFIX: Final = "map/webhook-secret"
 """The segment every signing secret sits under, ahead of the tenant and the reference.
@@ -57,18 +55,6 @@ SIGNATURE_SCHEME: Final = "v1"
 A later algorithm arrives beside this one under a second scheme name, so receivers
 pinned to v1 keep verifying instead of failing every check at once on a day nobody
 announced.
-"""
-
-LIFECYCLE_TYPES: Final[tuple[str, ...]] = tuple(
-    sorted(name for name, family in PUBLISHED.items() if family == lifecycle.FAMILY)
-)
-"""The event types worth tailing, read off the published vocabulary rather than listed.
-
-A family that gains a type gains it for this tail too, with no edit to this module --
-which is the only reason the set can be trusted to be complete. The invariant it rests
-on is that an event able to move a Session's state is declared in the lifecycle family;
-a test pins that against the projection's own transition table, so a state-moving type
-declared elsewhere fails there rather than going quietly undelivered.
 """
 
 SAFETY_LAG_MS: Final = 5_000
@@ -95,11 +81,16 @@ class Callback(BaseModel):
     """What a callback says.
 
     The field list is closed and every member is something this platform issued: which
-    registration fired, which Session, which state it reached, the sequence it reached
-    it at, and when this delivery was built. Nothing is read out of an event payload, a
-    tool result or a model response, so there is no field a tool credential or an
-    upstream token could travel in -- that is a property of this type rather than of a
-    redaction pass somebody maintains.
+    registration fired, which Session, which event type happened, the sequence it
+    happened at, and when this delivery was built. Nothing is read out of an event
+    payload, a tool result or a model response, so there is no field a tool credential
+    or an upstream token could travel in -- that is a property of this type rather than
+    of a redaction pass somebody maintains.
+
+    `event_type` is the type the event carries and not a state derived from it. A state
+    is a fold over a whole log and two events can fold to the same one, so a callback
+    naming a state cannot say which event caused it -- and the pair (session, sequence)
+    below is what a receiver uses to go and read it.
 
     `seq` is here so the callback is useful without being large: a receiver reads the
     Event Log from that sequence, through the surface that authorizes it to, instead of
@@ -110,7 +101,7 @@ class Callback(BaseModel):
 
     webhook_id: UUID
     session_id: SessionId
-    state: SessionState
+    event_type: str
     seq: Seq
     delivered_at_ms: int
 
@@ -143,12 +134,17 @@ def signed_callback(
 
 
 class LifecycleCandidate(Protocol):
-    """One lifecycle event the tail found, with the tenant that owns the Session.
+    """One deliverable event the tail found, with the tenant that owns the Session.
 
     Read-only members rather than plain annotations, for the reason `core.ports` gives
     for `EventRecord`: a plain annotation demands a settable attribute and so excludes
     every frozen implementation, which is what both the adapter's row and any honest
     test double are.
+
+    `type` is on it because it is the whole answer the sweep needs from a candidate.
+    Deriving it instead -- folding the Session's log and naming the state it arrived at
+    -- was what this used to do, and it could not distinguish two events that fold to
+    one state, which is exactly the pair a tenant most wants told apart.
     """
 
     @property
@@ -160,28 +156,24 @@ class LifecycleCandidate(Protocol):
     @property
     def seq(self) -> Seq: ...
 
+    @property
+    def type(self) -> str: ...
+
 
 class LifecycleScan(Protocol):
-    """The cross-Session tail, and the per-Session read the fold needs."""
+    """The cross-Session tail. One method, because one question is asked of the log."""
 
     async def lifecycle_events_between(
-        self, types: Sequence[str], from_ms: int, to_ms: int
+        self, types: Collection[str], from_ms: int, to_ms: int
     ) -> Sequence[LifecycleCandidate]:
         """Events of these types appended after `from_ms` and at or before `to_ms`.
 
         Half-open below and closed above, so consecutive windows cover the line between
         them exactly once.
-        """
-        ...
 
-    async def read(
-        self, session_id: SessionId, start: Seq, end: Seq, limit: int = 500
-    ) -> Sequence[EventRecord]:
-        """One Session's events with `start <= seq <= end`, at most `limit` of them.
-
-        The cap is named in the signature because it is real: an implementation may
-        return a short result meaning "page for the rest", and a caller that took the
-        default would fold part of a log and believe it had folded all of it.
+        `types` is a `Collection` rather than a `Sequence` so the eligible set can be
+        passed as the frozenset it is, with no order invented on the way in that would
+        suggest one is meaningful.
         """
         ...
 
@@ -196,7 +188,7 @@ class WatchedWebhooks(Protocol):
     """
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]: ...
 
 
@@ -227,7 +219,7 @@ class PendingDelivery(Protocol):
     def session_id(self) -> SessionId: ...
 
     @property
-    def state(self) -> SessionState: ...
+    def event_type(self) -> str: ...
 
     @property
     def seq(self) -> Seq: ...
@@ -248,7 +240,7 @@ class DeliveryLedger(Protocol):
         self,
         webhook_id: UUID,
         session_id: SessionId,
-        state: SessionState,
+        event_type: str,
         seq: Seq,
         max_attempts: int,
     ) -> int | None:
@@ -256,12 +248,17 @@ class DeliveryLedger(Protocol):
 
         None means the callback is already delivered, or its attempts are spent, or
         another dispatcher holds this attempt. One statement decides all three, because
-        the case that matters is two dispatchers reaching the same state change at once.
+        the case that matters is two dispatchers reaching the same event at once.
+
+        A claim is identified by the registration, the Session and the sequence. The
+        type travels with it because the row records what the callback said, but it is
+        not what makes the claim unique: the sequence already is, and a type in the key
+        would let one event be claimed twice under two spellings.
         """
         ...
 
     async def mark_delivered(
-        self, webhook_id: UUID, session_id: SessionId, state: SessionState, status: int
+        self, webhook_id: UUID, session_id: SessionId, seq: Seq, status: int
     ) -> None:
         """Record that this callback landed, and stop it being retried."""
         ...
@@ -275,11 +272,17 @@ class DeliveryLedger(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class Delivery:
-    """One attempt's outcome. `status` is None when the request got no answer at all."""
+    """One attempt's outcome. `status` is None when the request got no answer at all.
+
+    Carries the sequence as well as the type, because the type alone does not name one
+    delivery: a Session can be suspended and resumed repeatedly, so a caller logging
+    these would otherwise have several outcomes it could not tell apart.
+    """
 
     webhook_id: UUID
     session_id: SessionId
-    state: SessionState
+    event_type: str
+    seq: Seq
     delivered: bool
     status: int | None
 
@@ -294,11 +297,11 @@ class SweepRun:
     more_due: bool
 
 
-_Attempted = tuple[UUID, SessionId, str]
+_Attempted = tuple[UUID, SessionId, Seq]
 
 
 class WebhookDispatcher:
-    """Turns Session state changes into signed callbacks, one delivery each.
+    """Turns deliverable events into signed callbacks, one delivery each.
 
     Holds no schedule and reads no clock: `sweep_once` takes the instant, so whatever
     process runs it owns when it runs and there is no second answer to that question in
@@ -335,20 +338,19 @@ class WebhookDispatcher:
 
         if end > start:
             for candidate in await self._scan.lifecycle_events_between(
-                LIFECYCLE_TYPES, start, end
+                WEBHOOK_ELIGIBLE, start, end
             ):
-                state = await self._state_at(candidate)
-                if state is None:
-                    continue
-                for hook in await self._hooks.watching(candidate.tenant_id, state):
-                    attempted.add((hook.id, candidate.session_id, state.value))
+                for hook in await self._hooks.watching(
+                    candidate.tenant_id, candidate.type
+                ):
+                    attempted.add((hook.id, candidate.session_id, candidate.seq))
                     outcome = await self._attempt(
                         hook.id,
                         hook.tenant_id,
                         hook.url,
                         hook.secret_ref,
                         candidate.session_id,
-                        state,
+                        candidate.type,
                         candidate.seq,
                         now_ms,
                     )
@@ -364,7 +366,7 @@ class WebhookDispatcher:
             if (
                 pending.webhook_id,
                 pending.session_id,
-                pending.state.value,
+                pending.seq,
             ) in attempted:
                 continue
             outcome = await self._attempt(
@@ -373,7 +375,7 @@ class WebhookDispatcher:
                 pending.url,
                 pending.secret_ref,
                 pending.session_id,
-                pending.state,
+                pending.event_type,
                 pending.seq,
                 now_ms,
             )
@@ -387,37 +389,6 @@ class WebhookDispatcher:
             more_due=end < frontier,
         )
 
-    async def _state_at(self, candidate: LifecycleCandidate) -> SessionState | None:
-        """The state this Session was in as of this event, or None when it cannot
-        be known.
-
-        Folding rather than mapping the event type is what keeps one answer on the
-        platform to "what state is this Session in". A dispatcher carrying its own
-        event-type-to-state table would be a second answer, one that a tenant reading
-        the Session could eventually disagree with, on the one surface where disagreeing
-        means a callback that names the wrong state.
-
-        The read names a limit rather than taking the default, and the limit is provably
-        wide enough: the range is `1..seq`, the log's key is `(session_id, seq)`, so at
-        most `seq` events lie in it. Taking the default would fold one page of a long
-        log and report the state as of that page, which has happened twice in this
-        repository already.
-
-        None means the range held no event the projection recognises at all, which in
-        practice means the retention sweep emptied this log between the tail naming it
-        and this read. Nothing true can be said about a Session whose log is gone, and
-        inventing a state here would post a wrong one.
-        """
-        try:
-            state, _ = project(
-                await self._scan.read(
-                    candidate.session_id, FIRST_SEQ, candidate.seq, limit=candidate.seq
-                )
-            )
-        except ValueError:
-            return None
-        return state
-
     async def _attempt(
         self,
         webhook_id: UUID,
@@ -425,7 +396,7 @@ class WebhookDispatcher:
         url: str,
         secret_ref: str,
         session_id: SessionId,
-        state: SessionState,
+        event_type: str,
         seq: Seq,
         now_ms: int,
     ) -> Delivery | None:
@@ -461,7 +432,9 @@ class WebhookDispatcher:
         has to live where the key is composed and not only where it is registered.
         """
         if (
-            await self._ledger.claim(webhook_id, session_id, state, seq, MAX_ATTEMPTS)
+            await self._ledger.claim(
+                webhook_id, session_id, event_type, seq, MAX_ATTEMPTS
+            )
             is None
         ):
             return None
@@ -473,13 +446,15 @@ class WebhookDispatcher:
             # Deliberately every exception, and deliberately not logged: the reason is
             # what a caller must not be able to tell apart, and a log line carrying it
             # would carry the composed name, which holds the tenant's own id.
-            return Delivery(webhook_id, session_id, state, delivered=False, status=None)
+            return Delivery(
+                webhook_id, session_id, event_type, seq, delivered=False, status=None
+            )
         body, headers = signed_callback(
             secret,
             Callback(
                 webhook_id=webhook_id,
                 session_id=session_id,
-                state=state,
+                event_type=event_type,
                 seq=seq,
                 delivered_at_ms=now_ms,
             ),
@@ -494,15 +469,18 @@ class WebhookDispatcher:
             # The exception is swallowed rather than logged here because the caller gets
             # it as a value -- `SweepRun.failed` -- and a log line built from an httpx
             # error would carry the url, which is a tenant's.
-            return Delivery(webhook_id, session_id, state, delivered=False, status=None)
+            return Delivery(
+                webhook_id, session_id, event_type, seq, delivered=False, status=None
+            )
         if response.is_success:
             await self._ledger.mark_delivered(
-                webhook_id, session_id, state, response.status_code
+                webhook_id, session_id, seq, response.status_code
             )
         return Delivery(
             webhook_id,
             session_id,
-            state,
+            event_type,
+            seq,
             delivered=response.is_success,
             status=response.status_code,
         )

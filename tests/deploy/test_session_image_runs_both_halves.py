@@ -277,8 +277,6 @@ def test_the_manifest_declares_the_containers_this_file_grades() -> None:
     """
     assert [str(spec["name"]) for spec in _container_specs()] == [
         "seed-runtime-home",
-        "restore-working-lane",
-        "seed-rollout",
         "agent-runtime",
         "session-shim",
     ]

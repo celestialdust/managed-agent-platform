@@ -38,10 +38,11 @@ from managed_agent.control.session.lifecycle import (
     TurnReplayed,
     admit_turn,
 )
-from managed_agent.control.session.turn_dispatch import TurnUndeliverable
+from managed_agent.control.session.turn_execution import run_turn, task_name
 from managed_agent.core.errors import STATUS_FOR, ErrorCode, PublicErrorEnvelope
 from managed_agent.core.ids import Seq, SessionId, TenantId, TurnId
 from managed_agent.core.ports import SessionNotVisible
+from managed_agent.core.session.session import SessionState
 from managed_agent.core.vocabulary import turn
 
 _LOG = logging.getLogger(__name__)
@@ -79,7 +80,6 @@ class TurnView(BaseModel):
         STATUS_FOR[ErrorCode.SESSION_NOT_ACCEPTING_TURNS]: {
             "model": PublicErrorEnvelope
         },
-        STATUS_FOR[ErrorCode.TURN_UNDELIVERABLE]: {"model": PublicErrorEnvelope},
     },
 )
 async def submit(
@@ -117,9 +117,20 @@ async def submit(
     )
     match admission:
         case TurnRefused(state=state):
+            # One code, two sentences, because the two refusals need opposite remedies.
+            # A stop is permanent and the caller needs a new Session; a Turn already
+            # executing clears on its own, and the caller waits or interrupts. Saying
+            # only "accepts no Turn" for the second reads as the first, and would send
+            # somebody off to recreate a Session that was about to be free.
+            explained = (
+                "a Turn is already running on this session; wait for it to finish or "
+                "interrupt it"
+                if state is SessionState.RUNNING
+                else f"this session is {state.value} and accepts no Turn"
+            )
             return refuse(
                 ErrorCode.SESSION_NOT_ACCEPTING_TURNS,
-                f"this session is {state.value} and accepts no Turn",
+                explained,
                 session_id=str(session_id),
                 state=state.value,
             )
@@ -127,48 +138,22 @@ async def submit(
             response.status_code = status.HTTP_200_OK
             return TurnView(turn_id=replayed, seq=seq)
         case TurnAdmitted(turn_id=admitted, seq=seq):
-            try:
-                await platform.turn_dispatch.dispatch(session_id, admitted, body.prompt)
-            except TurnUndeliverable as undeliverable:
-                # Two audiences, and the split is the point. The exception's text names
-                # a pod, a cluster phase, or a configuration floor -- the platform's own
-                # facts and not the tenant's (ADR-013) -- so the tenant gets the
-                # published code and the Session's event log gets the one published
-                # cause.
-                #
-                # The platform's own log gets the words. It did not until 2026-08-23,
-                # and the cost was measured that day: a Turn answered 502 with no pod
-                # created and *nothing anywhere* said why. `session_pods.py` builds that
-                # message deliberately, to tell "this Session may not be resumed" from
-                # "that environment is not registered" from "the image will not pull" --
-                # three different people's problems -- and its own comment reasoned that
-                # carrying the words "costs nothing". It cost the message: it was
-                # constructed with care and then dropped on the floor here, so the one
-                # thing that knew the cause never told anyone.
-                #
-                # This log is stderr, which no tenant reads, so nothing is disclosed
-                # that the refusal withholds.
-                _LOG.warning(
-                    "turn %s for session %s is undeliverable: %s",
+            # Started, not awaited, and the 202 above stops being a promise this route
+            # breaks. What the Turn does and how it ends belong to
+            # `control/session/turn_execution.py` now -- including the `turn.failed`
+            # that closes it, which cannot stay here: a Turn that fails after this
+            # response has been sent would record nothing, and an open Turn refuses the
+            # Session's next Turn and its archive for ever.
+            platform.background_turns.start(
+                run_turn(
+                    platform.turn_dispatch,
+                    platform.event_log_append,
+                    session_id,
                     admitted,
-                    session_id,
-                    undeliverable,
-                )
-                await platform.event_log_append.append(
-                    session_id,
-                    turn.TURN_FAILED,
-                    {
-                        "turn_id": str(admitted),
-                        "cause": turn.TurnFailureCause.POD_UNREACHABLE.value,
-                    },
-                )
-                return refuse(
-                    ErrorCode.TURN_UNDELIVERABLE,
-                    "the session could not be reached, and the Turn is recorded as "
-                    "failed",
-                    session_id=str(session_id),
-                    turn_id=str(admitted),
-                )
+                    body.prompt,
+                ),
+                name=task_name(admitted),
+            )
             return TurnView(turn_id=admitted, seq=seq)
         case _:
             assert_never(admission)

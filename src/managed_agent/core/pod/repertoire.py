@@ -113,11 +113,24 @@ class ThreadResumeRequest(_Outbound):
     Both `path` and `thread_id` are sent, and the file wins: the Agent Runtime's own
     precedence puts a non-empty path above a thread id. Which file is handed over is the
     recovery boundary's question and belongs to the slice that truncates the Rollout.
+
+    `approval_policy` is fixed to "never" here for the same reason it is on
+    `ThreadStartRequest`, and it has to be repeated rather than inherited: a resume that
+    omits the field does not keep the value the thread was started with, it takes the
+    Agent Runtime's own default, which asks. Omitted, that is what happened -- measured
+    live -- and with nobody inside a pod to answer, every shell command in the resumed
+    thread was refused. The Turn still reported `turn.completed` and the model explained
+    the refusal as its own limitation, so nothing upstream could tell the difference
+    between an agent that would not run a command and one that could not.
+
+    That makes this a per-Turn concern rather than a recovery-only one: once a pod is
+    replaced at every Turn boundary, every Turn but a Session's first is a resume.
     """
 
     thread_id: str
     path: str
     permissions: str
+    approval_policy: Literal["never"] = "never"
 
 
 class ThreadReadRequest(_Outbound):

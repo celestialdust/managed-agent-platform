@@ -27,7 +27,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from managed_agent.control.files.output_shipout import OUTPUT_COUNT_LIMIT
+from managed_agent.control.files.output_shipout import (
+    OUTPUT_COUNT_LIMIT,
+    OUTPUT_TREE_LIMIT,
+)
 from managed_agent.core.ids import SessionId, new_session_id
 from managed_agent.core.pod.workspace_contract import OUTPUT_DIR_NAME
 from managed_agent.session_shim.client import RuntimeConnection
@@ -251,20 +254,39 @@ async def test_a_symlink_the_agent_planted_is_neither_listed_nor_served(
     assert served.content == b""
 
 
-async def test_a_listing_stops_at_one_past_the_limit_however_many_files_there_are(
+def test_the_enumeration_bound_is_well_above_what_one_turn_transfers() -> None:
+    """**Two bounds, and the gap between them is what keeps the transfer bound honest.**
+
+    They were one constant, and that is exactly what made the transfer bound accumulate
+    over a Session's life: the pod stopped scanning at what one Turn ships, so a Session
+    already holding that many never got the files it added this Turn into a listing at
+    all, and the control plane's already-delivered filter cannot weigh a path it was
+    never shown.
+
+    Asserted as a strict inequality with room, not as two literals. A later reader
+    tuning either number is free to; a reader who tunes them back to equality has undone
+    the fix, and this is the only thing in the tree that would notice.
+    """
+    assert OUTPUT_TREE_LIMIT > OUTPUT_COUNT_LIMIT * 2, (
+        "the pod must enumerate far more than one Turn transfers, or the transfer "
+        "bound is a bound on the Session's whole lifetime again"
+    )
+
+
+async def test_a_listing_stops_at_one_past_the_enumeration_bound(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The bound, exceeded on purpose so the cap is measured and not described.
 
     One entry past the limit rather than exactly the limit, and that extra entry is the
-    whole signal: the far end has to be able to tell "the workspace holds exactly what I
-    will take" from "it holds more than that", and a listing truncated at the limit is
+    whole signal: the far end has to be able to tell "the tree holds exactly what I will
+    enumerate" from "it holds more than that", and a listing truncated at the limit is
     the same bytes in both cases.
     """
     produced = tmp_path / "produced"
     produced.mkdir()
-    for index in range(OUTPUT_COUNT_LIMIT + 5):
-        (produced / f"file-{index:03d}.md").write_bytes(b"x")
+    for index in range(OUTPUT_TREE_LIMIT + 5):
+        (produced / f"file-{index:04d}.md").write_bytes(b"x")
     session_id = new_session_id()
     app = _app(monkeypatch, produced, session_id)
     async with _client(app) as client:
@@ -272,7 +294,36 @@ async def test_a_listing_stops_at_one_past_the_limit_however_many_files_there_ar
             _listing_path(session_id), headers=_bearer(session_id)
         )
     listing = ProducedFiles.model_validate(answer.json())
-    assert len(listing.files) == OUTPUT_COUNT_LIMIT + 1
+    assert len(listing.files) == OUTPUT_TREE_LIMIT + 1
+
+
+async def test_a_tree_larger_than_one_turn_ships_is_listed_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case the old coupling could not express, at the size where it bit.
+
+    A Session that has delivered more files than one Turn transfers is the ordinary
+    shape of a long run, and the file it wrote this Turn has to be in the listing for
+    the control plane to have any chance of shipping it. Under the old bound the
+    listing stopped one entry past what a Turn ships, so it came back holding an
+    arbitrary handful of a much larger tree and `late.md` was usually not among them.
+    """
+    produced = tmp_path / "produced"
+    produced.mkdir()
+    for index in range(OUTPUT_COUNT_LIMIT * 3):
+        (produced / f"file-{index:03d}.md").write_bytes(b"x")
+    (produced / "late.md").write_bytes(b"written this turn")
+    session_id = new_session_id()
+    app = _app(monkeypatch, produced, session_id)
+    async with _client(app) as client:
+        answer = await client.get(
+            _listing_path(session_id), headers=_bearer(session_id)
+        )
+
+    listing = ProducedFiles.model_validate(answer.json())
+
+    assert len(listing.files) == OUTPUT_COUNT_LIMIT * 3 + 1
+    assert "late.md" in {entry.name for entry in listing.files}
 
 
 async def test_a_listing_inside_the_limit_is_sorted_and_therefore_repeatable(

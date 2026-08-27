@@ -192,13 +192,19 @@ class FixedScope:
     in every test here that makes a call, rather than only in the ones about clamping.
     The default names `account`, the dimension this package's registrations bind.
 
+    The Grant is positional and defaults to empty, which the proxy reads as *no tools*.
+    That is deliberately the inconvenient default: a case that calls a tool has to name
+    the tool in its Grant, so the authorization it is relying on is written in the case
+    rather than inherited from a permissive fixture nobody reads.
+
     The read count is not decoration. The proxy is meant to read a Session's Scope once
     and hold it for its life, and a proxy that re-read it per call would put a database
     round trip on the hot path with every assertion in this package still green.
     """
 
-    def __init__(self, **scope: str) -> None:
+    def __init__(self, *grant: str, **scope: str) -> None:
         self.scope: dict[str, str] = scope or {"account": "the-tenants-own-account"}
+        self.grant = frozenset(grant)
         self.reads = 0
 
     async def fetch(self, session_id: SessionId, tenant_id: TenantId) -> SessionRecord:
@@ -208,7 +214,7 @@ class FixedScope:
             tenant_id=tenant_id,
             definition_id=DefinitionId(UUID("22222222-2222-4222-8222-222222222222")),
             definition_revision="0" * 40,
-            grant=frozenset(),
+            grant=self.grant,
             scope=tuple(self.scope.items()),
             budget_minor_units=1_000,
             budget_currency="USD",

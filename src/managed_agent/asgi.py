@@ -88,7 +88,16 @@ def build_app() -> FastAPI:
     ) -> AsyncIterator[None]:
         try:
             async with sweeping(platform.sweeps, every_s=every_s):
-                yield
+                try:
+                    yield
+                finally:
+                    # Innermost, so the Turns stop before the sweeps that watch them
+                    # and long before the pool both are writing through. A Turn
+                    # cancelled here is left open on purpose and collected by
+                    # `AbandonedTurnSweeper` from the replica still serving; closing it
+                    # from inside a task being cancelled is not available, because
+                    # every further await in that task is cancelled too.
+                    await platform.background_turns.aclose()
         finally:
             await engine.dispose()
 

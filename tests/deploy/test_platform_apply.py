@@ -626,3 +626,75 @@ def test_it_applies_no_manifest_bootstrap_already_applies() -> None:
         assert workload.manifest.name not in already
         if workload.schema_job is not None:
             assert workload.schema_job.name not in already
+
+
+def _with_a_tag_and_this_aws(monkeypatch: pytest.MonkeyPatch, aws: Any) -> ModuleType:
+    """`_reference` with its tag step stubbed out and `_aws` replaced.
+
+    The tag step shells out to `push-platform-image.sh`, which refuses while any build
+    input is uncommitted -- and `migrations/` is a build input. Left real, these cases
+    pass on a clean checkout and fail inside any run that has edited a migration, which
+    is exactly the run that would be exercising them. The subject here is which of two
+    registry answers a caller is shown, so the tag is stubbed rather than derived.
+    """
+    platform = _platform()
+
+    class _Tagged:
+        returncode = 0
+        stdout = "git-0000000000000000000000000000000000000000"
+        stderr = ""
+
+    monkeypatch.setattr(platform.subprocess, "run", lambda *a, **k: _Tagged())
+    monkeypatch.setattr(platform, "_aws", aws)
+    return platform
+
+
+def test_an_unpushed_commit_is_answered_with_the_command_that_fixes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The absent-image message has to survive `describe-images` exiting non-zero.
+
+    That message was unreachable for the whole of this file's life. `_aws` raises on a
+    non-zero exit and `describe-images` exits non-zero for a tag the repository does not
+    hold, so the branch written for "nothing has pushed this commit" could never run and
+    the caller got a traceback ending in `ImageNotFoundException`. It cost a real deploy
+    attempt: a docstring commit made after the images were pushed was enough, because
+    the tag names HEAD and nothing else.
+
+    Graded through `_aws` rather than through a real registry, since the assertion is
+    about which of two failures a caller is shown.
+    """
+
+    def _absent(*argv: str) -> str:
+        raise RuntimeError(
+            "aws ecr describe-images failed: An error occurred "
+            "(ImageNotFoundException) when calling the DescribeImages operation"
+        )
+
+    platform = _with_a_tag_and_this_aws(monkeypatch, _absent)
+    with pytest.raises(RuntimeError) as refused:
+        platform._reference(_ROOT, "map/control-plane")
+
+    assert "push-platform-image.sh" in str(refused.value)
+    assert "the tag names HEAD" in str(refused.value)
+
+
+def test_a_registry_that_cannot_be_reached_is_not_reported_as_an_unpushed_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Expired credentials are a different problem and must not be papered over.
+
+    The narrow catch above is what keeps this true: turning every `_aws` failure into
+    "nothing pushed this commit" would send somebody to rebuild an image that is already
+    in the registry, and the rebuild would fail the same way for the same reason.
+    """
+
+    def _unreachable(*argv: str) -> str:
+        raise RuntimeError("aws ecr describe-images failed: ExpiredTokenException")
+
+    platform = _with_a_tag_and_this_aws(monkeypatch, _unreachable)
+    with pytest.raises(RuntimeError) as refused:
+        platform._reference(_ROOT, "map/control-plane")
+
+    assert "ExpiredTokenException" in str(refused.value)
+    assert "push-platform-image.sh" not in str(refused.value)

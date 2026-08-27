@@ -63,6 +63,7 @@ from fixtures.codex_blog import codex_blog
 from managed_agent.control.api.request.tenancy import TENANT_HEADER
 from managed_agent.control.session.placement import pod_name_for
 from managed_agent.core.ids import SessionId
+from managed_agent.core.registration.advertised_name import advertised_name_for
 from managed_agent.core.vocabulary import tool_call, tool_server
 
 _GATE: Final = "MAP_CLUSTER_TESTS"
@@ -126,10 +127,17 @@ answered.
 _SHIPOUT_GRACE_S: Final = 120
 """How long to keep reading the log after the Turn ends, waiting for `output.produced`.
 
-Ship-out runs at Turn completion, so the announcement lands AFTER the terminal event --
-which means a poll that stopped at `turn.completed` would race the transfer and report a
-missing file on a Turn that produced one. Bounded rather than unbounded: a Turn that
-genuinely wrote nothing must fail this file rather than hang it.
+Kept, and no longer load-bearing, which is worth saying rather than deleting silently.
+
+It was written when ship-out ran after `turn.completed` was appended, so the
+announcement landed AFTER the terminal event and a poll that stopped there would race
+the transfer and report a missing file on a Turn that produced one. Since 2026-08-26 the
+marker is appended once the seam has returned, so `output.produced` is already in the
+log by the time `turn.completed` is -- and this grace covers only the gap between the
+append and this reader seeing it.
+
+Bounded rather than unbounded either way: a Turn that genuinely wrote nothing must fail
+this file rather than hang it.
 """
 
 requires_the_cluster = pytest.mark.skipif(
@@ -204,7 +212,7 @@ def _a_skill_with_a_receipt(receipt: str) -> str:
     )
 
 
-def _prompt(name: str, code_hint: str) -> str:
+def _prompt(name: str, tool: str, code_hint: str) -> str:
     """Four numbered demands, one per leg, each asking for something quotable.
 
     Numbered and explicit because a vague prompt makes a failed leg ambiguous: an agent
@@ -214,12 +222,16 @@ def _prompt(name: str, code_hint: str) -> str:
     Leg 3 names the reference code as required PDF content, and that is the load-bearing
     sentence in this file. It is what makes the downloaded bytes prove the whole chain
     rather than prove that reportlab works.
+
+    `tool` is passed in rather than spelled here, because what the model is shown is the
+    server and the tool joined -- the bare registered name reaches it as nothing, and
+    the agent reports a tool that is not available rather than a tool that failed.
     """
     return (
         "Four things, in order, and report each one as you finish it.\n"
         f"1. List the directory ./files/ and read {name}. Quote the reference code it "
         "contains, exactly as written.\n"
-        f"2. Call the {_TOOL} tool to ask the {_REPO_IN_SCOPE} repository how its "
+        f"2. Call the {tool} tool to ask the {_REPO_IN_SCOPE} repository how its "
         f"{_FEATURE} works. Quote one sentence of the answer you get back.\n"
         f"3. Follow your pdf skill to write {_OUTPUT_NAME} in your current working "
         "directory -- not in a subdirectory. It must be a real PDF of at least one "
@@ -350,11 +362,12 @@ class _Journey:
 
 def _register(
     base: str, tenant_id: str, image: str, run: str, receipt: str, code: str
-) -> tuple[SessionId, str]:
+) -> tuple[SessionId, str, str]:
     """Upload the document and the skill, register the server, create the Session.
 
-    Returns the Session's id and the name the workspace will hold the file under,
-    because the prompt has to name that file and this is the one place that knows it.
+    Returns the Session's id, the name the workspace will hold the file under, and the
+    name the model will see for the tool -- all three because the prompt has to name
+    them and this is the one place that knows any of them.
 
     Everything goes through the REST API; nothing touches the database or the cluster.
     That is what makes the pod found later evidence: this run had no other way to make
@@ -399,6 +412,7 @@ def _register(
         )
         assert registered.status_code in (200, 201), registered.text
         server_name = registered.json().get("server_name", f"deepwiki-{run.lower()}")
+        advertised = advertised_name_for(server_name, _TOOL)
 
         environment = _created(
             caller.post(
@@ -432,7 +446,7 @@ def _register(
                     "definition_id": definition["id"],
                     "environment_id": environment["id"],
                     "file_ids": [file_id],
-                    "grant": [_TOOL],
+                    "grant": [advertised],
                     "scope": {"repo": _REPO_IN_SCOPE},
                     "budget_minor_units": 1_000_000,
                     "budget_currency": "USD",
@@ -440,7 +454,7 @@ def _register(
                 },
             )
         )
-        return SessionId(UUID(session["id"])), name
+        return SessionId(UUID(session["id"])), name, advertised
 
 
 def _submit(base: str, tenant_id: str, session_id: SessionId, prompt: str) -> None:
@@ -569,9 +583,11 @@ def journey() -> Iterator[_Journey]:
     image = _session_image()
     run = uuid4().hex[:8]
     with forwarded(_CONTROL_PLANE, _CONTROL_PLANE_PORT) as base:
-        session_id, name = _register(base, tenant_id, image, run, receipt, doc_code)
+        session_id, name, tool = _register(
+            base, tenant_id, image, run, receipt, doc_code
+        )
         try:
-            _submit(base, tenant_id, session_id, _prompt(name, "<the code>"))
+            _submit(base, tenant_id, session_id, _prompt(name, tool, "<the code>"))
             events = _await_the_errand(base, tenant_id, session_id)
             yield _Journey(
                 session_id=session_id,
@@ -836,8 +852,13 @@ def test_the_produced_pdf_was_announced_with_an_id_that_downloads_it(
         one for one in journey.produced if one["payload"]["path"] == _OUTPUT_NAME
     )
     assert int(announced["payload"]["byte_length"]) > 0, announced
+    # Before the terminal event, not after it. `turn.completed` is appended once the
+    # seam that ships out has returned, so the announcement that seam makes lands
+    # first -- see the ordering case in
+    # `tests/pod/test_a_session_ships_out_a_document_and_then_closes.py`, which is
+    # where that claim is argued rather than merely used.
     types = [one["type"] for one in journey.events]
-    assert types.index("output.produced") > types.index("turn.completed"), types
+    assert types.index("output.produced") < types.index("turn.completed"), types
 
 
 @requires_the_cluster

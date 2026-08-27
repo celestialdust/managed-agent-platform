@@ -63,6 +63,7 @@ from uuid import uuid4
 
 import pytest
 import yaml
+from workspace_volume import documents_for
 
 from managed_agent.control.pod_config import compiler as config_compiler
 from managed_agent.core.ids import TenantId, new_definition_id, new_session_id
@@ -73,6 +74,13 @@ from managed_agent.core.session.session import SessionRecord
 _ROOT = Path(__file__).resolve().parents[2]
 _MANIFEST = _ROOT / "deploy" / "k8s" / "session-pod.yaml"
 _NAMESPACE = "map-67-targets"
+_RUN: Final = uuid4().hex[:8]
+"""Distinguishes this run's workspace subtrees from every earlier run's.
+
+The volume outlives the pods now, so a fixed name would hand each run the previous
+run's directories -- which is the same defect `_give_it_a_workspace_of_its_own` exists
+to close, one run apart instead of one pod apart.
+"""
 _REPOSITORY = "map/session-shim"
 _REGION = "us-east-1"
 _GATE = "MAP_CLUSTER_TESTS"
@@ -318,6 +326,100 @@ def _compiled(image: str) -> config_compiler.CompiledConfig:
     )
 
 
+def make_the_workspace_volume(namespace: str) -> None:
+    """Give `namespace` its own claim on the shared file system, before any pod lands.
+
+    `session-pod.yaml` mounts a claim called `session-workspaces`, and a claim is
+    reachable only from its own namespace. Without this every pod placed here sits in
+    `Pending` on a claim nobody created, and the event reads as the scheduler refusing
+    the pod rather than as a missing object -- measured, three pods held that way for
+    fifty-seven minutes while the tier waited on transcripts that could never arrive.
+
+    Applied with `--server-side` so a namespace left behind by an interrupted run is
+    reused rather than colliding: this tier deletes its namespace at teardown, and an
+    interrupted run is exactly when it did not.
+    """
+    for document in documents_for(namespace):
+        _kubectl(
+            "apply",
+            "--server-side",
+            "--force-conflicts",
+            "-f",
+            "-",
+            stdin=yaml.safe_dump(document),
+        )
+
+
+def drop_the_workspace_volume(namespace: str) -> None:
+    """Delete this namespace's volume, which `Retain` will not do on its own.
+
+    Deleting the namespace takes the claim with it and leaves the PersistentVolume
+    `Released` forever, because the manifest's reclaim policy is `Retain` -- correct for
+    the real volume and pure accretion here, one dead object per namespace a run has
+    ever used.
+
+    It deletes only the name `documents_for` derived, which always carries this
+    namespace as a suffix and which that function refuses to build for the platform's
+    own. Unchecked, because a teardown that raises replaces a real failure with a story
+    about cleanup.
+    """
+    volume, _ = documents_for(namespace)
+    _kubectl(
+        "delete",
+        "persistentvolume",
+        volume["metadata"]["name"],
+        "--ignore-not-found",
+        check=False,
+    )
+
+
+def _give_it_a_workspace_of_its_own(pod: dict[str, Any], name: str) -> None:
+    """Point this pod's workspace mounts at a subtree no other pod shares.
+
+    `session-pod.yaml` carries `MAP_TENANT_ID/MAP_SESSION_ID` as literal tokens, and
+    production substitutes them per Session in `pod_runner._fill_sub_paths`. A pod built
+    here from the manifest alone keeps the tokens, so every probe pod -- and every probe
+    pod of every previous run -- mounted one subtree literally named after the
+    placeholders.
+
+    That was invisible while the workspace was an emptyDir that died with its pod. Since
+    ADR-035 it is durable and shared, and it turned the two mutants into pods that
+    inherit whatever an earlier pod created: measured, the mutant with the `mkdir` lines
+    removed still found `.agents` a directory, because the pod before it had made one.
+    The mutant is the control that makes the first pod evidence, so a mutant reading
+    another pod's leftovers does not merely fail -- it passes while proving nothing.
+
+    Per POD and not per run: the three pods differ only in the thing being controlled
+    for, so sharing a subtree between them is the same defect at a shorter range.
+
+    Called from `_probe_pod`, which is what makes it reach every tier that builds a pod
+    through it rather than only this one. A mutant is therefore built from its OWN name
+    -- `_probe_pod("targets-no-targets", ...)` and then the mutation -- and not by deep
+    copying the first pod and appending a suffix. That copy is what this originally
+    did, and it carried the ORIGINAL pod's subtree under the original pod's name: the
+    rename made a distinct pod and not a distinct workspace, so the mutant with the
+    `mkdir` lines removed still found `.agents` a directory, made by the pod it was
+    copied from. The assertion below is the guard: a pod arriving here with nothing
+    left to substitute is one built by copying an already-substituted pod, and it fails
+    rather than mounting whichever subtree was filled in before it.
+    """
+    filled = 0
+    for container in pod["spec"]["initContainers"] + pod["spec"]["containers"]:
+        for mount in container.get("volumeMounts", ()):
+            sub_path = str(mount.get("subPath", ""))
+            if "MAP_TENANT_ID" not in sub_path:
+                continue
+            mount["subPath"] = sub_path.replace(
+                "MAP_TENANT_ID", f"probe-{_RUN}"
+            ).replace("MAP_SESSION_ID", name)
+            filled += 1
+    assert filled, (
+        f"{pod['metadata']['name']} carried no unsubstituted workspace subPath, so it "
+        "is about to mount whichever pod's subtree was filled in before it -- the one "
+        "sharing failure this function exists to prevent"
+    )
+
+
 def _probe_pod(
     name: str, *, image: str, namespace: str = _NAMESPACE, probe: str = PROBE
 ) -> dict[str, Any]:
@@ -333,6 +435,7 @@ def _probe_pod(
     pod: dict[str, Any] = copy.deepcopy(yaml.safe_load(_MANIFEST.read_text()))
     pod["metadata"]["name"] = name
     pod["metadata"]["namespace"] = namespace
+    _give_it_a_workspace_of_its_own(pod, name)
     pod["spec"].pop("subdomain", None)
     pod["spec"]["containers"] = [
         container
@@ -362,7 +465,6 @@ def _probe_pod(
 
 def _without_the_scratch_mount(pod: dict[str, Any]) -> dict[str, Any]:
     mutant = copy.deepcopy(pod)
-    mutant["metadata"]["name"] += "-no-scratch"
     removed = {
         mount["name"]
         for container in mutant["spec"]["containers"]
@@ -391,20 +493,36 @@ def _without_the_dot_path_mkdir(pod: dict[str, Any]) -> dict[str, Any]:
     nothing, and the alternative -- a filter that also strips prose -- would make
     the count below depend on how the manifest is worded rather than on what it
     does.
+
+    **Folded into logical lines before anything is filtered.** Every fallible step in
+    that body is a `cmd \\` continued by an `|| fail "..."`, and two of those messages
+    quote the very paths this strips by. A filter working one physical line at a time
+    therefore drops the command and leaves its `|| fail` behind with nothing in front
+    of it, which is a shell syntax error rather than a mutant -- the pod would refuse
+    for the wrong reason and the case would report a pass it did not earn.
     """
     mutant = copy.deepcopy(pod)
-    mutant["metadata"]["name"] += "-no-targets"
     script = mutant["spec"]["initContainers"][0]["args"][0]
     dot_paths = ("/session/workspace/.agents", "/session/workspace/.codex")
-    kept = [
-        line
-        for line in script.splitlines()
-        if line.strip().startswith("#") or not any(path in line for path in dot_paths)
+
+    logical: list[list[str]] = []
+    for line in script.splitlines():
+        if logical and logical[-1][-1].rstrip().endswith("\\"):
+            logical[-1].append(line)
+        else:
+            logical.append([line])
+
+    kept_lines = [
+        group
+        for group in logical
+        if group[0].strip().startswith("#")
+        or not any(path in "\n".join(group) for path in dot_paths)
     ]
-    assert len(kept) == len(script.splitlines()) - 3, (
-        "expected exactly three executable lines naming the two dot-paths -- one mkdir "
-        f"and two `test -d` -- and removed {len(script.splitlines()) - len(kept)}"
+    assert len(kept_lines) == len(logical) - 3, (
+        "expected exactly three executable statements naming the two dot-paths -- one "
+        f"mkdir and two `test -d` -- and removed {len(logical) - len(kept_lines)}"
     )
+    kept = [line for group in kept_lines for line in group]
     mutant["spec"]["initContainers"][0]["args"][0] = "\n".join(kept) + "\n"
     return mutant
 
@@ -482,16 +600,20 @@ def transcripts() -> Iterator[dict[str, str]]:
     compiled = _compiled(image)
     _kubectl("create", "namespace", _NAMESPACE)
     try:
+        make_the_workspace_volume(_NAMESPACE)
         _secret("map-session-compiled-config", {"config.toml": compiled.config_toml})
         _secret(
             "map-session-requirements",
             {"requirements.toml": compiled.requirements_toml},
         )
-        real = _probe_pod("targets", image=image)
         pods = {
-            "real": real,
-            "no-scratch": _without_the_scratch_mount(real),
-            "no-targets": _without_the_dot_path_mkdir(real),
+            "real": _probe_pod("targets", image=image),
+            "no-scratch": _without_the_scratch_mount(
+                _probe_pod("targets-no-scratch", image=image)
+            ),
+            "no-targets": _without_the_dot_path_mkdir(
+                _probe_pod("targets-no-targets", image=image)
+            ),
         }
         for pod in pods.values():
             _kubectl("apply", "-n", _NAMESPACE, "-f", "-", stdin=yaml.safe_dump(pod))
@@ -500,6 +622,7 @@ def transcripts() -> Iterator[dict[str, str]]:
         }
     finally:
         _kubectl("delete", "namespace", _NAMESPACE, "--ignore-not-found", check=False)
+        drop_the_workspace_volume(_NAMESPACE)
 
 
 def _phases(transcript: str) -> tuple[str, str]:

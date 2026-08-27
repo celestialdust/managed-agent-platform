@@ -46,6 +46,7 @@ import asyncio
 import hashlib
 import hmac
 import os
+import ssl
 import stat
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
@@ -55,11 +56,12 @@ from typing import Annotated, BinaryIO, Final, Literal, get_args
 from urllib.parse import quote
 from uuid import UUID
 
+import uvicorn
 from fastapi import APIRouter, FastAPI, Header, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from managed_agent.control.files.output_shipout import OUTPUT_COUNT_LIMIT
+from managed_agent.control.files.output_shipout import OUTPUT_TREE_LIMIT
 from managed_agent.control.pod_config.compiler import PROFILE_NAME, WORKSPACE_ROOT
 from managed_agent.core.errors import STATUS_FOR, ErrorCode, ErrorEnvelope
 from managed_agent.core.ids import Seq, SessionId, TurnId
@@ -71,7 +73,6 @@ from managed_agent.core.pod.workspace_contract import (
     INPUT_DIR_NAME,
     OUTPUT_DIR_NAME,
     is_a_produced_path,
-    is_a_synced_path,
 )
 from managed_agent.core.vfs.session_vfs import (
     MAX_RELATIVE_LEN,
@@ -84,6 +85,41 @@ from managed_agent.session_shim.turn_complete import (
     find_rollout,
 )
 from managed_agent.session_shim.turn_runner import run_turn
+
+SHIM_BIND_HOST: Final = "0.0.0.0"  # noqa: S104
+"""Every interface, which is what a pod addressed through a headless Service needs.
+
+Bound wide and reachable narrowly: the pod's own NetworkPolicy is what decides who may
+open a connection here.
+"""
+
+PROBE_BIND_HOST: Final = "0.0.0.0"  # noqa: S104
+"""Every interface, because **a kubelet `httpGet` probe dials the pod IP**.
+
+This said `127.0.0.1` for exactly one commit, with a docstring asserting that the
+kubelet probes over the pod's own loopback. It does not: `HTTPGetAction.host` defaults
+to the pod's IP address, and the kubelet runs in the node's network namespace, so a
+listener bound to this container's loopback has no route from it at all. Every Session
+pod would have failed its probe for ever, stayed out of the headless Service's
+endpoints, and left every Turn undeliverable while `kubectl get pod` read `2/2 Running`
+-- which is the *same* outage the separate probe port was created to prevent, moved one
+layer down from the port to the bind address.
+
+**Binding wide does not put this port on the pod network.** `session-pod`'s
+NetworkPolicy admits one thing -- the control plane, on 8081 -- so no pod can open 8082
+here, while the node's own probe traffic reaches it because the CNI exempts the node
+from policy so that probes can work at all. The reachability this port needs and the
+reachability it must not have are decided in two different places, and this one is not
+where either is decided.
+"""
+
+PROBE_PORT: Final = 8082
+"""Where the readiness-only listener answers, beside the Session port.
+
+A second port and not a second route on the first, because the first requires a client
+certificate once this pod has one and the kubelet presents none. Named here so the
+manifest test can compare the probe against it rather than against a literal.
+"""
 
 SHIM_PORT: Final = 8081
 """The port the shim container publishes and the control plane dials.
@@ -155,39 +191,6 @@ def output_path_for(session_id: SessionId, relative: str) -> str:
     )
 
 
-WORKSPACE_ROUTE: Final = "/session/{session_id}/workspace"
-"""Where the whole working tree is listed, for the sync into the `working` lane.
-
-The outputs pair above answers "what did the agent produce"; this answers "what does the
-agent's workspace hold". They are different questions with different rules -- `out/` is
-excluded here and is the whole of what is included there -- so they are different routes
-rather than one route with a flag, which would be one handler whose two halves share
-nothing but a path.
-"""
-
-WORKSPACE_FILE_ROUTE: Final = "/session/{session_id}/workspace/{name:path}"
-"""Where one file of the working tree is read from. The read counterpart above.
-
-Read-only, like the outputs routes and unlike `FILE_ROUTE`. Restoring a working tree
-into a pod would need a WRITE mount of the workspace root, and this container mounts the
-workspace `subPath: files` on purpose -- see `WORKSPACE_FILES`. So the lane is written
-from the pod and is not yet read back into one; `control/files/workspace_sync.py` says
-what that costs and what would have to change.
-"""
-
-
-def workspace_path_for(session_id: SessionId, relative: str) -> str:
-    """The read URL for one working file, built without `str.format`.
-
-    `{name:path}` is a Starlette converter and `str.format` reads `path` as a format
-    spec, so formatting this template raises `ValueError`. Encoded with `/` left safe,
-    for the reason `output_path_for` gives: the separators are the path's structure.
-    """
-    return WORKSPACE_FILE_ROUTE.replace("{session_id}", str(session_id)).replace(
-        "{name:path}", quote(relative, safe="/")
-    )
-
-
 FILE_ROUTE: Final = "/session/{session_id}/files/{name}"
 """Where the control plane places one of this Session's attached files.
 
@@ -203,14 +206,20 @@ can echo what the caller claimed instead of disclosing which Session this pod ru
 WORKSPACE_FILES: Final = Path(WORKSPACE_ROOT) / INPUT_DIR_NAME
 """The one directory this process may write into, and it is enforced by the mount.
 
-This container mounts the workspace volume with `subPath: files`, so the directory below
-is the whole of what it can reach -- not a convention this code keeps, but the only path
-that exists for it. That matters because this is the pod's outward-facing process: a
-mount of the whole workspace would let whatever reaches this port write anything the
-agent later reads, including over a file the agent itself produced.
+This container mounts the workspace volume with a `subPath` ending at `files`, so the
+directory below is the whole of what it can reach -- not a convention this code keeps,
+but the only path that exists for it. That matters because this is the pod's
+outward-facing process: a mount reaching the whole of the Session's workspace would let
+whatever reaches this port write anything the agent later reads, including over a file
+the agent itself produced.
+
+The segments above `files` in that `subPath` are this Session's subtree of a volume
+every Session on the cluster shares (ADR-035); the pod runner fills them in per Session.
+They are what keeps one tenant out of another's workspace, and they are invisible from
+in here -- the kubelet resolves them, so the path below is all this process ever sees.
 
 The same absolute path is what the runtime container sees, because that container mounts
-the volume whole at `/session/workspace`. One string for both ends;
+the same subtree whole at `/session/workspace`. One string for both ends;
 `tests/deploy/test_session_pod_runs_a_shim.py` compares it against the manifest, which
 cannot import it.
 """
@@ -218,24 +227,45 @@ cannot import it.
 WORKSPACE_READ_ROOT: Final = Path("/session/produced")
 """Where this container sees the whole workspace, read-only, to ship out what it holds.
 
-A **second** mount of the workspace volume, beside the read-write `subPath: files` one
-above, and the narrowing on that one is untouched. This container is the pod's only
-outward-facing process and the reason the write mount is narrowed is that a caller
-holding the shim token must not be able to write over what the agent produced. Reading
-what the agent produced is the whole of this feature, so the read has to be widened and
-the write does not -- and `readOnly: true` here is what keeps those two facts separate
-in the manifest rather than in a convention this code keeps.
+A **second** mount of the workspace volume, beside the read-write one narrowed to
+`files` above, and that narrowing is untouched. This one stops at the Session's own
+subtree: read-only over what this Session produced, and no reach past that subtree. This
+container is the pod's only outward-facing process and the reason the write mount is
+narrowed is that a caller holding the shim token must not be able to write over what the
+agent produced. Reading what the agent produced is the whole of this feature, so the
+read has to be widened and the write does not -- and `readOnly: true` here is what keeps
+those two facts separate in the manifest rather than in a convention this code keeps.
 
 A different path rather than the workspace's own, unlike `WORKSPACE_FILES`. That
 constant is one string for both containers because the shim writes a file the *agent*
 must then open, so the two have to agree on where it is. Nothing the agent does depends
 on this path: what leaves here is a bare leaf name and bytes, and no agent-visible path
-is ever built from either. Mounting the volume a second time at `/session/workspace`
+is ever built from either. Mounting the subtree a second time at `/session/workspace`
 would nest inside the read-write mount and leave the result depending on the order
 kubelet applies them.
 
 `tests/deploy/test_session_pod_runs_a_shim.py` compares this against the manifest,
 which cannot import it.
+"""
+
+SHIM_TLS_DIRECTORY: Final = Path("/etc/map/shim")
+"""The mount the control plane writes this pod's identity into.
+
+Both the bearer token and the TLS material land here, in one volume mounted into this
+container alone. Named separately from the token path below because the three TLS files
+are optional in a way the token is not: a pod placed by a control plane that holds no CA
+gets the token and nothing else, and must serve exactly as it did before certificates
+existed (ADR-044).
+"""
+
+SHIM_CERTIFICATE_PATH: Final = SHIM_TLS_DIRECTORY / "tls.crt"
+SHIM_PRIVATE_KEY_PATH: Final = SHIM_TLS_DIRECTORY / "tls.key"
+SHIM_TRUST_BUNDLE_PATH: Final = SHIM_TLS_DIRECTORY / "ca.crt"
+"""The three TLS files, under the names every TLS implementation calls them.
+
+Read at start-up rather than per connection: a certificate that changed under a running
+pod would be a pod whose identity moved mid-Turn, and there is nothing to reload for --
+a pod is leased for one Turn and its certificate outlives it by days.
 """
 
 SHIM_TOKEN_PATH: Final = Path("/etc/map/shim/token")
@@ -278,6 +308,7 @@ ShimEventType = Literal[
     "tool.called",
     "thread.started",
     "tool.server_unavailable",
+    "turn.progress",
 ]
 """The only event types the pod may put on the wire, spelled out rather than imported.
 
@@ -331,6 +362,21 @@ that really crossed it, and it keeps no such record today.
     view of whether anything ever connected, and it names no other tenant and plants no
     idempotency key. The alternative -- withholding it -- leaves the unhonoured grant
     invisible, which is the failure this type exists to end.
+
+`turn.progress` is the fourth outsider by origin though not by family, and the only
+    member here caused by a clock rather than by the runtime saying something. The pod
+    is once again the only process that can see the thing: whether the shim's own loop
+    is still running is invisible from outside the pod, because a wedged shim and a
+    busy runtime produce identical silence on this wire.
+
+    **Its damage runs further than the three above, and is the reason to be careful.**
+    A compromised pod can report progress it is not making, and so persuade a reader
+    that a Turn doing nothing is a Turn working. Anything that acts on this type must
+    therefore keep a bound that does not depend on it -- `TURN_CEILING_MS` in
+    `control/session/abandoned_turns.py` is that bound, it is enforced from outside the
+    pod, and no forged report can extend it. Stated here because the temptation with a
+    liveness signal is to let it postpone a deadline, and a deadline the suspect can
+    postpone is not a deadline.
 """
 
 SHIM_EVENT_TYPES: Final[frozenset[str]] = frozenset(get_args(ShimEventType))
@@ -415,12 +461,18 @@ class ProducedFileEntry(BaseModel):
 
 
 class ProducedFiles(BaseModel):
-    """Everything the agent produced, or the first `OUTPUT_COUNT_LIMIT` + 1 of it.
+    """Everything the agent produced, or the first `OUTPUT_TREE_LIMIT` + 1 of it.
 
     `files` may hold one entry more than the limit, and that extra entry is the signal
-    rather than a payload: it says the workspace holds more than the far end will take,
-    without this process having listed a directory of unknown size to find out how many
-    more. The far end refuses on it; nothing here decides what "too many" costs.
+    rather than a payload: it says the tree holds more than this process will enumerate,
+    without it having read a directory of unknown size to find out how many more.
+
+    **The bound here is the enumeration bound, not the transfer bound.** The far end
+    ships far fewer files than this in one Turn, and decides which by weighing what it
+    has already delivered out of what this reports -- a filter it can apply only to
+    paths this listing actually carried. Truncating here at what one Turn transfers is
+    what made that bound accumulate over a Session's life. Nothing here decides what
+    "too many" costs.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -691,7 +743,7 @@ async def list_the_outputs(
     that a deliverable is always a single file. The workspace root is the fallback when
     `out/` holds nothing, and the fallback does NOT descend: without the convention
     there is no way to tell a project tree from a set of documents, and walking one is
-    the unbounded transfer `OUTPUT_COUNT_LIMIT` exists to prevent.
+    the unbounded transfer `OUTPUT_TREE_LIMIT` exists to prevent.
 
     Two things are left out either way. Anything that is not a regular file -- a socket,
     a fifo, a dangling symlink -- has no bytes to ship. And a path `is_a_produced_path`
@@ -709,76 +761,6 @@ async def list_the_outputs(
     if session_id != served.session_id:
         return _refuse_without_saying_which(session_id)
     return JSONResponse(content=_produced_files().model_dump(mode="json"))
-
-
-@router.get(WORKSPACE_ROUTE)
-async def list_the_workspace(
-    session_id: SessionId,
-    request: Request,
-    authorization: Annotated[str | None, Header()] = None,
-) -> Response:
-    """The agent's whole working tree, by path, length and digest.
-
-    The same two authorisation checks as every other route here, in the same order.
-
-    **Everything the outputs listing excludes on purpose is included here, and that is
-    the point of having two.** A working file IS the scratch -- a half-written script,
-    a cache under `src/.cache/`, the project tree -- and the reason to keep it is that
-    the agent will want it back. What is excluded is `NOT_SYNCED`: the tenant's own
-    uploads, the deliverables that go to the other lane, and an installed dependency
-    tree that is rebuildable by definition.
-
-    A dotfile at the workspace *root* is excluded too, and by the lane grammar rather
-    than by that list -- it composes to no key, so `.gitignore` is absent here. That is
-    a known gap. `.codex/` is absent for the same mechanical reason and is not a loss:
-    the runtime keeps its conversation and tool state under `CODEX_HOME`, on a volume
-    outside the workspace, and ships it out by `ROLLOUT_ROUTE` rather than any lane.
-
-    The digest on every entry is what makes the far end's diff possible: it uploads only
-    the paths whose bytes differ from what the lane already holds, so a Session whose
-    workspace did not change costs one listing and no transfer at all.
-    """
-    served = _served_from_request(request)
-    if not _presented_this_sessions_token(authorization, served):
-        return _refuse_without_saying_which(session_id)
-    if session_id != served.session_id:
-        return _refuse_without_saying_which(session_id)
-    return JSONResponse(content=_workspace_files().model_dump(mode="json"))
-
-
-@router.get(WORKSPACE_FILE_ROUTE)
-async def read_a_workspace_file(
-    session_id: SessionId,
-    name: str,
-    request: Request,
-    authorization: Annotated[str | None, Header()] = None,
-) -> Response:
-    """One working file's bytes, or 204 if nothing is there now.
-
-    The outputs read route with the other predicate and no shipping prefix: the working
-    lane is the workspace root, so the path is relative to the root itself.
-
-    204 rather than 404 for a vanished path, matching the outputs route, and for the
-    same reason: a file the listing named a moment ago and the agent has since removed
-    is not an error, and the far end skips it rather than failing the Turn over it.
-    """
-    served = _served_from_request(request)
-    if not _presented_this_sessions_token(authorization, served):
-        return _refuse_without_saying_which(session_id)
-    if session_id != served.session_id:
-        return _refuse_without_saying_which(session_id)
-    if not is_a_synced_path(name):
-        return _refuse(
-            ErrorCode.REQUEST_INVALID,
-            "a working file's path must be relative and outside the reserved roots",
-        )
-    handle = _opened_without_following(name)
-    if handle is None:
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
-    return StreamingResponse(
-        _produced_prefix(handle, os.fstat(handle.fileno()).st_size),
-        media_type="application/octet-stream",
-    )
 
 
 @router.get(OUTPUT_ROUTE)
@@ -856,6 +838,26 @@ async def place_a_file(
     half-written document from a whole one, and would summarise the half. A rename
     within one directory is atomic, so the name either does not exist or holds it all.
 
+    **A name the workspace already holds is left exactly as it is.** This route is how
+    every attached file reaches the workspace, and since ADR-041 it runs at every Turn
+    rather than once per Session: a pod is leased for one Turn, so every Turn is a
+    placement and every placement re-pushes the Session's whole attachment set. The
+    workspace outlives the pod (ADR-035), so on the second Turn those bytes land on a
+    file the agent may have spent the first Turn editing -- and `replace` is
+    unconditional, so the edit went silently, with the tenant told nothing and the log
+    recording a Turn that succeeded.
+
+    Skipping is what makes re-delivery harmless rather than destructive, and it costs
+    nothing the caller wanted: the control plane pushes to guarantee the document is
+    *there* when the agent starts, and a file already there satisfies that. A tenant
+    attaching the same name twice is refused upstream at
+    `control/api/routes/resources.py` under its own code, so nothing that reaches here
+    is a deliberate overwrite being denied.
+
+    Checked with `exists` rather than `is_file`, so a name the agent turned into a
+    directory is also left alone -- writing over it would fail at the rename anyway,
+    and answering 500 for it would fail the Turn over the agent's own doing.
+
     204, not 201: there is nothing to return and no location to name that the caller did
     not just choose.
     """
@@ -870,6 +872,8 @@ async def place_a_file(
         )
     WORKSPACE_FILES.mkdir(parents=True, exist_ok=True)
     final = WORKSPACE_FILES / name
+    if final.exists():
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
     partial = WORKSPACE_FILES / f".{name}.partial"
     try:
         with partial.open("wb") as sink:
@@ -963,21 +967,6 @@ def _not_a_dotted_directory(relative: str) -> bool:
     return not relative.rsplit("/", 1)[-1].startswith(".")
 
 
-def _worth_entering_for_the_working_lane(relative: str) -> bool:
-    """Whether the working walk should enter this directory.
-
-    Only the three `NOT_SYNCED` roots are skipped, and only at the workspace root: a
-    directory named `out` one level down is the agent's own. A dotted directory below
-    the first segment is entered -- unlike the produced walk, which refuses one at any
-    depth -- because the agent's tree is the thing being kept rather than filtered.
-
-    A dotted directory AT the root is not entered, and that is `is_a_synced_path`
-    deferring to the lane grammar rather than a choice made here. See its docstring:
-    the cost is `.codex/`, and it is recorded there rather than restated.
-    """
-    return is_a_synced_path(relative)
-
-
 _DIGEST_BLOCK: Final = 1 << 20
 """How much of a file is held in memory at once while hashing it.
 
@@ -1013,12 +1002,12 @@ def _collect_produced(
     has to agree with the far end. `enter` decides whether a directory can hold anything
     `keep` would accept -- an optimisation and never a correctness boundary, so a wrong
     `enter` costs a walk and cannot admit a file `keep` refuses. That split is what lets
-    the produced walk skip `.map/lib` without opening it while the working walk descends
-    into `src/.cache/`, whose files it keeps. Neither walk enters a dotted directory at
-    the workspace root: `_worth_entering_for_the_working_lane` IS `is_a_synced_path`,
-    which parses through the lane grammar, and a leading dot composes to no key.
+    this walk skip `.map/lib` without opening it rather than opening it and refusing
+    every file inside. The default pair is the produced one, and it is now the only
+    pair: a second walk carried the WHOLE working tree out at every completed Turn, and
+    a workspace on a mounted volume needs no carrying (ADR-035).
 
-    **The scan stops at `OUTPUT_COUNT_LIMIT` + 1 entries rather than reading the whole
+    **The scan stops at `OUTPUT_TREE_LIMIT` + 1 entries rather than reading the whole
     tree and truncating.** Reading it all would make this process's memory a function of
     how many files the agent chose to create, which is the one thing about the workspace
     nothing bounds -- an `emptyDir` `sizeLimit` bounds bytes, not inodes. The cost is
@@ -1030,7 +1019,7 @@ def _collect_produced(
     produced, so a tree there is a deliverable with its parts and walking it is what
     delivers `report/fig1.png`. At the root nothing has been said: descending there
     would walk `files/` and hand the tenant their own uploads back, walk the runtime's
-    directories, and turn the fallback into the unbounded transfer `OUTPUT_COUNT_LIMIT`
+    directories, and turn the fallback into the unbounded transfer `OUTPUT_TREE_LIMIT`
     exists to prevent. The fallback stays exactly as flat as it has always been.
 
     `follow_symlinks=False` at every test is not tidiness. A symlink the agent placed
@@ -1041,7 +1030,7 @@ def _collect_produced(
     """
     with os.scandir(directory) as scan:
         for entry in scan:
-            if len(found) > OUTPUT_COUNT_LIMIT:
+            if len(found) > OUTPUT_TREE_LIMIT:
                 return
             relative = prefix + entry.name
             if len(relative) >= MAX_RELATIVE_LEN:
@@ -1101,35 +1090,6 @@ def _digest_of(path: str) -> str | None:
     except OSError:
         return None
     return digest.hexdigest()
-
-
-def _workspace_files() -> ProducedFiles:
-    """The agent's working tree, by workspace-relative path, length and digest.
-
-    The same walk the produced listing uses, with the other pair of predicates and no
-    shipping prefix: the working lane IS the workspace root, so a path here is relative
-    to the root itself rather than to a directory below it.
-
-    Bounded by the same `OUTPUT_COUNT_LIMIT` + 1 signal, so the far end learns "more
-    than will be taken" without this process counting an unbounded tree. What the far
-    end does with that differs -- a workspace over the limit is synced in part rather
-    than refused -- and that is `control/files/workspace_sync.py`'s call, not this
-    route's.
-    """
-    found: list[ProducedFileEntry] = []
-    try:
-        _collect_produced(
-            found,
-            WORKSPACE_READ_ROOT,
-            "",
-            True,
-            1,
-            is_a_synced_path,
-            _worth_entering_for_the_working_lane,
-        )
-    except OSError:
-        return ProducedFiles()
-    return ProducedFiles(files=tuple(sorted(found, key=lambda e: e.name)))
 
 
 def _produced_files() -> ProducedFiles:
@@ -1346,13 +1306,14 @@ async def open_the_thread(connection: RuntimeConnection) -> str:
     """Continue this Session's conversation, or open its first one. Returns the id.
 
     **Which of the two happens is decided by one fact: whether a Rollout is on disk.**
-    The `seed-rollout` init container puts one there when this Session has completed a
-    Turn, and refuses to let the pod start when it should have and could not -- so by
-    the time this runs, a file present means "continue this" and a file absent means
-    "this Session has never run". Reading the environment for a second opinion would be
-    a second answer to a settled question, and the way those two disagree is a shim
-    that opens a fresh thread over a seeded record: the history the Rollout's compaction
-    checkpoints folded gets replayed, the tenant is billed for it, and the Turn reports
+    The `seed-runtime-home` init container puts one there when this Session has
+    completed a Turn, and refuses to let the pod start when it should have and could
+    not -- so by the time this runs, a file present means "continue this" and a file
+    absent means "this Session has never run". Reading the environment for a second
+    opinion would be a second answer to a settled question, and the way those two
+    disagree is a shim that opens a fresh thread over a seeded record: the history the
+    Rollout's compaction checkpoints folded gets replayed, the tenant is billed for it,
+    and the Turn reports
     success (ADR-004).
 
     The thread id sent alongside the path comes out of the record's own `session_meta`,
@@ -1426,10 +1387,166 @@ def build_shim_app() -> FastAPI:
             connection=connection,
             token=SHIM_TOKEN_PATH.read_text().strip(),
         )
+        # The readiness listener answers from this, and it is set here rather than
+        # there so the two apps report one pod's readiness from one assignment. The
+        # kubelet talks to the app that does not hold the connection, so without this
+        # the pod would never be reported ready and would never enter DNS.
+        _READINESS.served = app.state.served
         try:
             yield
         finally:
+            _READINESS.served = None
             await connection.close()
 
     app.router.lifespan_context = _open_the_session
     return app
+
+
+def tls_settings_for_this_pod() -> dict[str, object]:
+    """The uvicorn TLS arguments this pod's mount justifies, or none at all.
+
+    Three files present means serve mTLS: this pod's certificate and key, and the CA
+    that must have signed whatever connects to it. `CERT_REQUIRED` is the half that
+    makes the bundle a control rather than decoration -- loading a CA and then accepting
+    connections that present no certificate verifies nothing, and is the ordinary way an
+    mTLS configuration turns out to have been one-way all along.
+
+    No files means plain HTTP, and that is a supported state rather than a degraded one:
+    it is what every pod placed by a control plane with no CA gets, and the platform ran
+    that way before certificates existed.
+
+    **A partial mount is refused rather than downgraded.** Two of three files present is
+    a control plane that meant to give this pod an identity, and quietly serving plain
+    HTTP instead would leave the control plane dialling `https://` against a listener
+    that does not speak it -- a whole fleet failing to dispatch, for a reason no log
+    line here would carry. Refusing means this pod does not start, which the placement
+    path already reports as a runtime that did not come up.
+    """
+    present = [
+        path
+        for path in (
+            SHIM_CERTIFICATE_PATH,
+            SHIM_PRIVATE_KEY_PATH,
+            SHIM_TRUST_BUNDLE_PATH,
+        )
+        if path.exists()
+    ]
+    if not present:
+        return {}
+    if len(present) != 3:
+        raise RuntimeError(
+            f"{SHIM_TLS_DIRECTORY} holds a partial TLS mount "
+            f"({', '.join(path.name for path in present)}): a Session pod serves TLS "
+            "with all three files or plain HTTP with none, because the control plane "
+            "chooses the scheme from the same material and would dial the wrong one."
+        )
+    return {
+        "ssl_certfile": str(SHIM_CERTIFICATE_PATH),
+        "ssl_keyfile": str(SHIM_PRIVATE_KEY_PATH),
+        "ssl_ca_certs": str(SHIM_TRUST_BUNDLE_PATH),
+        "ssl_cert_reqs": ssl.CERT_REQUIRED,
+    }
+
+
+def build_probe_app() -> FastAPI:
+    """A readiness-only app, for the kubelet to reach over plain HTTP on loopback.
+
+    It exists because of a collision between two correct things. The Session port
+    requires a client certificate once this pod has one, and a kubelet `httpGet` probe
+    presents none -- so the probe would be refused at the handshake, the pod would never
+    become Ready, and it would therefore never enter DNS. That is the exact shape of
+    failure this repository has already paid for once: a pod at `2/2 Running` with a
+    healthy shim that no Turn could reach.
+
+    Downgrading the port to accept certificateless connections would have made the
+    trust bundle decoration, and a `tcpSocket` probe would report a pod ready before its
+    runtime connection exists, which is what the readiness route is there to prove. A
+    second listener costs neither.
+
+    Bound to loopback by the caller, so the only processes that can reach it are the
+    ones already inside this pod's network namespace -- the kubelet, and the runtime
+    container, which can reach the Session port today anyway. It carries the readiness
+    route and nothing else, so what it exposes is a 204 or a 503.
+    """
+    app = FastAPI(title="Managed Agent Session-shim readiness", version="v1")
+
+    @app.get(READY_ROUTE, status_code=status.HTTP_204_NO_CONTENT)
+    async def _ready() -> Response:
+        """204 once the runtime connection is open, 503 until then.
+
+        Reads the same `app.state.served` the Session app sets, through the module-level
+        holder below, so the two apps cannot answer differently about one pod.
+        """
+        if _READINESS.served is None:
+            return Response(status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    return app
+
+
+@dataclass
+class _Readiness:
+    """Whether this pod's runtime connection is open, shared between the two apps.
+
+    Mutable module state, which nothing else here is, and the reason is that the two
+    apps are two `FastAPI` objects with separate `state` and the kubelet talks to the
+    one that does not hold the connection. A second source of truth for "is this pod
+    ready" would eventually disagree with the first, and the disagreement would present
+    as a pod flapping in and out of DNS.
+    """
+
+    served: ServedSession | None = None
+
+
+_READINESS = _Readiness()
+
+
+def serve() -> None:
+    """The pod's entry point: `python -m managed_agent.session_shim.serve`.
+
+    A module rather than the bare `uvicorn` command the manifest used to name, because
+    whether this pod serves TLS is decided by what is on its mount, and a manifest can
+    only name flags unconditionally. Naming `--ssl-certfile` there would make every pod
+    placed without CA material fail to start on a missing file.
+
+    Two listeners, always both: the Session port on every interface with whatever TLS
+    this pod's mount justifies, and a readiness-only port on loopback in plain HTTP for
+    the kubelet. Run unconditionally rather than only under TLS, so a pod's probe path
+    is the same in both configurations -- a probe that moved with the certificate would
+    be a second thing to get right on the day the certificates arrive.
+    """
+    asyncio.run(_serve_both())
+
+
+async def _serve_both() -> None:
+    """Run the Session listener and the readiness listener until either stops.
+
+    `return_exceptions=False` by omission: if either server dies the gather raises, the
+    process exits, and `restartPolicy: Never` turns that into a pod the placement path
+    reports as a runtime that did not come up. A shim serving one of its two ports is
+    not a state worth staying alive in -- with the Session port gone no Turn arrives,
+    and with the readiness port gone the pod leaves DNS anyway.
+    """
+    session_port = uvicorn.Server(
+        uvicorn.Config(
+            "managed_agent.session_shim.serve:build_shim_app",
+            factory=True,
+            host=SHIM_BIND_HOST,
+            port=SHIM_PORT,
+            **tls_settings_for_this_pod(),  # type: ignore[arg-type]
+        )
+    )
+    probe_port = uvicorn.Server(
+        uvicorn.Config(
+            "managed_agent.session_shim.serve:build_probe_app",
+            factory=True,
+            host=PROBE_BIND_HOST,
+            port=PROBE_PORT,
+            log_level="warning",
+        )
+    )
+    await asyncio.gather(session_port.serve(), probe_port.serve())
+
+
+if __name__ == "__main__":
+    serve()

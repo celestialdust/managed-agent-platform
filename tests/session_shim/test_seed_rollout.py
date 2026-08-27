@@ -36,14 +36,18 @@ from starlette.routing import Route
 
 from managed_agent.core.session.session_token import SESSION_TOKEN_HEADER_NAME
 from managed_agent.session_shim import seed_rollout
-from managed_agent.session_shim.restore_working_lane import Emit, RestoreRefused
 from managed_agent.session_shim.seed_rollout import (
     _SEED_BUDGET_BYTES,
     RESUMING_ENV,
     SEED_ROUTE,
+    Emit,
+    GatewayBinding,
+    RestoreRefused,
+    client_for,
     find_seeded,
     is_resuming,
     main,
+    read_binding,
     run,
     seed,
     seeded_path,
@@ -201,6 +205,63 @@ def test_bytes_that_are_not_a_resumable_record_refuse_here(body: bytes) -> None:
     would trade a clear refusal for an obscure one."""
     with pytest.raises(RestoreRefused):
         thread_id_in(body)
+
+
+_A_PATH_FRAGMENT: Final = [
+    "a/../../../../../../../session/workspace/.codex/seeded",
+    "../../../../etc/map/compiled/config",
+    "a/b",
+    "/absolute",
+    ".",
+    "..",
+    "id with spaces",
+    "x" * 129,
+]
+
+
+@pytest.mark.parametrize("hostile", _A_PATH_FRAGMENT)
+def test_a_thread_id_that_is_a_path_fragment_is_refused(hostile: str) -> None:
+    """The id names the FILE the Rollout is written to, so its shape is a path question.
+
+    `seeded_path` interpolates this value into a filename and `pathlib` splits an
+    embedded `/` into components while normalising no `..` among them, so an id like
+    the first case above composes a write outside `CODEX_HOME` -- and, since the two
+    init containers were merged, one that lands in the mounted workspace that outlives
+    the pod rather than in scratch that dies with it.
+
+    This value is not the pod's own. It is read off the first line of a body the Tool
+    Gateway returned, so a compromised gateway, a tampered stored object or a position
+    on the in-cluster hop chooses it. The confined agent cannot forge it directly --
+    `CODEX_HOME` is a DENY path in its sandbox -- and that is a second control rather
+    than a reason not to have this one.
+    """
+    body = json.dumps({"type": "session_meta", "payload": {"id": hostile}}).encode()
+
+    with pytest.raises(RestoreRefused):
+        thread_id_in(body + b"\n")
+
+
+@pytest.mark.parametrize("hostile", _A_PATH_FRAGMENT)
+def test_no_thread_id_steers_the_seed_out_of_the_runtime_home(
+    tmp_path: Path, hostile: str
+) -> None:
+    """Stated against the writer, because refusing in the parser is a means and not the
+    property. What has to be true is that nothing this module writes lands outside the
+    root it was given, whatever the body says -- so this asserts on the filesystem after
+    the call rather than on the exception before it."""
+    root = tmp_path / "codex"
+    root.mkdir()
+    outside = tmp_path / "witness"
+    outside.mkdir()
+    body = json.dumps({"type": "session_meta", "payload": {"id": hostile}}).encode()
+
+    with pytest.raises(RestoreRefused):
+        write_seed(root, body + b"\n", datetime(2026, 8, 26, tzinfo=UTC), report=print)
+
+    assert list(outside.iterdir()) == [], "a seed was written outside the runtime home"
+    assert not any(entry.is_file() for entry in root.rglob("*")), (
+        "a refused seed still put a file under the runtime home"
+    )
 
 
 def test_the_id_is_read_off_a_record_whose_tail_does_not_parse(tmp_path: Path) -> None:
@@ -458,6 +519,66 @@ async def test_a_gateway_that_is_not_there_takes_the_pod_down(tmp_path: Path) ->
     async with httpx.AsyncClient(base_url=NOWHERE) as client:
         with pytest.raises(RestoreRefused, match="did not answer"):
             await seed(client, tmp_path, True, report=say)
+
+
+def test_the_binding_is_read_out_of_the_document_the_compiler_writes() -> None:
+    """Both halves out of one `mcp_servers` entry, so a URL and a token cannot come
+    from different Sessions. The base drops the MCP path because the seed route is a
+    sibling of that endpoint rather than a child of it."""
+    document = _compiled(url="http://tool-gateway.map-dev.svc.cluster.local/mcp")
+
+    binding = read_binding(document)
+
+    assert binding == GatewayBinding(
+        base_url="http://tool-gateway.map-dev.svc.cluster.local",
+        token=TOKEN,
+    )
+
+
+@pytest.mark.parametrize(
+    "authority",
+    ["operator:hunter2@tool-gateway", "operator@tool-gateway", ":secret@tool-gateway"],
+)
+def test_a_gateway_url_that_embeds_credentials_is_refused(authority: str) -> None:
+    """Refused rather than stripped, because of where the composed base ends up.
+
+    An unreachable Gateway's refusal names the address it dialed, and that refusal is
+    promoted into the pod's status by `terminationMessagePolicy: FallbackToLogsOnError`
+    -- so a `user:pass@` surviving into the base would be a credential printed for every
+    reader of the pod. Refusing here is what makes the address safe to print at all,
+    which is why this test and the one naming the address are two halves of one
+    property.
+    """
+    document = _compiled(url=f"http://{authority}/mcp")
+
+    with pytest.raises(RestoreRefused) as refusal:
+        read_binding(document)
+
+    assert "credentials" in str(refusal.value)
+    assert "hunter2" not in str(refusal.value)
+    assert "secret" not in str(refusal.value)
+
+
+async def test_the_client_presents_the_token_as_a_header_and_not_in_the_url() -> None:
+    """The three decisions `client_for` makes, read back off the object the pod uses.
+
+    Each of them fails the same way in the cluster and is invisible from inside this
+    process: a header under the wrong name, a base that kept the `/mcp` path, or a
+    token spliced into a URL all produce a 401 or a 404 on every request from every
+    pod -- and the Gateway answers a token it cannot read with the same fixed 401 as a
+    request that carried none. The last one is worse than a failure: a token in a URL
+    is a token in every access log it passes through.
+
+    The third is graded by the exact-equality check below rather than by a line of
+    its own: a base URL pinned to a literal that holds no token cannot also hold
+    one, so a separate "token not in the url" assertion could never fail while that
+    one passed.
+    """
+    document = _compiled(url="http://tool-gateway.map-dev.svc.cluster.local/mcp")
+
+    async with client_for(read_binding(document)) as client:
+        assert client.headers[SESSION_TOKEN_HEADER_NAME] == TOKEN
+        assert str(client.base_url) == "http://tool-gateway.map-dev.svc.cluster.local"
 
 
 async def test_the_client_is_built_from_this_pods_own_compiled_document(

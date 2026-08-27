@@ -125,7 +125,14 @@ class ClusterHoldingPods:
         return PodPhase.ABSENT
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("a test in this file released a pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
     async def placed_pods(self) -> Sequence[PlacedPod]:
         return self.pods
@@ -650,7 +657,14 @@ class ClusterThatPlacesOnDemand:
         return PodPhase.RUNNING if self.placed else PodPhase.ABSENT
 
     async def remove(self, pod_name: str) -> None:
-        raise AssertionError("a test in this file released a pod")
+        """A no-op, where this used to refuse.
+
+        Under ADR-041 a pod is leased for one Turn, so every dispatch releases one and
+        the refusal written here asserted the opposite of the contract. Nothing is
+        recorded because no case in this file grades which pod went -- the lease itself
+        is graded in `tests/control/test_a_pod_is_leased_for_one_turn.py`, against a
+        cluster whose phase actually reflects the removal.
+        """
 
     async def placed_pods(self) -> Sequence[PlacedPod]:
         return ()

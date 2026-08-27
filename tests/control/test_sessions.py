@@ -49,7 +49,7 @@ from managed_agent.core.registration.scope_binding import (
     ServerRegistration,
 )
 from managed_agent.core.session.session import SessionRecord, SessionState
-from managed_agent.core.vocabulary import lifecycle
+from managed_agent.core.vocabulary import lifecycle, turn
 
 _MIGRATIONS = Path(__file__).parents[2] / "migrations" / "versions"
 
@@ -234,7 +234,7 @@ def _create_body() -> dict[str, object]:
         # about the fold, and a real shape threaded through them would read as though it
         # mattered to it. The one case below that wires the real adapters registers one.
         "environment_id": str(uuid4()),
-        "grant": ["fs.read"],
+        "grant": [],
         "scope": {"repo": "acme/widgets"},
         "budget_minor_units": 500,
         "budget_currency": "USD",
@@ -250,7 +250,7 @@ def test_one_call_creates_a_session_and_hands_back_its_id(
     assert response.status_code == 201
     created = response.json()
     assert UUID(created["id"])
-    assert created["state"] == "running"
+    assert created["state"] == "idle"
     assert created["seq"] == 1
     assert log.appends == 1
 
@@ -265,32 +265,37 @@ def test_creation_writes_exactly_one_published_lifecycle_event(
     written = log._events[session_id]
     assert [event.type for event in written] == [lifecycle.SESSION_CREATED]
     assert written[0].payload["budget_currency"] == "USD"
-    assert written[0].payload["grant"] == ["fs.read"]
+    # Empty, and this file cannot honestly assert otherwise: every name in a Grant is
+    # resolved against the tenant's registrations at creation now, and this file's
+    # registry double raises on sight. That the Grant travels from the request into the
+    # event with real names in it is asserted where a real registry exists, in
+    # `test_a_grant_names_a_registered_tool.py`.
+    assert written[0].payload["grant"] == []
 
 
-def test_a_created_session_reads_back_as_running(client: TestClient) -> None:
+def test_a_created_session_reads_back_as_idle(client: TestClient) -> None:
     session_id = client.post("/v1/sessions", json=_create_body()).json()["id"]
 
     response = client.get(f"/v1/sessions/{session_id}")
 
     assert response.status_code == 200
-    assert response.json() == {"id": session_id, "state": "running", "seq": 1}
+    assert response.json() == {"id": session_id, "state": "idle", "seq": 1}
 
 
 def test_a_read_reports_what_the_log_says_and_not_what_creation_returned(
     client: TestClient, log: InMemoryLog
 ) -> None:
-    """A lifecycle event appended behind the API's back changes the next read.
+    """An event appended behind the API's back changes the next read.
 
     This is the whole claim: had the state been stored at creation, the read would still
-    say running, because nothing went back and updated a column.
+    say idle, because nothing went back and updated a column.
     """
     session_id = client.post("/v1/sessions", json=_create_body()).json()["id"]
-    log.add(SessionId(UUID(session_id)), lifecycle.SESSION_SUSPENDED)
+    log.add(SessionId(UUID(session_id)), turn.TURN_SUBMITTED)
 
     body = client.get(f"/v1/sessions/{session_id}").json()
 
-    assert body["state"] == "suspended"
+    assert body["state"] == "running"
     assert body["seq"] == 2
 
 
@@ -320,15 +325,19 @@ def test_neither_response_carries_a_runtime_identifier(client: TestClient) -> No
 
 
 _NOT_A_SESSIONS_STATE = {
-    # MAP-51's webhook tables. Neither column holds what this check exists to forbid --
-    # a Session's *current* state, cached where the fold's answer could disagree with
-    # it. `webhook.states` is a registration's filter: the set of states a tenant asked
-    # to hear about, which belongs to the registration and to no Session. `state` on
-    # `webhook_delivery` is one third of the primary key that makes "one callback per
-    # state change" a constraint rather than a check somebody can skip; it records that
-    # a transition was called back, at the sequence beside it, and nothing reads a
-    # Session's state from it -- the dispatcher folds the log through `core.projection`
-    # like every other reader.
+    # MAP-51's webhook tables, as `0016_webhooks.py` first declared them. Neither column
+    # held what this check exists to forbid -- a Session's *current* state, cached where
+    # the fold's answer could disagree with it. `webhook.states` was a registration's
+    # filter: the set of states a tenant asked to hear about, which belonged to the
+    # registration and to no Session. `state` on `webhook_delivery` recorded which
+    # change had been called back.
+    #
+    # Both are gone: `0030_webhooks_by_event_type.py` renames them to `event_types` and
+    # `event_type`, so a registration names what happened rather than what it meant and
+    # nothing on this side of the platform mentions a state at all. The entries stay
+    # because this check reads every migration source including the one that created
+    # them, and the second assertion below fails on an entry whose column no revision
+    # declares.
     "0016_webhooks.py:states",
     "0016_webhooks.py:state",
 }
@@ -754,7 +763,7 @@ class UnusedWebhooks:
         self,
         tenant_id: TenantId,
         url: CallbackUrl,
-        states: frozenset[SessionState],
+        event_types: frozenset[str],
         secret_ref: str,
     ) -> WebhookRecord:
         raise AssertionError("a test in this file registered a webhook")
@@ -766,9 +775,9 @@ class UnusedWebhooks:
         raise AssertionError("a test in this file deleted a webhook")
 
     async def watching(
-        self, tenant_id: TenantId, state: SessionState
+        self, tenant_id: TenantId, event_type: str
     ) -> Sequence[WebhookRecord]:
-        raise AssertionError("a test in this file asked what watches a state")
+        raise AssertionError("a test in this file asked what watches a type")
 
 
 FIXTURE_IMAGE = "registry.map.internal/session@sha256:" + "a" * 64

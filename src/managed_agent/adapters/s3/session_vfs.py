@@ -40,7 +40,6 @@ from managed_agent.core.vfs.session_vfs import (
     Lane,
     LaneBlobs,
     LaneEntry,
-    MutableFile,
     ObjectAlreadyPresent,
     SourceRef,
     StoredObject,
@@ -49,7 +48,7 @@ from managed_agent.core.vfs.session_vfs import (
     lane_prefix,
 )
 from managed_agent.core.vfs.vfs_provenance import written_payload
-from managed_agent.core.vocabulary.vfs import OBJECT_PLACED, OBJECT_REPLACED
+from managed_agent.core.vocabulary.vfs import OBJECT_PLACED
 
 _ALREADY_THERE: frozenset[str] = frozenset(
     {"PreconditionFailed", "ConditionalRequestConflict"}
@@ -108,10 +107,6 @@ class S3LaneBlobs:
                     raise ObjectAlreadyPresent(key) from exc
                 raise
 
-    async def put(self, key: str, body: bytes) -> None:
-        async with self._session.client("s3") as s3:
-            await s3.put_object(Bucket=self._bucket, Key=key, Body=body)
-
     async def get(self, key: str) -> bytes | None:
         async with self._session.client("s3") as s3:
             try:
@@ -166,19 +161,6 @@ class SessionVfsStore:
         )
         return StoredObject(key=file.key, digest=digest)
 
-    async def replace(
-        self, file: MutableFile, body: bytes, sources: Sequence[SourceRef] = ()
-    ) -> StoredObject:
-        digest = digest_of(body)
-        await self._blobs.put(file.key, body)
-        await append_in_order(
-            self._log,
-            file.session_id,
-            OBJECT_REPLACED,
-            written_payload(file.lane, file.relative, digest, sources),
-        )
-        return StoredObject(key=file.key, digest=digest)
-
     async def read(self, file: VfsFile) -> bytes | None:
         return await self._blobs.get(file.key)
 
@@ -211,11 +193,6 @@ class UnconfiguredSessionVfs:
 
     async def place(
         self, file: VfsFile, body: bytes, sources: Sequence[SourceRef] = ()
-    ) -> StoredObject:
-        raise self._refuse()
-
-    async def replace(
-        self, file: MutableFile, body: bytes, sources: Sequence[SourceRef] = ()
     ) -> StoredObject:
         raise self._refuse()
 

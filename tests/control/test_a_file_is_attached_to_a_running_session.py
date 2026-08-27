@@ -208,7 +208,7 @@ async def _a_session(
             "definition_id": registered.json()["id"],
             "environment_id": shape.json()["id"],
             "file_ids": file_ids,
-            "grant": ["fs.read"],
+            "grant": [],
             "scope": {},
             "budget_minor_units": 500,
             "budget_currency": "USD",
@@ -665,33 +665,39 @@ async def test_an_attach_to_an_archived_session_is_refused(wired: Wired) -> None
     assert await _listed(wired, tenant, session_id) == []
 
 
-async def test_an_attach_to_a_reaped_session_is_the_same_refusal(
+async def test_an_attach_to_a_session_whose_pod_was_reclaimed_is_accepted(
     wired: Wired,
 ) -> None:
-    """A reaped Session is the same refusal, and needs no rule of its own.
+    """Losing a pod is not losing the Session, so the file has a Turn to be read by.
 
-    Reaping suspends, and a suspended Session's pod is gone: `place_resuming` raises
-    unconditionally, so no future Turn will ever read a file attached now. That is why
-    one rule -- "would this Session still take a Turn" -- covers archiving and reaping
-    both, and why the state travels in the detail so a caller can tell which it hit.
+    The refusal above is about a Session that will run nothing more, and a reclaimed
+    pod says nothing of the sort -- the next Turn asks for a pod and gets one, and it
+    reads whatever the workspace was rehydrated with. Refusing here would make a cost
+    dial into a deadline on attaching files, which is a rule no caller was told about
+    and could not have planned around.
+
+    **The row appended below is history rather than something this platform still
+    writes.** A pod is leased for one Turn now, so nothing appends `session.suspended`
+    and `idle_timeout` is no longer a reason any model will accept (ADR-041) -- which is
+    exactly why the payload is spelled out here instead of built from the enum. Every
+    Session that ran before the change has rows of this shape in its log, they are still
+    published so they still replay, and a fold that stopped reading them as `IDLE` would
+    refuse this attach on the strength of an event from last month.
     """
     tenant = uuid.uuid4()
-    file = await _upload(wired.client, tenant, "reaped.txt")
+    file = await _upload(wired.client, tenant, "reclaimed.txt")
     session_id = await _a_session(wired.client, tenant, [])
     await _append(
         wired,
         session_id,
         lifecycle.SESSION_SUSPENDED,
-        {"stop_reason": lifecycle.StopReason.IDLE_TIMEOUT.value},
+        {"stop_reason": "idle_timeout"},
     )
 
-    refused = await _attach(wired, tenant, session_id, str(file["id"]))
+    added = await _attach(wired, tenant, session_id, str(file["id"]))
 
-    assert refused.status_code == 409, refused.text
-    assert (
-        refused.json()["error"]["code"] == ErrorCode.SESSION_NOT_ACCEPTING_TURNS.value
-    )
-    assert refused.json()["error"]["detail"]["state"] == "suspended"
+    assert added.status_code == 201, added.text
+    assert await _listed(wired, tenant, session_id) == [str(file["id"])]
 
 
 async def test_an_attach_while_a_turn_is_open_is_refused(wired: Wired) -> None:
@@ -714,6 +720,14 @@ async def test_an_attach_while_a_turn_is_open_is_refused(wired: Wired) -> None:
     assert refused.json()["error"]["code"] == ErrorCode.SESSION_TURN_IN_FLIGHT.value
     assert refused.json()["error"]["detail"]["turn_id"] == turn_id
     assert await _listed(wired, tenant, session_id) == []
+    # The refusal above it must not catch this case. A Session running a Turn is the
+    # one that is most certainly going to read a file, so answering "will run no
+    # further Turn" here would be false and would point the caller at archiving rather
+    # than at the interrupt that actually clears it. The two refusals are ordered, and
+    # this is the assertion that keeps them in that order.
+    assert (
+        refused.json()["error"]["code"] != ErrorCode.SESSION_NOT_ACCEPTING_TURNS.value
+    )
 
 
 async def test_the_same_attach_is_accepted_once_that_turn_is_closed(
@@ -742,20 +756,31 @@ async def test_the_same_attach_is_accepted_once_that_turn_is_closed(
 # --- delivery, and the order it happens in ----------------------------------------
 
 
-async def test_a_session_past_its_first_turn_needs_a_pod_that_will_take_the_file(
+async def test_a_session_past_its_first_turn_takes_the_file_without_a_pod(
     wired: Wired,
 ) -> None:
-    """Past its first Turn the bytes go first, and a failed push records nothing.
+    """A Session that has already run accepts an attach, and needs no pod to do it.
 
-    A completed Turn means `FirstTurnPlacement` will not place a pod again, so the file
-    has to go down now or never. This deployment has no pod runner, so the refusing
-    default answers, and the 502 is the honest reading: the platform could not put the
-    file where the agent would look.
+    This case asserted the opposite, and the premise it rested on is the one ADR-041
+    removed: that a completed Turn meant a pod was standing, and that placement would
+    never run again, so the bytes had to go down at this moment or never. A pod now
+    lives exactly as long as the Turn it carries, which falsifies both halves. The
+    branch that pushed here refused every attach to a Session that had ever run --
+    measured on `map-dev` as `session ... has no running pod to place 'appendix.md'
+    into`, on a deployment that was working correctly.
 
-    The assertion that matters is the empty list afterwards. It is the whole of the
-    push-before-append order: appending first would leave a Session whose record names a
-    file its pod does not have, with nothing that would ever push it, and the 502 would
-    have told the caller to retry a call that had already changed the record.
+    Delivery did not go away, it moved: the next Turn places a pod and its fold over the
+    log picks this event up. That the fold really reaches an attach sitting after the
+    Turn events is not assertable from here -- this harness wires no placer at all --
+    and is graded directly in `test_a_first_turn_places_the_session_pod.py`, by
+    `test_a_file_attached_after_a_turn_is_carried_by_the_next_placement`. Naming it
+    rather than approximating it here, because a second version of that claim written
+    against a different double would be free to disagree with the one that counts.
+
+    The listing is asserted for the same reason the empty listing was asserted before,
+    with the sign reversed: the record and the delivery have to agree. Then, a recorded
+    attach with no push was a file nothing would deliver; now, a *missing* record is the
+    failure, because the record is the only thing the next placement reads.
     """
     tenant = uuid.uuid4()
     file = await _upload(wired.client, tenant, "delivered.txt")
@@ -764,13 +789,12 @@ async def test_a_session_past_its_first_turn_needs_a_pod_that_will_take_the_file
     await _append(wired, session_id, turn.TURN_SUBMITTED, {"turn_id": turn_id})
     await _append(wired, session_id, turn.TURN_COMPLETED, {"turn_id": turn_id})
 
-    refused = await _attach(wired, tenant, session_id, str(file["id"]))
+    added = await _attach(wired, tenant, session_id, str(file["id"]))
 
-    assert refused.status_code == STATUS_FOR[ErrorCode.TURN_UNDELIVERABLE]
-    assert refused.json()["error"]["code"] == ErrorCode.TURN_UNDELIVERABLE.value
-    assert await _listed(wired, tenant, session_id) == [], (
-        "the push was refused and the attach was recorded anyway, so this session's "
-        "record names a file its pod does not have and nothing will ever push it"
+    assert added.status_code == 201, added.text
+    assert await _listed(wired, tenant, session_id) == [str(file["id"])], (
+        "the attach was accepted and not recorded, so the placement that was going to "
+        "deliver it has nothing to read and the file never reaches the workspace"
     )
 
 

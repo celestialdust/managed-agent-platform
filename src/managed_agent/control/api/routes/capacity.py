@@ -113,14 +113,30 @@ class PlacementStatsView(BaseModel):
     """
 
     session_pods_running: int
-    """How many Session pods can actually serve a Turn right now.
+    """How many Turns are being served right now.
 
-    Capacity that is serving. Counts pods in the running phase only -- a pod still
-    starting has been paid for and cannot take a Turn yet, and counting it would make
-    the fleet look able to serve Turns it would refuse.
+    **This number changed meaning without changing name or arithmetic.** It still
+    counts Session pods in the running phase, and it is still read the same way. What
+    moved is what a running pod is: while a Session held one for its whole life, a
+    running pod was a Session that *could* take a Turn, so this read as headroom. A pod
+    now exists only for the length of the Turn it carries, so every one of them is
+    already carrying one and this reads as utilisation -- the concurrency in flight,
+    against the fleet's ceiling rather than under it.
+
+    The name is kept because it is published: a tenant reading this field would not be
+    helped by having it disappear, and what it counts is unchanged. Read it beside
+    `node_ceiling` and `nodes_schedulable`, which are the supply this demand is measured
+    against.
+
+    Still the running phase only, and now for a sharper reason than before. A pod
+    that is starting belongs to a Turn that is queued rather than served, and that Turn
+    is already counted by `turns_awaiting_placement` -- so counting its pod here would
+    count one Turn twice, in two fields an operator reads against each other.
 
     Cluster-wide rather than per-replica, unlike the two queue numbers, because it is
     read from the cluster: whichever replica answers gives the same count.
+
+    Provenance: ADR-041.
     """
 
     nodes_schedulable: int | None

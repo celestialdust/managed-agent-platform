@@ -227,7 +227,7 @@ def bench() -> _Bench:
 def _a_session(
     bench: _Bench,
     *,
-    state: SessionState = SessionState.RUNNING,
+    state: SessionState = SessionState.IDLE,
     last_event_ms: int = _NOW_MS - IDLE_GRACE_MS * 2,
     open_turn: bool = False,
     phase: PodPhase = PodPhase.RUNNING,
@@ -262,21 +262,16 @@ def _a_session(
             {"turn_id": str(first)},
             at_ms=last_event_ms,
         )
-        if state is SessionState.SUSPENDED:
-            log.add(
-                session_id,
-                lifecycle.SESSION_SUSPENDED,
-                {"stop_reason": StopReason.IDLE_TIMEOUT.value},
-                at_ms=last_event_ms,
-            )
-        elif state is SessionState.STOPPED:
+        if state is SessionState.STOPPED:
             log.add(
                 session_id,
                 lifecycle.SESSION_STOPPED,
                 {"stop_reason": StopReason.ARCHIVED.value},
                 at_ms=last_event_ms,
             )
-        if open_turn:
+        if open_turn or state is SessionState.RUNNING:
+            # An unclosed submission is what `RUNNING` *is* now -- there is no event
+            # that says "running" on its own -- so the two dials build the same log.
             log.add(
                 session_id,
                 turn.TURN_SUBMITTED,
@@ -361,8 +356,8 @@ def test_every_verdict_has_a_case_that_reaches_it() -> None:
 # and `projection.py` has no row for one -- so this row is the only thing standing
 # between the guard and its silent removal.
 _STATE_SETTLES: dict[SessionState, ReapVerdict | None] = {
+    SessionState.IDLE: None,
     SessionState.RUNNING: None,
-    SessionState.SUSPENDED: ReapVerdict.THE_SESSION_HAS_ENDED,
     SessionState.STOPPED: ReapVerdict.THE_SESSION_HAS_ENDED,
     SessionState.TAKEN_OVER: ReapVerdict.A_HUMAN_HAS_TAKEN_OVER,
 }
@@ -384,16 +379,79 @@ def test_a_session_a_human_is_driving_keeps_its_pod() -> None:
     assert ReapVerdict.A_HUMAN_HAS_TAKEN_OVER.gave_the_pod_back() is False
 
 
-async def test_going_idle_appends_a_suspension_naming_the_reason(
+async def test_going_idle_gives_the_pod_back_and_says_nothing_in_the_log(
     bench: _Bench,
 ) -> None:
+    """The reclamation is silent now, and the silence is the decision.
+
+    This used to append `session.suspended`, which was worth saying while a pod outlived
+    the Turn that made it: a pod going was a thing that happened *to* a Session between
+    Turns, and a tenant could reasonably want to hear about it. A pod is now leased for
+    one Turn, so the only pod this sweep ever finds is one whose control plane died
+    holding it -- and an event announcing that would be the platform reporting its own
+    crash into a tenant's Session history, once per replica that noticed.
+
+    The Session does not move either. It was `IDLE` before the sweep and it is `IDLE`
+    after, because nothing about a pod is a claim about whether a Session will work
+    again.
+    """
     session_id = _a_session(bench)
+    before = bench.log.types_of(session_id)
 
     await bench.reaper.sweep()
 
-    assert bench.log.types_of(session_id)[-1] == lifecycle.SESSION_SUSPENDED
-    assert bench.log.state_of(session_id) is SessionState.SUSPENDED
+    assert bench.log.types_of(session_id) == before
+    assert bench.log.state_of(session_id) is SessionState.IDLE, (
+        "the pod went; the Session did not move, and is still takeable"
+    )
     assert not bench.cluster.holds(session_id)
+
+
+async def test_a_turn_that_opens_across_the_decision_keeps_its_pod(
+    bench: _Bench,
+) -> None:
+    """The race the re-read in front of the deletion exists for.
+
+    Every guard runs against one fold, and a submission that lands after that fold is
+    invisible to it: the sweep would go on to delete the pod of a Turn a tenant is
+    waiting on, on the strength of a log that was already stale when it was read. The
+    reclamation used to append, and the append settled this half of the race by
+    sequence; nothing is appended now, so what is left is to look again as late as
+    possible.
+
+    Driven from the log rather than argued. The read is patched on the instance, so what
+    is simulated is another writer reaching the store at that instant -- and it fires on
+    the empty page that ends a fold, which is exactly the gap between the fold the
+    guards used and the read below them.
+    """
+    session_id = _a_session(bench)
+    real_read = bench.log.read
+    arrived = False
+
+    async def read_and_then_a_turn_arrives(
+        sid: SessionId, start: Seq, end: Seq, limit: int | None = None
+    ) -> Sequence[Event]:
+        nonlocal arrived
+        page = await real_read(sid, start, end, limit)
+        if not page and not arrived and sid == session_id:
+            arrived = True
+            bench.log.add(
+                session_id, turn.TURN_SUBMITTED, {"turn_id": str(new_turn_id())}
+            )
+        return page
+
+    bench.log.read = read_and_then_a_turn_arrives  # type: ignore[assignment]
+
+    outcomes = await bench.reaper.sweep()
+
+    assert arrived, "the submission never landed, so this case proved nothing"
+    assert (
+        bench.verdict_for_session(outcomes, session_id)
+        is ReapVerdict.A_TURN_IS_STILL_OPEN
+    )
+    assert bench.cluster.holds(session_id), (
+        "the pod of a Turn that arrived across the decision was deleted"
+    )
 
 
 async def test_an_idle_session_keeps_its_history_when_its_pod_goes(
@@ -405,7 +463,7 @@ async def test_an_idle_session_keeps_its_history_when_its_pod_goes(
 
     await bench.reaper.sweep()
 
-    assert bench.log.types_of(session_id) == [*before, lifecycle.SESSION_SUSPENDED]
+    assert bench.log.types_of(session_id) == before
 
 
 async def test_an_ended_session_is_swept_without_appending_anything(
@@ -426,6 +484,7 @@ async def test_sweeping_twice_is_the_same_as_sweeping_once(bench: _Bench) -> Non
     """Idempotent, which is what lets two replicas and a retry all run it."""
     idle = _a_session(bench)
     ended = _a_session(bench, state=SessionState.STOPPED)
+    types_before_the_first_sweep = bench.log.types_of(idle)
 
     first = await bench.reaper.sweep()
     deletions_after_one = len(bench.cluster.deleted)
@@ -434,7 +493,7 @@ async def test_sweeping_twice_is_the_same_as_sweeping_once(bench: _Bench) -> Non
     assert len(first) == 2
     assert second == [], "the second sweep found nothing left to judge"
     assert len(bench.cluster.deleted) == deletions_after_one
-    assert bench.log.types_of(idle).count(lifecycle.SESSION_SUSPENDED) == 1
+    assert bench.log.types_of(idle) == types_before_the_first_sweep
     assert bench.log.types_of(ended).count(lifecycle.SESSION_STOPPED) == 1
 
 
@@ -443,31 +502,45 @@ async def test_two_replicas_sweeping_at_once_settle_on_one_state(
 ) -> None:
     """Concurrent sweeps converge, and the convergence is what is asserted.
 
-    **A redundant suspension is possible here and is not a defect this asserts away.**
-    Two sweeps that both fold before either appends both decide to suspend, and the
-    second append lands after the first -- exactly the shape `admit_turn` already
-    accepts, where a submission that loses its race stays in the log while its caller is
-    told who won. The fold reads the last event, so the state is the same either way.
+    Idempotence here is now a property of the deletion alone, which is why the case is
+    stated as an append count that never moves. Two sweeps that both fold before either
+    acts both decide to reclaim, and the second handback meets a pod that is already
+    gone -- which the release treats as success. There is nothing else either sweep
+    does, so "both ran" and "one ran" are indistinguishable afterwards by construction
+    rather than by a lock.
 
-    What must hold is that it settles: after any number of concurrent sweeps the Session
-    is suspended, its pod is gone, and a further sweep appends **nothing at all**. That
-    last clause is the one with teeth -- it fails if the state check before the append
-    is removed, which is what would turn a bounded duplicate into a log that grows by
-    one event per sweep for the life of the Session.
+    **The bound used to need an argument and does not any more.** While this appended,
+    the reclamation was a write whose only limit was that the sweep walks pods: two
+    replicas could each append, a second pod placed later could be reclaimed and
+    appended for again, and the log grew by one honest event per reclamation. Nothing is
+    written now, so the last stanza below places a second pod, has it reclaimed, and
+    still expects the same count -- the property is no longer "bounded growth" but "no
+    growth".
     """
     session_id = _a_session(bench)
+    before = bench.log.types_of(session_id)
 
     await asyncio.gather(bench.reaper.sweep(), bench.reaper.sweep())
     settled = bench.log.appends
 
-    assert bench.log.state_of(session_id) is SessionState.SUSPENDED
+    assert bench.log.state_of(session_id) is SessionState.IDLE
     assert not bench.cluster.holds(session_id)
-    assert set(bench.log.types_of(session_id)[3:]) == {lifecycle.SESSION_SUSPENDED}
+    assert bench.log.types_of(session_id) == before
+
+    await bench.reaper.sweep()
+
+    assert bench.log.appends == settled, (
+        "a sweep with no pod to walk still appended an event"
+    )
 
     bench.cluster.place(session_id)
     await bench.reaper.sweep()
 
-    assert bench.log.appends == settled, "a later sweep appended a further ending"
+    assert bench.log.appends == settled, (
+        "a second pod was placed and reclaimed, and the reclamation wrote to the log"
+    )
+    assert not bench.cluster.holds(session_id)
+    assert bench.log.state_of(session_id) is SessionState.IDLE
     assert not bench.cluster.holds(session_id), "and it still reclaimed the pod"
 
 
@@ -575,7 +648,7 @@ async def test_a_pod_the_cluster_says_is_gone_is_judged_on_its_session(
 async def test_the_sweep_reports_the_pods_it_left_alone(bench: _Bench) -> None:
     """A sweep reporting only its deletions cannot be told from one that refused all."""
     kept = _a_session(bench, phase=PodPhase.STARTING)
-    taken = _a_session(bench, state=SessionState.SUSPENDED)
+    taken = _a_session(bench)
 
     outcomes = await bench.reaper.sweep()
 
@@ -633,10 +706,12 @@ async def test_the_activity_window_is_read_once_for_the_whole_sweep(
 def test_the_grace_period_is_longer_than_the_worst_measured_placement() -> None:
     """The floor the number was chosen against, asserted rather than left in prose.
 
-    A first Turn's HTTP response is held for the whole placement and the test client's
-    timeout had to go to 660 seconds to cover an autoscaled node arriving. A grace below
-    that can expire inside one Turn, and while the open-Turn guard would still refuse
-    that Session, the whole guarantee would then rest on one check instead of three.
+    A placement can take 660 seconds when an autoscaled node has to arrive -- measured
+    back when a first Turn's HTTP response was held for the whole of it, which is how
+    the number came to be a test client's timeout. The Turn no longer waits inside that
+    response, but the placement still takes as long, so a grace below this can still
+    expire inside one Turn. The open-Turn guard would refuse that Session anyway, and
+    the whole guarantee would then rest on one check instead of three.
     """
     worst_measured_placement_ms = 660_000
     assert worst_measured_placement_ms < IDLE_GRACE_MS

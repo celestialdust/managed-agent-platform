@@ -206,24 +206,40 @@ class FirstTurnPlacement:
         """
         try:
             await self._place(session_id)
+        except PodNotStarted as refused:
+            # Told apart from the six below, because the tenant's next move is the
+            # opposite one. Nothing about this Session is wrong: a pod was asked for and
+            # did not come up, which is transient far more often than not, and
+            # resubmitting is the remedy. The six below are configuration this Session
+            # names, where resubmitting changes nothing at all.
+            raise TurnUndeliverable(
+                f"session {session_id} was given a pod that did not start: {refused}",
+                turn.TurnFailureCause.RUNTIME_DID_NOT_START,
+            ) from refused
         except (
             UnknownEnvironment,
             UnknownAgentVersion,
             AgentVersionArchived,
             FloorViolation,
-            PodNotStarted,
             SkillsUnresolvable,
             FilesNotPlaceable,
         ) as refused:
             # The refusal's own words are carried, not only its type. This text never
-            # reaches a tenant -- `control/api/routes/turns.py` drops it and appends the
-            # one published cause -- so what it costs is nothing and what it buys is the
-            # difference between "this Session's Rollout could not be seeded", "that
-            # environment is not registered" and "the image will not pull", which are
-            # three different people's problems.
+            # reaches a tenant -- `control/session/turn_execution.py` logs it to stderr
+            # and appends the published cause -- so what it costs is nothing and what it
+            # buys is the difference between "this Session's Rollout could not be
+            # seeded", "that environment is not registered" and "the image will not
+            # pull", which are three different people's problems.
+            #
+            # All six share one published cause because they share one remedy: the
+            # tenant fixes what the Session names, and until they do a resubmission
+            # fails identically. Splitting them further would publish six codes a
+            # consumer branches on the same way, and each addition is a version event
+            # under ADR-013.
             raise TurnUndeliverable(
                 f"session {session_id} has no pod and could not be given one "
-                f"({type(refused).__name__}): {refused}"
+                f"({type(refused).__name__}): {refused}",
+                turn.TurnFailureCause.SESSION_NOT_PLACEABLE,
             ) from refused
 
     async def _place(self, session_id: SessionId) -> None:

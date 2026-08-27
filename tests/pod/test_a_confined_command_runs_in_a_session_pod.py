@@ -78,10 +78,13 @@ from test_the_pod_materialises_its_sandbox_targets import (
     _probe_pod,
     _secret,
     _transcript,
+    drop_the_workspace_volume,
+    make_the_workspace_volume,
     requires_the_cluster,
 )
 
 from managed_agent.control.pod_config import compiler as config_compiler
+from managed_agent.core.pod.workspace_contract import SCRATCH_ROOT
 
 _NAMESPACE = "map-68-confined"
 
@@ -89,6 +92,7 @@ CONTROL_PATH = "Can't mkdir parents for /run/codex/ctl"
 RAN = "CONFINED-COMMAND-RAN"
 SOCK = config_compiler.CONTROL_SOCKET
 WS = config_compiler.WORKSPACE_ROOT
+SCRATCH = SCRATCH_ROOT
 SYSCONF = config_compiler.SYSTEM_CONFIG_DIR
 CODEX_HOME = config_compiler.CODEX_HOME
 
@@ -123,7 +127,7 @@ PRESENT_RAN = "RAN-WITH-TARGET-PRESENT"
 _BINDER = f'''
 import os, socket, threading, time
 
-for path in ("{SOCK}", "{WS}/probe.sock"):
+for path in ("{SOCK}", "{SCRATCH}/probe.sock", "{WS}/probe.sock"):
     if os.path.lexists(path):
         os.unlink(path)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -170,6 +174,7 @@ def connect(path):
 
 say("P-stat-control-socket", lambda: stat.filemode(os.stat("{SOCK}").st_mode))
 say("P-connect-control-socket", lambda: connect("{SOCK}"))
+say("P-connect-scratch-socket", lambda: connect("{SCRATCH}/probe.sock"))
 say("P-connect-workspace-socket", lambda: connect("{WS}/probe.sock"))
 print("outside=complete")
 '''
@@ -181,6 +186,7 @@ SOCK = "{SOCK}"
 CTL = os.path.dirname(SOCK)
 RUN = os.path.dirname(CTL)
 WS = "{WS}"
+SCRATCH = "{SCRATCH}"
 SYSCONF = "{SYSCONF}"
 CODEX_HOME = "{CODEX_HOME}"
 
@@ -307,7 +313,10 @@ say(
     "D1-socket-af-unix",
     lambda: socket.socket(socket.AF_UNIX, socket.SOCK_STREAM).fileno(),
 )
-say("D2-connect-a-socket-in-the-WRITABLE-root", lambda: connect(f"{{WS}}/probe.sock"))
+say(
+    "D2-connect-a-socket-in-the-WRITABLE-root",
+    lambda: connect(f"{{SCRATCH}}/probe.sock"),
+)
 say("D3-abstract-namespace-no-inode-at-all", abstract_round_trip)
 say(
     "D4-write-a-plain-file-in-the-writable-root",
@@ -361,7 +370,7 @@ echo "codex-version=$(codex --version 2>&1 | head -1)"
 python3 /tmp/binder.py > /tmp/binder.log 2>&1 &
 i=0
 while [ "$i" -lt 30 ]; do
-  if [ -S {SOCK} ] && [ -S {WS}/probe.sock ]; then break; fi
+  if [ -S {SOCK} ] && [ -S {SCRATCH}/probe.sock ]; then break; fi
   i=$((i + 1))
   sleep 1
 done
@@ -478,6 +487,7 @@ def transcripts() -> Iterator[dict[str, str]]:
     }
     _kubectl("create", "namespace", _NAMESPACE)
     try:
+        make_the_workspace_volume(_NAMESPACE)
         _secret(
             "map-session-compiled-config",
             {"config.toml": compiled.config_toml},
@@ -507,6 +517,7 @@ def transcripts() -> Iterator[dict[str, str]]:
         }
     finally:
         _kubectl("delete", "namespace", _NAMESPACE, "--ignore-not-found", check=False)
+        drop_the_workspace_volume(_NAMESPACE)
 
 
 def _labelled(transcript: str, prefixes: tuple[str, ...]) -> list[str]:
@@ -570,12 +581,63 @@ def test_the_control_socket_is_reachable_from_outside_the_sandbox(
     their socket had never been bound -- with the leaf absent the pre-slice
     configuration builds a sandbox fine, so a pod whose binder failed would report the
     refusal missing and look like this slice's own result.
+
+    **The control socket lives on scratch, not on the workspace, and it had to move.**
+    Since ADR-035 the workspace is durable and outlives the pod that wrote it, and a
+    socket inode outlives its listener with it: a pod that finds another pod's socket
+    at its own path sees `S_ISSOCK` true with nothing listening, and `connect` answers
+    `ESTALE` naming nothing about why. A control that can inherit a dead inode is not a
+    control, whatever the filesystem underneath it is. `SCRATCH_ROOT` is a pod-local
+    emptyDir the sandbox profile also grants WRITE, so it is a writable root that dies
+    with its pod and cannot be inherited, which is the only property this control needs.
+
+    Not because a socket on the workspace cannot work -- the test below binds and
+    connects one there. This file asserted that it could not, for one run, on evidence
+    taken while every probe pod shared a single workspace subtree.
     """
     for label, transcript in transcripts.items():
         assert f"bound {SOCK}" in transcript, label
         assert "P-connect-control-socket=REACHED" in transcript, label
-        assert "P-connect-workspace-socket=REACHED" in transcript, label
+        assert "P-connect-scratch-socket=REACHED" in transcript, label
         assert "outside=complete" in transcript, label
+
+
+@requires_the_cluster
+def test_a_unix_socket_on_the_workspace_binds_and_connects(
+    transcripts: dict[str, str],
+) -> None:
+    """A Unix socket on the workspace works, and what it costs to be sure of that.
+
+    `bind` creates the inode and `connect` reaches the listener, in the same pod, over
+    the mount. So an agent that starts a language server or any helper that talks over
+    a socket in its own workspace is not blocked by the filesystem.
+
+    **This file asserted the opposite first, on evidence that was real.** The socket
+    bound, `connect` answered `ESTALE`, and that was written up as a property of the
+    network filesystem. Then the same code answered `REACHED` on the next run, which is
+    the shape of a claim about shared state rather than about a filesystem. The cause:
+    `session-pod.yaml` carries `MAP_TENANT_ID/MAP_SESSION_ID` as literal tokens that
+    production substitutes per Session (`pod_runner._fill_sub_paths`) and a pod built
+    from the manifest alone does not, so every pod of every run mounted ONE subtree and
+    bound its socket over the path a dead pod had bound. `ESTALE` is exactly what
+    connecting to an inode whose listener is gone answers, and whether it fired
+    depended on what the run before had left there.
+
+    Both readings were wrong in the same way -- each took a finding off a shared
+    mutable substrate as a fact about the substrate. `_probe_pod` now gives every pod
+    its own subtree, and this assertion has held over two consecutive runs where it
+    previously alternated.
+
+    The hazard the mount really creates is still worth naming, because it is what the
+    first reading half-saw: a socket inode on a durable workspace outlives the process
+    that bound it, so anything treating `S_ISSOCK` as proof a server is up will believe
+    a dead one. An agent that wants a socket nothing can inherit puts it under
+    `SCRATCH_ROOT`, which is pod-local -- where this file's own control socket lives,
+    for that reason and not for the filesystem's.
+    """
+    for label, transcript in transcripts.items():
+        assert f"bound {WS}/probe.sock" in transcript, label
+        assert "P-connect-workspace-socket=REACHED" in transcript, label
 
 
 @requires_the_cluster

@@ -102,6 +102,35 @@ spec:
     metadata:
       labels: { map.component: control-plane }
     spec:
+      # A Turn runs inside the tenant's own POST, and a control plane killed while one
+      # is streaming leaves that Turn open in an append-only log with nothing to close
+      # it -- no `turn.failed` is appended outside the request path, and there is no
+      # reconciliation on startup. An open Turn then refuses the Session's next Turn
+      # ("a Turn is already running on this session"), refuses its archive, and pins
+      # the sweep that would collect its pod. The Session is wedged for good.
+      #
+      # At the 30s default that was reachable by ordinary operations rather than by a
+      # crash: every rollout of this Deployment takes a pod down, and a Turn outlives
+      # 30 seconds routinely -- a first Turn's placement alone has been measured at 660
+      # (ADR-041). uvicorn drains on SIGTERM, refusing new connections and finishing the
+      # requests it holds, so this is a ceiling and not a wait: a replica with nothing
+      # in flight still goes in about a second, and only a replica actually serving a
+      # Turn spends any of it.
+      #
+      # 900 because it has to clear the longest placement this platform has measured
+      # (660s, ADR-041) with margin -- the placement runs inside the Turn's own POST, so
+      # a first Turn is still in that request while its node is being autoscaled into
+      # existence, and a grace that expired there would kill exactly the Turns that
+      # waited longest.
+      #
+      # It is not derived from what a Turn may take, because nothing in this tree bounds
+      # that: `_SHIM_TIMEOUT` is an inter-byte deadline, so a Turn streaming steadily
+      # for an hour is legitimate, and the Turn Ceiling is denominated in tokens rather
+      # than seconds. So this shortens the window rather than closing it -- a Turn still
+      # running at 900s is still killed and still wedges its Session. What would close
+      # it is a reconciliation that can tell an abandoned Turn from a slow one, and the
+      # signal that would let it is what this platform does not have.
+      terminationGracePeriodSeconds: 900
       # TWO CONSTRAINTS, and the pair is the point rather than either one alone.
       #
       # Two replicas on one node is one node drain away from zero. Two replicas in one
@@ -215,6 +244,32 @@ spec:
             - name: MAP_SHIM_TOKEN_KEY
               valueFrom:
                 secretKeyRef: { name: map-control-plane, key: shim-token-key }
+            # The platform's internal CA (ADR-044). This process signs a server
+            # certificate for each Session pod at placement and mounts it beside the
+            # bearer above, which is what lets the in-cluster hops become mTLS instead
+            # of plain HTTP.
+            #
+            # `optional: true` on BOTH, and they are a pair: absent, this process places
+            # pods exactly as it did before the CA existed, which is the state every
+            # deployment is in until an operator creates the two keys. Required refs
+            # would stop the Deployment from rolling at all -- a kubelet holds the pod
+            # at CreateContainerConfigError, so the platform would be down for a
+            # certificate it does not yet need. The half-configured case is the one
+            # worth failing on, and composition.py refuses it at startup by name.
+            #
+            # Neither value is in this repository and neither must be.
+            - name: MAP_INTERNAL_CA_CERT
+              valueFrom:
+                secretKeyRef:
+                  name: map-control-plane
+                  key: internal-ca-cert
+                  optional: true
+            - name: MAP_INTERNAL_CA_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: map-control-plane
+                  key: internal-ca-key
+                  optional: true
             # The SAME Secret and the SAME key tool-gateway.yaml names, deliberately.
             # This process signs a Session token and that one verifies it, so two copies
             # of "the same" key would be two things free to diverge -- and divergence
@@ -315,6 +370,15 @@ spec:
             # code change. Merging them would make the split a code change instead.
             - name: MAP_ROLLOUT_BUCKET
               value: map-dev-000000000000-us-east-1-an
+            # Where the volume below is mounted, and control/api/routes/workspace.py
+            # reads it to find the tree the browse route answers from. Plural, and the
+            # Session pod's is singular: a pod mounts `subPath: <tenant>/<session>` and
+            # sees exactly one workspace, while this process mounts the volume root and
+            # composes those two segments per request. The two paths differing by one
+            # letter is deliberate -- a stack trace naming /session/workspace is a pod's
+            # and one naming /session/workspaces is this process's.
+            - name: MAP_SESSION_WORKSPACE_MOUNT
+              value: /session/workspaces
           volumeMounts:
             # The Session-pod manifest, as a ConfigMap deploy/platform.py generates from
             # deploy/k8s/session-pod.yaml itself rather than from a checked-in copy --
@@ -334,6 +398,20 @@ spec:
             # 100 MiB and a memory-backed emptyDir counts against this container's own
             # memory limit.
             - { name: scratch, mountPath: /tmp }
+            # Every tenant's workspace, read-only, so `GET /v1/sessions/{id}/workspace`
+            # can answer from the disk the agent is writing rather than from the bucket.
+            # S3 Files exports after sixty seconds of write INACTIVITY, so during a Turn
+            # the bucket lags the mount by however long the agent keeps writing; a route
+            # reading the bucket would show a stale tree and call it current.
+            #
+            # readOnly is a data-integrity control and not tidiness. S3 Files resolves a
+            # bucket-versus-filesystem conflict in the BUCKET's favour and moves the
+            # filesystem's copy to `.s3files-lost+found-<fs-id>`, which sits above this
+            # access point's root and so is invisible to the agent's pod AND to this
+            # route. A write from this process would silently discard an agent's live
+            # workspace -- the hazard ADR-035 deleted workspace_sync.py to close,
+            # arriving by the other door.
+            - { name: workspaces, mountPath: /session/workspaces, readOnly: true }
           readinessProbe:
             httpGet: { path: /v1/healthz, port: http }
             periodSeconds: 5
@@ -359,6 +437,12 @@ spec:
           emptyDir: { sizeLimit: 256Mi }
         - name: pod-manifest
           configMap: { name: map-session-pod }
+        # The claim deploy/k8s/session-vfs.yaml declares and deploy/bootstrap.py
+        # applies, mounted whole. readOnly here as well as on the mount above: this
+        # asks the kubelet for a read-only attachment rather than only refusing writes
+        # at the mount, so the two are not one flag away from each other.
+        - name: workspaces
+          persistentVolumeClaim: { claimName: session-workspaces, readOnly: true }
 ---
 apiVersion: v1
 kind: Service

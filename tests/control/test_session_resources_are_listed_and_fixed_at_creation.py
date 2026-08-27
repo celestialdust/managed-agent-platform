@@ -236,7 +236,7 @@ async def _a_session(
             "definition_id": registered.json()["id"],
             "environment_id": shape.json()["id"],
             "file_ids": file_ids,
-            "grant": ["fs.read"],
+            "grant": [],
             "scope": {},
             "budget_minor_units": 500,
             "budget_currency": "USD",

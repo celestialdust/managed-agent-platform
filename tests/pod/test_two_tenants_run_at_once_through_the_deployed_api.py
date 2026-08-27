@@ -5,17 +5,26 @@ model was called, and nothing here is evidence of anything on that run.
 
 Why this is a separate file from the two beside it. `test_the_control_plane_places_a_
 session_pod.py` grades whether the deployed control plane can create the objects a
-Session needs, and deliberately registers an image that is never pulled: its findings
-are about what the API server accepted, so a pod that starts would be beside the point
-and would cost every run a real image pull. `test_the_placement_code_really_places_a_
-running_pod.py` drives the placement code directly with a key of its own, which is how a
-Turn was first made to complete. Neither can say what this one does: that the platform
-serves more than one tenant at the same time without their work meeting.
+Session needs: its findings are about what the API server accepted, and it stops at the
+pod object rather than waiting for one to serve anything. `test_the_placement_code_
+really_places_a_running_pod.py` drives the placement code directly with a key of its
+own, which is how a Turn was first made to complete. Neither can say what this one does:
+that the platform serves more than one tenant at the same time without their work
+meeting.
 
 **What this proves.** Two Sessions, under two different tenants, each get their own pod;
 both pods are RUNNING in the same observation; both Turns complete through the real
 model; and each Session's answer is its own. The prompts ask for different words, so an
 answer landing in the wrong Event Log is a failure with a name rather than a suspicion.
+
+**The pods are observed while the Turns are still in flight, and they have to be.** A
+pod is leased for exactly one Turn and given back when that Turn ends (ADR-041), and the
+API holds each submission's response until its Turn is over -- so the window in which
+both pods exist at once is exactly the window in which both submissions are unanswered.
+This file used to wait for both submissions to answer and then look for the pods, which
+under the lease means looking for two objects the platform has already deleted. The
+submissions therefore run on threads that are NOT joined until the observation has been
+taken.
 
 **What it does not prove, stated because the difference is easy to lose.** It does not
 show the two Turns were in the model at the same instant -- both pods are observed
@@ -41,7 +50,7 @@ import json
 import os
 import subprocess
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from typing import Any, Final
 from uuid import UUID, uuid4
@@ -145,15 +154,27 @@ def _answers() -> tuple[str, ...]:
     return _ANSWERS[:asked]
 
 
+_OVERLAP_POLL_S: Final = 0.5
+"""How often the two pods are read while looking for one moment holding both.
+
+One `kubectl get` costs a few hundred milliseconds, so this is close to as fast as the
+reading can be taken at all -- which is what a window measured in seconds needs.
+"""
+
 _SUBMIT_TIMEOUT_S: Final = 660
 """How long this client waits for the API to answer a Turn submission.
 
 Larger than it looks like it should be, and the reason is a fact about the platform
-rather than about this test: a Session's FIRST Turn is answered only once its pod has
-been placed, so the response is held for the whole placement. On an autoscaled cluster
-that includes waiting for a node -- measured at 1m0s for the ASG plus the image pull --
-so the adapter's own bounds add to about ten minutes in the worst case and this must
-exceed them or the client gives up on a placement that was going to succeed.
+rather than about this test: a Turn's response is not written until that Turn is over,
+so this covers the placement, the model round trip and the handback end to end. On an
+autoscaled cluster the placement alone includes waiting for a node -- measured at 1m0s
+for the ASG plus the image pull -- so the adapter's own bounds add to about ten minutes
+in the worst case and this must exceed them or the client gives up on a Turn that was
+going to succeed.
+
+It said "a Session's FIRST Turn" while a pod was held for a Session and only the first
+Turn paid for placement. Under the lease every Turn pays, so the figure is no longer a
+first-Turn allowance -- it is what any submission can cost.
 
 It did, at 120 s: twenty-four Sessions submitted at once, the autoscaler added two
 nodes, and this client gave up while the platform was still working. That is worth
@@ -286,11 +307,18 @@ def _register(base: str, tenant_id: str, image: str) -> SessionId:
 
 
 def _submit(base: str, who: _Tenant) -> str:
-    """Submit one Turn asking for one word, and return the turn id it was given.
+    """Submit one Turn asking for one word, wait it out, and return its turn id.
 
-    202, not 200: the API accepts a Turn and dispatches it behind the response, so the
-    answer arrives in the Event Log rather than on this connection. A 200 here would
-    mean the API had changed shape under this file.
+    Blocks for the whole Turn, which is why every caller runs this on a thread -- and
+    since `2316348` the block is the poll on the last line rather than the API. The
+    route starts a background task and answers 202 straight away now, so a version of
+    this that returned on the POST came back before the pod had finished initialising.
+    The pods-Running poll upstream stops as soon as every submission is done, so it
+    stopped on its first reading and reported two pods that were never Running when
+    what had actually happened is that nothing had waited for them.
+
+    202, not 200. A 200 is what a replayed idempotency key answers, so this would mean
+    the API had changed shape under this file or the key had been seen before.
     """
     with _client(base, who.tenant_id, timeout=_SUBMIT_TIMEOUT_S) as caller:
         answered = caller.post(
@@ -300,6 +328,7 @@ def _submit(base: str, who: _Tenant) -> str:
         )
     assert answered.status_code == 202, answered.text
     turn_id: str = answered.json()["turn_id"]
+    _await_terminal(base, who)
     return turn_id
 
 
@@ -384,9 +413,11 @@ def test_two_tenants_take_a_turn_at_once_and_neither_gets_the_others_answer() ->
     """Two tenants, two pods running together, two answers that do not cross.
 
     The two Turns are submitted from two threads so that neither waits on the other's
-    acceptance, and the pods are then observed in ONE `kubectl get pods` call, so
-    "together" is one reading of the cluster rather than two readings stitched into a
-    claim.
+    acceptance, and the pods are observed WHILE both submissions are still unanswered,
+    in ONE `kubectl get pods` call -- so "together" is one reading of the cluster rather
+    than two readings stitched into a claim, and it is taken in the only window where
+    there is anything to read. Each pod is leased to the Turn being carried underneath
+    its submission, so the answer arriving is the pod going away.
 
     Each prompt asks for a different single word. That is what makes a crossed answer a
     failure with a name: an assertion that both Turns merely completed would pass on a
@@ -419,13 +450,25 @@ def test_two_tenants_take_a_turn_at_once_and_neither_gets_the_others_answer() ->
         assert len({one.pod_name for one in who}) == len(who), who
 
         try:
+            # The observation happens INSIDE this block, between the submissions
+            # starting and their results being collected. Outside it there is nothing
+            # to observe: each response is written only once its Turn has ended, and
+            # the lease deletes the pod before that. Collecting the results is what
+            # joins the threads, so it is deliberately the last thing here.
+            #
+            # A failed observation leaves this block by raising, and the pool's exit
+            # then waits for both submissions anyway -- up to the client timeout. That
+            # is slow and it is right: the Turns are running on the cluster either way,
+            # and cleaning up underneath them would delete a pod mid-Turn and report
+            # the resulting failure as this file's finding.
             with ThreadPoolExecutor(max_workers=len(who)) as pool:
-                turn_ids = list(pool.map(lambda one: _submit(base, one), who))
+                flying = [pool.submit(_submit, base, one) for one in who]
+                _await_all_pods_running_at_once(who, flying)
+                turn_ids = [one.result(timeout=_SUBMIT_TIMEOUT_S) for one in flying]
             who = [
                 replace(one, turn_id=turn_id)
                 for one, turn_id in zip(who, turn_ids, strict=True)
             ]
-            _await_both_running(who)
             logs = _await_both_terminal(base, who)
             _assert_each_answer_is_its_own(who, logs)
         finally:
@@ -433,8 +476,16 @@ def test_two_tenants_take_a_turn_at_once_and_neither_gets_the_others_answer() ->
                 _clean_up(one)
 
 
-def _await_both_running(who: list[_Tenant]) -> dict[str, str]:
+def _await_all_pods_running_at_once(
+    who: list[_Tenant], flying: list[Future[str]]
+) -> dict[str, str]:
     """Wait until ONE reading of the cluster shows every pod Running, and return it.
+
+    Polled while the submissions are still unanswered, because that is the only time
+    these pods exist: each is leased to one Turn and deleted when that Turn ends, and
+    the response that says the Turn ended is the same response this function is racing.
+    Waiting for the submissions first and looking afterwards is what this used to do,
+    and it looked for two objects the platform had correctly already deleted.
 
     Fails the case rather than returning a verdict, because there is nothing a caller
     could usefully do with "not yet" -- the deadline has already passed by then. The
@@ -444,18 +495,43 @@ def _await_both_running(who: list[_Tenant]) -> dict[str, str]:
     not here: two readings could each show one pod Running and together show two
     Sessions in sequence, which is exactly what this file must not accept as two at
     once.
+
+    Every phase each pod was EVER seen in is carried into the failure, because under the
+    lease the last reading is usually empty and empty has three meanings that need
+    different people: no pod was ever placed, the pods ran but never overlapped, or they
+    overlapped and this poll was too slow to catch it. The last reading alone says the
+    same nothing for all three.
+
+    Polled hard rather than every few seconds, because the window it is looking for is
+    short by construction: each pod is leased to one Turn asking for a single word, so
+    it is Running for a handful of seconds and then gone. A three-second poll saw one
+    pod Pending, Running and Succeeded while the other was still coming up, and
+    reported two pods that never overlapped when what it had was a sampling rate
+    coarser than the thing being sampled.
     """
     names = [one.pod_name for one in who]
     deadline = time.monotonic() + _TURN_DEADLINE_S
+    ever: dict[str, set[str]] = {name: set() for name in names}
     seen: dict[str, str] = {}
     while time.monotonic() < deadline:
         seen = _pod_phases(names)
+        for name, phase in seen.items():
+            ever[name].add(phase)
         if len(seen) == len(names) and set(seen.values()) == {"Running"}:
             return seen
-        time.sleep(3)
+        if all(one.done() for one in flying):
+            break
+        time.sleep(_OVERLAP_POLL_S)
+    never = sorted(name for name, phases in ever.items() if not phases)
     pytest.fail(
-        f"the {len(names)} session pods were never Running in one reading; "
-        f"the last was {seen}"
+        f"the {len(names)} session pods were never Running in one reading. The last "
+        f"reading was {seen}; across the whole wait each pod was seen "
+        f"{ {name: sorted(phases) for name, phases in ever.items()} }"
+        + (
+            f"; {never} was never in the namespace at all"
+            if never
+            else "; every pod was seen at some point, so what failed is the overlap"
+        )
     )
 
 
@@ -464,9 +540,14 @@ def _await_both_terminal(
 ) -> dict[str, list[dict[str, Any]]]:
     """Each Session's Event Log, once every Turn has ended.
 
-    The two waits run in threads rather than one after the other. Sequentially, the
-    second Session's Turn would be finishing while this process blocked on the first,
-    and a deadline that is generous per Turn would become a deadline for both.
+    Reached after the submissions have been collected, so every Turn has already ended
+    and each of these polls is expected to return on its first reading. The wait is kept
+    because it is the durable record that is being graded and not the responses: a Turn
+    whose events were still being appended as its response was written would otherwise
+    be read here as a Turn that produced none.
+
+    The waits run in threads rather than one after the other, so a Session whose log is
+    genuinely late does not spend another Session's share of the deadline.
     """
     with ThreadPoolExecutor(max_workers=len(who)) as pool:
         logs = list(pool.map(lambda one: _await_terminal(base, one), who))

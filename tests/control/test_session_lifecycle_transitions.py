@@ -1,7 +1,10 @@
 """Ending a Session's working life, and giving its pod back when it does.
 
-Tier 1 (local, no infrastructure). The two transitions `control/session/lifecycle.py`
-grows are graded here: archiving a Session, and parking one nothing is using.
+Tier 1 (local, no infrastructure). The one transition `control/session/lifecycle.py`
+grows is graded here: archiving a Session. Parking one nothing is using was the other,
+and it is gone with the event it appended -- a pod leased for one Turn is never parked
+(ADR-041). What remains of that path is the reclamation in `control/session/reaper.py`,
+which deletes a pod and writes nothing, and is graded in `test_session_reaper.py`.
 
 **The pod is a real thing in this file, not a call record.** `TrackedCluster` below is a
 `PodRunner` that holds pods in a dict, and every claim that a pod was handed back is
@@ -15,6 +18,11 @@ has an answer for all four `SessionState` members, and getting one of them wrong
 Session that either cannot be archived or is stopped twice; the four turn-event shapes a
 log can end on decide whether a Turn is open, and reading only the completion is how
 every failed Turn stays open for ever.
+
+Each state is reached by appending the events that cause it rather than by setting a
+field, which for `RUNNING` means a submission nothing has closed -- there is no event
+that declares a Session running, and building one would grade a log this platform cannot
+produce.
 
 The log fake **pages** at two rows by default, which is what the real adapter does and
 what three shipped defects in this repository came from. A transition that folded one
@@ -36,8 +44,6 @@ from managed_agent.control.session.lifecycle import (
     SessionAlreadyArchived,
     SessionArchived,
     archive_session,
-    open_turn,
-    suspend_session,
 )
 from managed_agent.control.session.placement import (
     Placement,
@@ -54,6 +60,7 @@ from managed_agent.core.ids import (
 )
 from managed_agent.core.session.projection import project
 from managed_agent.core.session.session import SessionState
+from managed_agent.core.session.turns import open_turn
 from managed_agent.core.vocabulary import lifecycle, turn
 from managed_agent.core.vocabulary.lifecycle import StopReason
 
@@ -174,7 +181,7 @@ class _Fixture:
         return state
 
 
-def _created(state: SessionState = SessionState.RUNNING) -> _Fixture:
+def _created(state: SessionState = SessionState.IDLE) -> _Fixture:
     """A Session whose log lands on `state`, with a pod placed and running.
 
     The log is built out of the events that actually cause each state rather than out of
@@ -190,14 +197,11 @@ def _created(state: SessionState = SessionState.RUNNING) -> _Fixture:
     log.add(session_id, turn.TURN_SUBMITTED, {"turn_id": str(new_turn_id())})
     log.add(session_id, turn.TURN_COMPLETED, {"turn_id": _last_turn_id(log)})
     match state:
-        case SessionState.RUNNING:
+        case SessionState.IDLE:
             pass
-        case SessionState.SUSPENDED:
-            log.add(
-                session_id,
-                lifecycle.SESSION_SUSPENDED,
-                {"stop_reason": StopReason.IDLE_TIMEOUT.value},
-            )
+        case SessionState.RUNNING:
+            # No event says "running" on its own: an unclosed submission is the state.
+            log.add(session_id, turn.TURN_SUBMITTED, {"turn_id": str(new_turn_id())})
         case SessionState.STOPPED:
             log.add(
                 session_id,
@@ -230,14 +234,18 @@ def _open_a_turn(fixture: _Fixture) -> TurnId:
 
 # `TAKEN_OVER` is reachable in this file only because `_created` appends the type the
 # projection table would read for it, and that type is not published. The projection has
-# no row for it either -- so the fold reports RUNNING, and the archive answer for it is
-# the RUNNING answer. Listed as its own row anyway: the day the takeover family lands,
-# this row is where the decision has to be made rather than discovered.
-_ARCHIVE_APPENDS = {
-    SessionState.RUNNING: True,
-    SessionState.SUSPENDED: True,
-    SessionState.STOPPED: False,
-    SessionState.TAKEN_OVER: True,
+# no row for it either -- so the fold reports IDLE, and the archive answer for it is the
+# IDLE answer. Listed as its own row anyway: the day the takeover family lands, this row
+# is where the decision has to be made rather than discovered.
+#
+# `RUNNING` is the one row that appends nothing, and it is not a state refusal. Archive
+# refuses while a Turn is open so the caller can interrupt it first, and `RUNNING` *is*
+# an open Turn -- so this row grades the same refusal from the other side.
+_ARCHIVE_OUTCOME: dict[SessionState, type] = {
+    SessionState.IDLE: SessionArchived,
+    SessionState.RUNNING: ArchiveRefused,
+    SessionState.STOPPED: SessionAlreadyArchived,
+    SessionState.TAKEN_OVER: SessionArchived,
 }
 
 
@@ -258,16 +266,27 @@ async def test_archive_has_a_decided_answer_for_every_state(
         fixture.session_id, fixture.log, fixture.log, fixture.placement
     )
 
+    expected = _ARCHIVE_OUTCOME[state]
+    assert isinstance(outcome, expected), (
+        f"archiving a {state.value} session gave {type(outcome).__name__}, expected "
+        f"{expected.__name__}"
+    )
+    # Exactly one outcome writes, and it is the one that ends the Session. Derived from
+    # the table above rather than listed a second time, so the two cannot disagree.
     appended = fixture.log.appends > before
-    assert appended is _ARCHIVE_APPENDS[state], (
-        f"archiving a {state.value} session appended={appended}, expected "
-        f"{_ARCHIVE_APPENDS[state]}"
+    assert appended is (expected is SessionArchived), (
+        f"archiving a {state.value} session appended={appended}"
     )
-    assert await fixture.pod_phase() is PodPhase.ABSENT, (
-        f"a {state.value} session kept its pod after being archived"
-    )
-    assert fixture.state() is SessionState.STOPPED
-    assert isinstance(outcome, SessionArchived | SessionAlreadyArchived)
+    if expected is ArchiveRefused:
+        assert await fixture.pod_phase() is PodPhase.RUNNING, (
+            "the pod of a Turn the caller was told to interrupt was deleted"
+        )
+        assert fixture.state() is SessionState.RUNNING, "a refusal moved the Session"
+    else:
+        assert await fixture.pod_phase() is PodPhase.ABSENT, (
+            f"a {state.value} session kept its pod after being archived"
+        )
+        assert fixture.state() is SessionState.STOPPED
 
 
 async def test_archiving_appends_one_stop_carrying_the_archived_reason() -> None:
@@ -371,34 +390,6 @@ async def test_a_turn_admitted_across_the_append_keeps_its_pod() -> None:
     assert await fixture.pod_phase() is PodPhase.RUNNING, (
         "the pod of a Turn that arrived across the append was deleted"
     )
-
-
-async def test_suspending_parks_the_session_and_gives_the_pod_back() -> None:
-    fixture = _created()
-
-    seq = await suspend_session(
-        fixture.session_id, fixture.log, fixture.log, fixture.placement
-    )
-
-    assert fixture.state() is SessionState.SUSPENDED
-    assert fixture.state().accepts_a_turn() is False
-    assert await fixture.pod_phase() is PodPhase.ABSENT
-    assert fixture.log.payload_of(lifecycle.SESSION_SUSPENDED) == {
-        "stop_reason": StopReason.IDLE_TIMEOUT.value
-    }
-    assert seq == len(fixture.log.events())
-
-
-async def test_a_suspended_session_keeps_every_event_it_had() -> None:
-    """Parking is not deletion. What a resume would need is still in the log."""
-    fixture = _created()
-    before = fixture.log.types()
-
-    await suspend_session(
-        fixture.session_id, fixture.log, fixture.log, fixture.placement
-    )
-
-    assert fixture.log.types() == [*before, lifecycle.SESSION_SUSPENDED]
 
 
 async def test_the_stop_is_appended_before_the_pod_goes() -> None:

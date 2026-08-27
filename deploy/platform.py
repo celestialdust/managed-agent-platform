@@ -280,6 +280,20 @@ CONTROL_PLANE: Final = Workload(
         # genuinely healthy, and genuinely unaddressable is the worst shape this could
         # have taken -- every probe says the pod is fine, because it is.
         _K8S / "session-shim-service.yaml",
+        # What may reach what inside this namespace. A companion of this workload
+        # because it is the first one applied, so the exceptions are in place before
+        # any pod rolls -- and re-asserted every release rather than at bootstrap,
+        # because the set names the pods of all three workloads and a policy that
+        # stopped matching one of them would otherwise stay wrong until somebody
+        # rebuilt the cluster.
+        #
+        # This file was applied by nothing until 2026-08-26, and that is the third time
+        # this class has cost a deploy. The first two announced themselves -- a pod at
+        # ContainerCreating, a Deployment at 0/2. This one could not: absent, the
+        # namespace is default-allow, every manifest still reads as a boundary, and
+        # nothing anywhere is unhealthy. `test_every_manifest_in_this_tree_is_applied_
+        # by_something` is the guard, and it runs offline.
+        _K8S / "network-policies.yaml",
     ),
     generated_config_maps=((POD_MANIFEST_CONFIG_MAP, _SESSION_POD),),
     required_variables=(
@@ -941,20 +955,33 @@ def _reference(root: Path, repository: str) -> str:
     )
     if tag.returncode != 0:
         raise RuntimeError(f"could not derive the tag for HEAD: {tag.stderr.strip()}")
-    digest = _aws(
-        "ecr",
-        "describe-images",
-        "--repository-name",
-        repository,
-        "--image-ids",
-        f"imageTag={tag.stdout.strip()}",
-        "--query",
-        "imageDetails[0].imageDigest",
-    )
+    # `describe-images` EXITS NON-ZERO for an absent tag rather than returning nothing,
+    # so `_aws` raised and the message below -- written for exactly this case -- was
+    # unreachable. A caller who had committed anything after their last push got a
+    # traceback ending in `ImageNotFoundException` instead of the one line that says
+    # what to do. Only that one failure is turned back into an empty digest; expired
+    # credentials and an unreachable registry are different problems and still raise.
+    try:
+        digest = _aws(
+            "ecr",
+            "describe-images",
+            "--repository-name",
+            repository,
+            "--image-ids",
+            f"imageTag={tag.stdout.strip()}",
+            "--query",
+            "imageDetails[0].imageDigest",
+        )
+    except RuntimeError as failure:
+        if "ImageNotFoundException" not in str(failure):
+            raise
+        digest = ""
     if not digest or digest == "None":
         raise RuntimeError(
             f"{repository} holds no image tagged {tag.stdout.strip()}. Nothing has "
-            "pushed this commit; run deploy/docker/push-platform-image.sh"
+            "pushed this commit; run deploy/docker/push-platform-image.sh -- and note "
+            "that the tag names HEAD, so any commit made since the last push is enough "
+            "to produce this, whatever it changed."
         )
     account = _aws("sts", "get-caller-identity", "--query", "Account")
     region = _aws("configure", "get", "region")

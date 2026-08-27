@@ -1,4 +1,4 @@
-"""The vfs family: an object was created, or one in the mutable lane was rewritten.
+"""The vfs family: an object was created, or one was rewritten before that could not be.
 
 **These two events are the provenance record, and there is deliberately no file beside
 them saying the same thing.** The obvious implementation of an artifact contract is a
@@ -10,10 +10,10 @@ appended here once, and anything that wants them folds the log
 (`core/vfs/vfs_provenance.py` does exactly that).
 
 Two types rather than one with a direction field. Creating an object and rewriting one
-are different acts with different consequences — the first is the only write a sealed
-lane has, the second is possible in one lane and nowhere else — and folding them would
-make "was this artifact ever revised" a question about a field rather than about which
-events are in the log.
+are different acts with different consequences, and folding them would make "was this
+artifact ever revised" a question about a field rather than about which events are in
+the log. Nothing emits the second any more — see `OBJECT_REPLACED` — and it stays
+declared here because Session logs written before that already carry rows of it.
 
 **Nothing here carries a timestamp.** The Event Log's own row has a server-defaulted
 `created_at` (migration 0001), so "when it was produced" is already recorded by the
@@ -37,24 +37,18 @@ are recorded here rather than looked up when somebody asks.
 """
 
 OBJECT_REPLACED = declare("vfs.object_replaced", FAMILY)
-"""An object in the one rewritable lane was overwritten, and by what.
+"""An object in a rewritable lane was overwritten, and by what.
 
-Only the mutable lane can produce this. Its existence in a Session's log is what makes a
-recorded source digest checkable: an artifact whose source was rewritten after the
-artifact was made has a log that says so, in order, rather than a source file that
-quietly stopped matching the hash beside its name.
-"""
+**Nothing writes this any more, and it is not deprecated — it is historical.** The lane
+that could produce it was `working`, carrying the agent's tree between Turns; the
+workspace became a mounted volume that needs no carrying and the lane went with it
+(ADR-035), taking the only `replace` in the tree. Every lane is sealed now, so no call
+that exists can append one of these.
 
-
-WORKING_LANE_PARTIAL = declare("vfs.working_lane_partial", FAMILY)
-"""The workspace was larger than one Turn will sync, so the lane holds part of it.
-
-Not a failure and not a refusal. A Turn that produced good work in a large workspace
-must not be failed for the size of that workspace, so the sync takes what fits, in a
-deterministic order, and says here what it left. Carries how many paths and bytes were
-taken and what the ceilings are.
-
-It exists because the alternative is silence. A tenant resuming from a lane that holds
-most of their tree, with nothing anywhere saying part of it was dropped, would read the
-absence as the platform having lost work rather than as a limit they can act on.
+It stays declared because Sessions that ran before that hold rows of this type, and
+`core/vfs/vfs_provenance.py` folds them. Deleting the constant would not delete the
+rows: the fold skips a type it does not recognise, so those Sessions would quietly start
+reporting `revisions=0` over a log that says otherwise, and a provenance record that
+under-reports a revision is the exact failure this family exists to make impossible.
+Delete it when no retained log can still contain one, and not before.
 """
